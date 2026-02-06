@@ -2,11 +2,6 @@ import os
 import json
 import time
 import re
-import math
-import html
-import urllib.request
-import ssl
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -40,21 +35,32 @@ RSS_FEEDS = {
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
     "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
 
-    # MarketWatch
+    # MarketWatch (valid RSS feeds)
     "MARKETWATCH_TOP_STORIES": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "MARKETWATCH_REAL_TIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
     "MARKETWATCH_BREAKING": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
     "MARKETWATCH_MARKETPULSE": "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
 
-    # Financial Times (may be restricted)
+    # Financial Times (may be restricted; ok to try)
     "FT_PRECIOUS_METALS": "https://www.ft.com/precious-metals?format=rss",
 
-    # DailyForex
+    # DailyForex (RSS)
     "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
     "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
     "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
+
+    # --- NEW: your feeds ---
+    "RSSAPP_1": "https://rss.app/feeds/X1lZYAmHwbEHR8OY.xml",
+    "RSSAPP_2": "https://rss.app/feeds/BDVzmd6sW0mF8DJ6.xml",
+
+    # ForexFactory calendar weekly feed (proxy feed)
+    "FF_CALENDAR_WEEK": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml?version=51c52bdf678435acb58756461c1e8226&utm_source=chatgpt.com",
+
+    # Trump / politics
+    "POLITICO_TRUMP": "https://rss.politico.com/donald-trump.xml",
 }
 
+# impact weights by source (MVP heuristic)
 SOURCE_WEIGHT = {
     "FED": 3.0,
     "BLS": 3.0,
@@ -78,27 +84,27 @@ SOURCE_WEIGHT = {
     "DAILYFOREX_NEWS": 1.2,
     "DAILYFOREX_TECH": 1.0,
     "DAILYFOREX_FUND": 1.2,
+
+    # new feeds - keep neutral-ish until you calibrate
+    "RSSAPP_1": 1.1,
+    "RSSAPP_2": 1.1,
+    "FF_CALENDAR_WEEK": 2.2,    # calendar is important for "event mode"
+    "POLITICO_TRUMP": 1.3,
 }
 
 # Exponential decay (half-life ~ 8 hours)
 HALF_LIFE_SEC = 8 * 3600
-LAMBDA = math.log(2.0) / HALF_LIFE_SEC
+LAMBDA = 0.69314718056 / HALF_LIFE_SEC
 
+# Bias thresholds (per-asset)
 BIAS_THRESH = {
     "US500": 1.2,
     "XAU":   0.9,
     "WTI":   0.9,
 }
 
-# Optional: ForexFactory calendar XML (event mode)
-FF_CAL_ENABLED = os.environ.get("FF_CAL_ENABLED", "0").strip() == "1"
-FF_CAL_URL = os.environ.get("FF_CAL_URL", "https://nfs.faireconomy.media/ff_calendar_thisweek.xml").strip()
-FF_CAL_TIMEOUT_SEC = int(os.environ.get("FF_CAL_TIMEOUT_SEC", "8"))
-EVENT_MODE_LOOKAHEAD_HOURS = float(os.environ.get("EVENT_MODE_LOOKAHEAD_HOURS", "18"))
-EVENT_MODE_RECENT_HOURS = float(os.environ.get("EVENT_MODE_RECENT_HOURS", "6"))
-
 # ============================================================
-# RULES
+# RULES: regex patterns -> signed weight + explanation
 # ============================================================
 
 RULES: Dict[str, List[Tuple[str, float, str]]] = {
@@ -115,7 +121,7 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 
     "XAU": [
         (r"\b(wall st|wall street|futures|s&p|spx|nasdaq|dow|treasur(y|ies)|yields?|vix|risk[- ]off)\b.*\b(rout|plunges?|slides?|sell[- ]off|wary)\b"
-         r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|futures|s&p|nasdaq|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
+         r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|wall street|futures|s&p|spx|nasdaq|dow|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
          +0.9, "Market-wide risk-off supports gold"),
         (r"\b(rebound|risk[- ]on|stocks to buy|buy after .* drop|strong earnings)\b",
          -0.7, "Risk-on pressures gold"),
@@ -136,14 +142,6 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
          0.0, "Not crude-direct"),
     ],
 }
-
-# Pre-compile regex for speed + stability
-RULES_RX: Dict[str, List[Tuple[re.Pattern, float, str]]] = {}
-for a, rules in RULES.items():
-    compiled = []
-    for pat, w, why in rules:
-        compiled.append((re.compile(pat, flags=re.IGNORECASE), float(w), why))
-    RULES_RX[a] = compiled
 
 
 # ============================================================
@@ -177,9 +175,6 @@ def db_init():
                 payload_json TEXT NOT NULL
             );
             """)
-            # Helpful indexes
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_news_published_ts ON news_items(published_ts DESC);")
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_news_source ON news_items(source);")
             conn.commit()
 
 
@@ -228,8 +223,7 @@ def ingest_once(limit_per_feed: int = 30) -> int:
                 d = feedparser.parse(url)
                 entries = getattr(d, "entries", []) or []
 
-                # If bozo==1 but entries exist — still ingest (FED/OILPRICE often do this).
-                # If bozo==1 and entries==0 — skip as truly broken.
+                # bozo==1 but entries exist -> still ingest
                 if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
                     continue
 
@@ -243,6 +237,7 @@ def ingest_once(limit_per_feed: int = 30) -> int:
                     if published_parsed:
                         published_ts = int(time.mktime(published_parsed))
                     else:
+                        # Some feeds (calendar) may not have published dates reliably
                         published_ts = now
 
                     fp = fingerprint(title, link)
@@ -268,138 +263,105 @@ def ingest_once(limit_per_feed: int = 30) -> int:
 
 
 # ============================================================
-# EVENT MODE (ForexFactory calendar - optional)
-# ============================================================
-
-def _http_get_text(url: str, timeout_sec: int = 8) -> str:
-    ctx = ssl.create_default_context()
-    req = urllib.request.Request(url, headers={"User-Agent": "NewsBiasBot/1.0"})
-    with urllib.request.urlopen(req, timeout=timeout_sec, context=ctx) as r:
-        return r.read().decode("utf-8", errors="replace")
-
-
-def ff_calendar_fetch() -> List[Dict[str, Any]]:
-    """
-    Best-effort parse of ForexFactory XML.
-    Returns events with fields: title, country, impact, timestamp_utc (unix), dt_utc_iso.
-    If disabled/fails -> [].
-    """
-    if not FF_CAL_ENABLED:
-        return []
-
-    try:
-        xml_text = _http_get_text(FF_CAL_URL, timeout_sec=FF_CAL_TIMEOUT_SEC)
-        root = ET.fromstring(xml_text)
-        out = []
-        # Common structure: <event>...</event>
-        for ev in root.findall(".//event"):
-            title = (ev.findtext("title") or "").strip()
-            country = (ev.findtext("country") or "").strip()
-            impact = (ev.findtext("impact") or "").strip()  # often: Low/Medium/High
-            # Many FF XML variants contain <timestamp> unix seconds OR date/time strings.
-            ts_txt = (ev.findtext("timestamp") or "").strip()
-            ts = None
-            if ts_txt.isdigit():
-                ts = int(ts_txt)
-            else:
-                # fallback: try date+time (very variant). If cannot parse -> skip.
-                # We'll keep it simple: skip.
-                ts = None
-
-            if not title or not country or ts is None:
-                continue
-
-            out.append({
-                "title": title,
-                "country": country,
-                "impact": impact,
-                "timestamp_utc": ts,
-                "dt_utc_iso": datetime.fromtimestamp(ts, tz=timezone.utc).isoformat(),
-            })
-        return out
-    except Exception:
-        return []
-
-
-def event_mode_for_asset(asset: str, why_all: List[Dict[str, Any]], ff_events: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    event_mode is true if:
-    - recent macro source match within EVENT_MODE_RECENT_HOURS for FED/BLS/BEA
-    OR
-    - upcoming high-impact event in lookahead window (FF calendar), relevant to the asset.
-    """
-    now = int(time.time())
-    recent_cut = now - int(EVENT_MODE_RECENT_HOURS * 3600)
-
-    # 1) recent macro sources
-    recent_macro = any(
-        (w.get("source") in ("FED", "BLS", "BEA")) and int(w.get("published_ts", 0)) >= recent_cut
-        for w in why_all
-    )
-
-    # 2) upcoming FF events (optional)
-    look_to = now + int(EVENT_MODE_LOOKAHEAD_HOURS * 3600)
-    relevant_countries = {"US"}  # keep simple MVP; extend later
-
-    # relevant by asset (you can refine)
-    if asset == "WTI":
-        # still US macro matters; later add OPEC meeting etc
-        relevant_countries = {"US"}
-    elif asset == "US500":
-        relevant_countries = {"US"}
-    elif asset == "XAU":
-        relevant_countries = {"US"}
-
-    upcoming = []
-    for e in (ff_events or []):
-        ts = int(e.get("timestamp_utc", 0) or 0)
-        if ts <= 0:
-            continue
-        if now <= ts <= look_to and (e.get("country") in relevant_countries):
-            # filter impacts: keep High/Medium by default
-            imp = (e.get("impact") or "").lower()
-            if "high" in imp or "medium" in imp:
-                upcoming.append(e)
-
-    upcoming = sorted(upcoming, key=lambda x: x["timestamp_utc"])[:6]
-
-    return {
-        "enabled": True,
-        "event_mode": bool(recent_macro or upcoming),
-        "recent_macro": bool(recent_macro),
-        "upcoming_events": upcoming,
-        "lookahead_hours": EVENT_MODE_LOOKAHEAD_HOURS,
-        "recent_hours": EVENT_MODE_RECENT_HOURS,
-        "ff_calendar_enabled": FF_CAL_ENABLED,
-    }
-
-
-# ============================================================
-# SCORING
+# SCORING HELPERS
 # ============================================================
 
 def decay_weight(age_sec: int) -> float:
-    return float(math.exp(-LAMBDA * max(0, age_sec)))
+    return float(pow(2.718281828, -LAMBDA * max(0, age_sec)))
 
 
 def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
     tl = (text or "").lower()
     out = []
-    for rx, w, why in RULES_RX.get(asset, []):
-        if rx.search(tl):
-            out.append({"w": float(w), "why": why})
+    for pattern, w, why in RULES.get(asset, []):
+        if re.search(pattern, tl, flags=re.IGNORECASE):
+            out.append({"pattern": pattern, "w": float(w), "why": why})
     return out
 
 
-def _fresh_bucket(age_sec: int) -> str:
-    if age_sec <= 2 * 3600:
+def freshness_bucket(age_sec: int) -> str:
+    h = age_sec / 3600.0
+    if h <= 2.0:
         return "0-2h"
-    if age_sec <= 8 * 3600:
+    if h <= 8.0:
         return "2-8h"
     return "8-24h"
 
 
-def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> dict:
+def safe_float(x: Any, default: float = 0.0) -> float:
+    try:
+        return float(x)
+    except Exception:
+        return default
+
+
+# ============================================================
+# EVENT MODE (ForexFactory calendar feed MVP parse)
+# ============================================================
+
+HIGH_IMPACT_MARKERS = [
+    "high impact", "impact: high", "★★★", "high",
+    "fomc", "cpi", "ppi", "nfp", "non-farm", "payroll",
+    "unemployment", "jobs", "gdp", "retail sales",
+    "ism", "pmi", "rate decision", "fed", "powell",
+]
+
+def extract_calendar_events(rows_24h: List[Tuple[str, str, str, int]],
+                            lookahead_hours: float = 18.0,
+                            recent_hours: float = 6.0) -> Dict[str, Any]:
+    """
+    MVP:
+    - We treat FF_CALENDAR_WEEK items as "events".
+    - We don't have structured timestamps, so we approximate by published_ts (ingest timestamp).
+    - We'll flag "high impact" using text markers in title/summary (we only have title stored).
+    """
+    now = int(time.time())
+    lookahead_sec = int(lookahead_hours * 3600)
+    recent_sec = int(recent_hours * 3600)
+
+    upcoming: List[Dict[str, Any]] = []
+    recent_macro = False
+
+    for (source, title, link, ts) in rows_24h:
+        if source != "FF_CALENDAR_WEEK":
+            continue
+
+        t = (title or "").lower()
+        is_high = any(m in t for m in HIGH_IMPACT_MARKERS)
+
+        age = now - int(ts)
+
+        # "recent" macro: within recent_hours (published)
+        if is_high and age <= recent_sec:
+            recent_macro = True
+
+        # "upcoming" is hard without true event time; we approximate:
+        # if item is fresh (<= lookahead) we show it as "upcoming-ish"
+        if is_high and age <= lookahead_sec:
+            upcoming.append({
+                "title": title,
+                "link": link,
+                "age_min": int(age / 60),
+                "impact": "HIGH",
+            })
+
+    event_mode = (len(upcoming) > 0) or recent_macro
+    return {
+        "enabled": True,
+        "ff_calendar_enabled": True,
+        "lookahead_hours": lookahead_hours,
+        "recent_hours": recent_hours,
+        "event_mode": bool(event_mode),
+        "recent_macro": bool(recent_macro),
+        "upcoming_events": upcoming[:12],
+    }
+
+
+# ============================================================
+# COMPUTE BIAS + SIGNAL QUALITY V2
+# ============================================================
+
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200):
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -417,36 +379,46 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> dict:
             )
             rows = cur.fetchall()
 
-    ff_events = ff_calendar_fetch()  # optional
-
     assets_out: Dict[str, Any] = {}
+
+    # event mode uses same rows
+    event_info = extract_calendar_events(rows, lookahead_hours=18.0, recent_hours=6.0)
 
     for asset in ASSETS:
         total = 0.0
-        why_all: List[Dict[str, Any]] = []
+        matches_all: List[Dict[str, Any]] = []
+
+        # for v2 analytics
+        freshness_counts = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
+        by_source_net: Dict[str, float] = {}
+        by_source_abs: Dict[str, float] = {}
+        by_source_cnt: Dict[str, int] = {}
+        by_driver_abs: Dict[str, float] = {}
 
         for (source, title, link, ts) in rows:
             age = now - int(ts)
-            w_src = float(SOURCE_WEIGHT.get(source, 1.0))
+            w_src = SOURCE_WEIGHT.get(source, 1.0)
             w_time = decay_weight(age)
 
             matches = match_rules(asset, title)
             if not matches:
                 continue
 
+            # freshness bucket counts: count MATCHED items (not all items)
+            b = freshness_bucket(age)
+            freshness_counts[b] = freshness_counts.get(b, 0) + 1
+
             for m in matches:
-                base_w = float(m["w"])
+                base_w = m["w"]
                 contrib = base_w * w_src * w_time
                 total += contrib
 
-                why_all.append({
+                matches_all.append({
                     "source": source,
                     "title": title,
                     "link": link,
                     "published_ts": int(ts),
                     "age_min": int(age / 60),
-                    "age_sec": int(age),
-                    "bucket": _fresh_bucket(int(age)),
                     "base_w": base_w,
                     "src_w": w_src,
                     "time_w": round(w_time, 4),
@@ -454,7 +426,16 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> dict:
                     "why": m["why"],
                 })
 
-        th = float(BIAS_THRESH.get(asset, 1.0))
+                # consensus by source
+                by_source_net[source] = by_source_net.get(source, 0.0) + contrib
+                by_source_abs[source] = by_source_abs.get(source, 0.0) + abs(contrib)
+                by_source_cnt[source] = by_source_cnt.get(source, 0) + 1
+
+                # top drivers now (by "why" label)
+                why = m["why"]
+                by_driver_abs[why] = by_driver_abs.get(why, 0.0) + abs(contrib)
+
+        th = BIAS_THRESH.get(asset, 1.0)
         if total >= th:
             bias = "BULLISH"
         elif total <= -th:
@@ -462,95 +443,102 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> dict:
         else:
             bias = "NEUTRAL"
 
-        why_sorted = sorted(why_all, key=lambda x: abs(float(x["contrib"])), reverse=True)
-        why_top5 = why_sorted[:5]
+        why_top5 = sorted(matches_all, key=lambda x: abs(safe_float(x.get("contrib"))), reverse=True)[:5]
 
-        # --- Metrics for "smart visual"
-        evidence_count = len(why_all)
-        src_div = len(set([w["source"] for w in why_all])) if why_all else 0
-        sum_abs = sum(abs(float(w["contrib"])) for w in why_all) if why_all else 0.0
+        # -------- Quality v1 (keep, but not the main anymore)
+        evidence_count = len(matches_all)
+        source_div = len(set([w["source"] for w in matches_all])) if matches_all else 0
+        strength = min(1.0, abs(total) / max(th, 1e-9))
+        quality_v1 = int(min(100, (strength * 60.0) + min(30, evidence_count * 2.0) + min(10, source_div * 2.0)))
+
+        # -------- Signal Quality v2
+        # Consensus ratio: (abs(net)) / (sum abs)
+        sum_abs = sum(by_source_abs.values()) if by_source_abs else 0.0
         consensus_ratio = (abs(total) / sum_abs) if sum_abs > 1e-9 else 0.0
-        consensus_ratio = float(max(0.0, min(1.0, consensus_ratio)))
-        conflict_index = float(1.0 - consensus_ratio)
 
-        # freshness buckets for matched items
-        buckets = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
-        for w in why_all:
-            b = w.get("bucket")
-            if b in buckets:
-                buckets[b] += 1
+        # Conflict index: 1 - consensus_ratio (bounded)
+        conflict_index = float(max(0.0, min(1.0, 1.0 - consensus_ratio)))
 
-        # top drivers (aggregate by 'why')
-        drv: Dict[str, float] = {}
-        for w in why_all:
-            k = str(w.get("why", "") or "")
-            drv[k] = drv.get(k, 0.0) + abs(float(w.get("contrib", 0.0)))
+        # "What would flip the bias" distance in score units
+        if bias == "NEUTRAL":
+            to_bull = max(0.0, th - total)
+            to_bear = max(0.0, th + total)
+        elif bias == "BULLISH":
+            # to bearish: need move from total down to -th => delta = total + th
+            to_bull = 0.0
+            to_bear = max(0.0, total + th)
+        else:  # BEARISH
+            to_bull = max(0.0, -th - total)  # total is negative
+            to_bear = 0.0
+
         top3_drivers = sorted(
-            [{"why": k, "abs_contrib_sum": round(v, 4)} for k, v in drv.items()],
-            key=lambda x: float(x["abs_contrib_sum"]),
+            [{"why": k, "abs_contrib_sum": round(v, 4)} for k, v in by_driver_abs.items()],
+            key=lambda x: x["abs_contrib_sum"],
             reverse=True
         )[:3]
 
-        # consensus by sources
-        by_src: Dict[str, Dict[str, Any]] = {}
-        for w in why_all:
-            s = w["source"]
-            by_src.setdefault(s, {"source": s, "net": 0.0, "abs": 0.0, "count": 0})
-            c = float(w["contrib"])
-            by_src[s]["net"] += c
-            by_src[s]["abs"] += abs(c)
-            by_src[s]["count"] += 1
+        consensus_by_source = sorted(
+            [{
+                "source": s,
+                "net": round(by_source_net.get(s, 0.0), 4),
+                "abs": round(by_source_abs.get(s, 0.0), 4),
+                "count": int(by_source_cnt.get(s, 0)),
+            } for s in by_source_net.keys()],
+            key=lambda x: abs(x["net"]),
+            reverse=True
+        )[:10]
 
-        src_list = list(by_src.values())
-        for x in src_list:
-            x["net"] = round(float(x["net"]), 4)
-            x["abs"] = round(float(x["abs"]), 4)
-        src_list.sort(key=lambda x: float(x["abs"]), reverse=True)
+        # v2 quality score:
+        # - reward strength vs threshold
+        # - reward diversity
+        # - penalize conflict
+        # - reward freshness (more 0-2h and 2-8h)
+        fresh_score = 0.0
+        fresh_score += min(1.0, freshness_counts.get("0-2h", 0) / 6.0) * 0.45
+        fresh_score += min(1.0, freshness_counts.get("2-8h", 0) / 10.0) * 0.35
+        fresh_score += min(1.0, freshness_counts.get("8-24h", 0) / 18.0) * 0.20
 
-        # What would flip
-        to_bull = round(max(0.0, th - float(total)), 4)
-        to_bear = round(max(0.0, th + float(total)), 4)  # need score <= -th
-        flip_info = {
-            "to_bullish": to_bull,
-            "to_bearish": to_bear,
-            "note": "Δ needed in score units (same scale as 'score')",
-        }
+        strength2 = min(1.0, abs(total) / max(th, 1e-9))
+        diversity2 = min(1.0, source_div / 8.0)
+        conflict_penalty = conflict_index  # 0..1
 
-        # Quality v2 (0..100), intentionally "harder" and conflict-aware
-        strength = min(1.0, abs(float(total)) / max(th, 1e-9))
-        q_strength = strength * 45.0
-        q_evidence = min(25.0, evidence_count * 1.6)
-        q_div = min(15.0, src_div * 2.5)
-        q_cons = consensus_ratio * 15.0
-        q_penalty = conflict_index * 10.0  # conflict penalty
-        quality_v2 = int(max(0.0, min(100.0, q_strength + q_evidence + q_div + q_cons - q_penalty)))
-
-        # Event mode (optional)
-        event_info = event_mode_for_asset(asset, why_all, ff_events)
+        quality_v2 = int(
+            max(0, min(100,
+                (strength2 * 45.0) +
+                (diversity2 * 20.0) +
+                (fresh_score * 20.0) +
+                ((1.0 - conflict_penalty) * 15.0)
+            ))
+        )
 
         assets_out[asset] = {
             "bias": bias,
-            "score": round(float(total), 4),
+            "score": round(total, 4),
             "threshold": th,
 
-            # v1 + v2
-            "quality": int(max(0, min(100, int((strength * 60.0) + min(30, evidence_count * 2.0) + min(10, src_div * 2.0))))),
+            "quality": quality_v1,
             "quality_v2": quality_v2,
 
             "evidence_count": evidence_count,
-            "source_diversity": src_div,
+            "source_diversity": source_div,
+
             "consensus_ratio": round(consensus_ratio, 4),
             "conflict_index": round(conflict_index, 4),
-            "freshness": buckets,
+            "freshness": freshness_counts,
 
             "top3_drivers": top3_drivers,
-            "flip": flip_info,
-            "consensus_by_source": src_list[:8],
-
-            "event": event_info,
+            "flip": {
+                "to_bullish": round(to_bull, 4),
+                "to_bearish": round(to_bear, 4),
+                "note": "Δ needed in score units (same scale as 'score')",
+            },
+            "consensus_by_source": consensus_by_source,
 
             "why_top5": why_top5,
         }
+
+        # Attach event mode (global) under each asset too (convenient for UI)
+        assets_out[asset]["event"] = event_info
 
     payload = {
         "updated_utc": datetime.now(timezone.utc).isoformat(),
@@ -558,7 +546,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> dict:
         "meta": {
             "lookback_hours": lookback_hours,
             "feeds": list(RSS_FEEDS.keys()),
-            "ff_calendar_enabled": FF_CAL_ENABLED,
         }
     }
     return payload
@@ -594,10 +581,10 @@ def load_bias() -> Optional[dict]:
     return json.loads(row[0])
 
 
-def pipeline_run() -> dict:
+def pipeline_run():
     db_init()
-    inserted = ingest_once(limit_per_feed=30)
-    payload = compute_bias(lookback_hours=24, limit_rows=800)
+    inserted = ingest_once(limit_per_feed=40)
+    payload = compute_bias(lookback_hours=24, limit_rows=1200)
 
     payload["meta"]["inserted_last_run"] = inserted
     payload["meta"]["feeds_status"] = feeds_health_live()
@@ -636,9 +623,25 @@ def bias(pretty: int = 0):
     return JSONResponse(state)
 
 
+@app.get("/rules")
+def rules():
+    # dump rules for UI/debug
+    out = {}
+    for asset, items in RULES.items():
+        out[asset] = [{"pattern": p, "weight": w, "why": why} for (p, w, why) in items]
+    return {"assets": ASSETS, "rules": out}
+
+
 @app.post("/run")
-def run_now():
+def run_now_post():
     return pipeline_run()
+
+
+@app.get("/run", include_in_schema=False)
+def run_now_get():
+    # If user opens /run in browser -> do not show "black screen"
+    pipeline_run()
+    return RedirectResponse(url="/dashboard", status_code=302)
 
 
 @app.get("/latest")
@@ -682,7 +685,7 @@ def explain(asset: str = "US500", limit: int = 50):
                 FROM news_items
                 WHERE published_ts >= %s
                 ORDER BY published_ts DESC
-                LIMIT 800;
+                LIMIT 1200;
                 """,
                 (cutoff,)
             )
@@ -695,24 +698,25 @@ def explain(asset: str = "US500", limit: int = 50):
             continue
 
         age = now - int(ts)
-        w_src = float(SOURCE_WEIGHT.get(source, 1.0))
+        w_src = SOURCE_WEIGHT.get(source, 1.0)
         w_time = decay_weight(age)
 
         for m in matches:
-            contrib = float(m["w"]) * w_src * w_time
+            contrib = m["w"] * w_src * w_time
             out.append({
                 "source": source,
                 "title": title,
                 "link": link,
                 "age_min": int(age / 60),
-                "base_w": float(m["w"]),
+                "base_w": m["w"],
                 "src_w": w_src,
                 "time_w": round(w_time, 4),
                 "contrib": round(contrib, 4),
                 "why": m["why"],
+                "pattern": m["pattern"],
             })
 
-    out_sorted = sorted(out, key=lambda x: abs(float(x["contrib"])), reverse=True)[:limit]
+    out_sorted = sorted(out, key=lambda x: abs(safe_float(x.get("contrib"))), reverse=True)[:limit]
     return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
 
 
@@ -733,19 +737,18 @@ def _badge(bias: str) -> str:
     return '<span class="pill pill-neutral">NEUTRAL</span>'
 
 
-def _bar(value: int, cls: str = "") -> str:
+def _bar(value: int) -> str:
     v = max(0, min(100, int(value)))
-    extra = f" {cls}" if cls else ""
     return f"""
-    <div class="bar{extra}">
+    <div class="bar">
       <div class="bar-fill" style="width:{v}%;"></div>
     </div>
     <div class="bar-num">{v}/100</div>
     """
 
 
-def _pill_small(text: str) -> str:
-    return f'<span class="pill pill-small">{html.escape(text)}</span>'
+def _mini_kv(k: str, v: str) -> str:
+    return f'<div class="kv"><span class="muted">{k}</span><span class="kvv">{v}</span></div>'
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
@@ -757,7 +760,9 @@ def dashboard():
 
     assets = payload.get("assets", {})
     updated = payload.get("updated_utc", "")
+    feeds_status = (payload.get("meta", {}) or {}).get("feeds_status", {})
 
+    # Pull last headlines (raw)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -768,47 +773,46 @@ def dashboard():
             """)
             rows = cur.fetchall()
 
-    feeds_status = (payload.get("meta", {}) or {}).get("feeds_status", {})
-
     def render_asset(asset: str) -> str:
         a = assets.get(asset, {})
         bias = a.get("bias", "NEUTRAL")
-        score = a.get("score", 0.0)
-        th = a.get("threshold", 1.0)
+        score = safe_float(a.get("score", 0.0))
+        th = safe_float(a.get("threshold", 1.0))
 
         q1 = int(a.get("quality", 0))
         q2 = int(a.get("quality_v2", 0))
+
         ev = int(a.get("evidence_count", 0))
         div = int(a.get("source_diversity", 0))
+        consensus = safe_float(a.get("consensus_ratio", 0.0))
+        conflict = safe_float(a.get("conflict_index", 0.0))
+        fresh = a.get("freshness", {}) or {}
+        top3 = a.get("top3_drivers", []) or []
+        flip = a.get("flip", {}) or {}
+        cbs = a.get("consensus_by_source", []) or []
+        why = a.get("why_top5", []) or []
+        event = a.get("event", {}) or {}
+        event_mode = bool(event.get("event_mode", False))
+        upcoming = event.get("upcoming_events", []) or []
 
-        cons = float(a.get("consensus_ratio", 0.0))
-        conflict = float(a.get("conflict_index", 0.0))
-        fresh = a.get("freshness", {"0-2h": 0, "2-8h": 0, "8-24h": 0})
-        top3 = a.get("top3_drivers", [])
-        flip = a.get("flip", {"to_bullish": 0.0, "to_bearish": 0.0})
-        by_src = a.get("consensus_by_source", [])
-        event = a.get("event", {"event_mode": False, "recent_macro": False, "upcoming_events": []})
-        why = a.get("why_top5", [])
-
-        # WHY
         why_html = ""
         for w in why:
             why_html += f"""
             <li>
               <div class="why-row">
-                <div class="why-title"><b>{html.escape(str(w.get('why','')))}</b></div>
-                <div class="why-meta">contrib={html.escape(str(w.get('contrib','')))}, src={html.escape(str(w.get('source','')))}, age={html.escape(str(w.get('age_min','')))}m</div>
+                <div class="why-title"><b>{w.get('why','')}</b></div>
+                <div class="why-meta">contrib={w.get('contrib','')}, src={w.get('source','')}, age={w.get('age_min','')}m</div>
               </div>
-              <div class="why-headline">{html.escape(str(w.get('title','')))}</div>
-              <a class="tiny" href="{html.escape(str(w.get('link','')))}" target="_blank" rel="noopener">open</a>
+              <div class="why-headline">{w.get('title','')}</div>
+              <a class="tiny" href="{w.get('link','')}" target="_blank" rel="noopener">open</a>
             </li>
             """
 
-        # Latest relevant headlines
+        # relevance filter
         kw = {
-            "XAU": ["fed","fomc","cpi","inflation","yields","usd","risk","gold"],
-            "US500": ["stocks","futures","earnings","downgrade","upgrade","rout","slides","rebound","sp","s&p","nasdaq"],
-            "WTI": ["oil","crude","opec","inventory","stocks","tanker","pipeline","storm","spr"],
+            "XAU": ["fed","fomc","cpi","inflation","yields","usd","risk","gold","treasury","real yields"],
+            "US500": ["stocks","futures","earnings","downgrade","upgrade","rout","slides","rebound","sp","s&p","nasdaq","dow"],
+            "WTI": ["oil","crude","opec","inventory","stocks","tanker","pipeline","storm","spr","sanctions"],
         }[asset]
 
         news_html = ""
@@ -820,71 +824,87 @@ def dashboard():
             shown += 1
             if shown > 9:
                 break
-            news_html += f'<li><a href="{html.escape(link)}" target="_blank" rel="noopener">{html.escape(title)}</a> <span class="muted">[{html.escape(source)}]</span></li>'
+            news_html += f'<li><a href="{link}" target="_blank" rel="noopener">{title}</a> <span class="muted">[{source}]</span></li>'
 
-        # Actionable cards
-        top3_html = ""
-        if top3:
-            for x in top3:
-                top3_html += f"<li>{html.escape(str(x.get('why','')))} <span class='muted'>(abs={html.escape(str(x.get('abs_contrib_sum','')))} )</span></li>"
-        else:
-            top3_html = "<li class='muted'>—</li>"
+        top3_html = "".join([
+            f'<li><span class="muted">{x.get("why","")}</span><span class="kvv">{x.get("abs_contrib_sum","")}</span></li>'
+            for x in top3
+        ]) or "<li class='muted'>—</li>"
 
         flip_html = f"""
-          <div class="kpi-row">
-            <div class="kpi"><div class="k">To BULLISH</div><div class="v">{html.escape(str(flip.get('to_bullish', 0.0)))}</div></div>
-            <div class="kpi"><div class="k">To BEARISH</div><div class="v">{html.escape(str(flip.get('to_bearish', 0.0)))}</div></div>
-          </div>
-          <div class="muted tiny">Δ score needed to cross threshold</div>
+          {_mini_kv("to bullish", str(flip.get("to_bullish", "—")))}
+          {_mini_kv("to bearish", str(flip.get("to_bearish", "—")))}
         """
-
-        src_html = ""
-        if by_src:
-            for s in by_src[:6]:
-                net = float(s.get("net", 0.0))
-                sign = "▲" if net > 0 else ("▼" if net < 0 else "•")
-                src_html += f"""
-                <li>
-                  <span class="muted">[{html.escape(str(s.get('source','')))}]</span>
-                  <b>{sign} net={html.escape(str(s.get('net','')))}</b>
-                  <span class="muted">abs={html.escape(str(s.get('abs','')))} • n={html.escape(str(s.get('count','')))}</span>
-                </li>
-                """
-        else:
-            src_html = "<li class='muted'>—</li>"
 
         fresh_html = f"""
-          <div class="kpi-row">
-            <div class="kpi"><div class="k">0–2h</div><div class="v">{int(fresh.get("0-2h",0))}</div></div>
-            <div class="kpi"><div class="k">2–8h</div><div class="v">{int(fresh.get("2-8h",0))}</div></div>
-            <div class="kpi"><div class="k">8–24h</div><div class="v">{int(fresh.get("8-24h",0))}</div></div>
-          </div>
+          {_mini_kv("0–2h", str(fresh.get("0-2h", 0)))}
+          {_mini_kv("2–8h", str(fresh.get("2-8h", 0)))}
+          {_mini_kv("8–24h", str(fresh.get("8-24h", 0)))}
         """
 
-        event_pill = _pill_small("EVENT MODE") if event.get("event_mode") else _pill_small("NORMAL")
-        upcoming = event.get("upcoming_events", []) or []
-        up_html = ""
-        if upcoming:
-            for e in upcoming[:4]:
-                up_html += f"<li>{html.escape(str(e.get('dt_utc_iso','')))} • {html.escape(str(e.get('impact','')))} • {html.escape(str(e.get('title','')))}</li>"
-        else:
-            up_html = "<li class='muted'>—</li>"
+        cbs_rows = ""
+        for x in cbs[:8]:
+            cbs_rows += f"""
+              <tr>
+                <td>{x.get('source','')}</td>
+                <td class="muted">net={x.get('net','')}</td>
+                <td class="muted">abs={x.get('abs','')}</td>
+                <td class="muted">n={x.get('count','')}</td>
+              </tr>
+            """
+        if not cbs_rows:
+            cbs_rows = "<tr><td class='muted'>—</td><td></td><td></td><td></td></tr>"
+
+        # event mode badge
+        em_badge = ""
+        if event_mode:
+            em_badge = '<span class="pill pill-warn">EVENT MODE</span>'
+
+        upcoming_html = ""
+        for e in upcoming[:6]:
+            upcoming_html += f"""
+              <li>
+                <a href="{e.get('link','')}" target="_blank" rel="noopener">{e.get('title','')}</a>
+                <span class="muted tiny"> • age={e.get('age_min','')}m • {e.get('impact','')}</span>
+              </li>
+            """
+        if not upcoming_html:
+            upcoming_html = "<li class='muted'>—</li>"
 
         return f"""
         <section class="card" id="card-{asset}">
           <div class="card-head">
             <div>
-              <div class="h2">{asset} {_badge(bias)} <span class="muted">score={score} / th={th}</span></div>
-
-              <div class="meta-line">
-                {event_pill}
-                <span class="muted tiny">evidence={ev} • source_diversity={div} • consensus={cons} • conflict={conflict}</span>
-              </div>
+              <div class="h2">{asset} {_badge(bias)} {em_badge} <span class="muted">score={score} / th={th}</span></div>
 
               <div class="quality">
                 <div class="q-label">Signal Quality v2</div>
-                {_bar(q2, "bar-v2")}
-                <div class="muted tiny">v1={q1}/100 • v2={q2}/100</div>
+                {_bar(q2)}
+                <div class="muted tiny">q1={q1} • evidence={ev} • source_diversity={div}</div>
+              </div>
+
+              <div class="grid2" style="margin-top:10px;">
+                <div class="box">
+                  <div class="h3">Top 3 drivers now</div>
+                  <ul class="klist">{top3_html}</ul>
+                </div>
+
+                <div class="box">
+                  <div class="h3">What would flip the bias</div>
+                  {flip_html}
+                  <div class="muted tiny" style="margin-top:6px;">Δ in score units</div>
+                </div>
+
+                <div class="box">
+                  <div class="h3">Consensus / Conflict</div>
+                  {_mini_kv("consensus", str(consensus))}
+                  {_mini_kv("conflict", str(conflict))}
+                </div>
+
+                <div class="box">
+                  <div class="h3">Freshness buckets</div>
+                  {fresh_html}
+                </div>
               </div>
             </div>
 
@@ -894,6 +914,7 @@ def dashboard():
                 <button class="btn" onclick="runNow('{asset}')">Run now</button>
                 <button class="btn" onclick="showJson()">JSON</button>
                 <button class="btn" onclick="showExplain('{asset}')">Explain</button>
+                <button class="btn" onclick="showRules()">Rules</button>
               </div>
               <div class="tiny muted" id="status-{asset}" style="margin-top:6px;"></div>
             </div>
@@ -904,56 +925,43 @@ def dashboard():
               <div class="h3">WHY (top 5)</div>
               <ol class="why">{why_html or "<li>—</li>"}</ol>
 
-              <div class="h3" style="margin-top:14px;">Actionable cards</div>
-              <div class="cards-mini">
-                <div class="mini">
-                  <div class="mini-h">Top 3 drivers now</div>
-                  <ul class="mini-ul">{top3_html}</ul>
-                </div>
-                <div class="mini">
-                  <div class="mini-h">What would flip bias</div>
-                  {flip_html}
-                </div>
-                <div class="mini">
-                  <div class="mini-h">Freshness buckets</div>
-                  {fresh_html}
-                </div>
-                <div class="mini">
-                  <div class="mini-h">Consensus by sources</div>
-                  <ul class="mini-ul">{src_html}</ul>
-                </div>
-                <div class="mini">
-                  <div class="mini-h">Macro event mode</div>
-                  <div class="muted tiny">recent_macro={str(bool(event.get("recent_macro"))).lower()} • ff_cal_enabled={str(bool(event.get("ff_calendar_enabled"))).lower()}</div>
-                  <ul class="mini-ul">{up_html}</ul>
-                </div>
-              </div>
+              <div class="h3" style="margin-top:14px;">Consensus by source (top)</div>
+              <table class="table">
+                <thead>
+                  <tr><th>source</th><th>net</th><th>abs</th><th>n</th></tr>
+                </thead>
+                <tbody>{cbs_rows}</tbody>
+              </table>
             </div>
 
             <div>
               <div class="h3">Latest relevant headlines</div>
               <ul class="news">{news_html or "<li>—</li>"}</ul>
+
+              <div class="h3" style="margin-top:14px;">Upcoming macro (FF calendar, MVP)</div>
+              <ul class="news">{upcoming_html}</ul>
             </div>
           </div>
         </section>
         """
 
+    # feeds health table (snapshot)
     feeds_rows = ""
     for src in RSS_FEEDS.keys():
         st = feeds_status.get(src, {})
-        ok = bool(st.get("ok", False))
+        ok = st.get("ok", False)
         bozo = st.get("bozo", "")
         entries = st.get("entries", "")
         icon = "✅" if ok and int(bozo or 0) == 0 else ("⚠️" if ok else "❌")
         feeds_rows += f"""
         <tr>
-          <td>{icon} {html.escape(src)}</td>
-          <td class="muted">bozo={html.escape(str(bozo))}</td>
-          <td class="muted">entries={html.escape(str(entries))}</td>
+          <td>{icon} {src}</td>
+          <td class="muted">bozo={bozo}</td>
+          <td class="muted">entries={entries}</td>
         </tr>
         """
 
-    html_page = f"""
+    html = f"""
     <html>
     <head>
       <meta charset="utf-8">
@@ -963,11 +971,11 @@ def dashboard():
         :root {{
           --bg:#0b0f17; --card:#121a26; --muted:#93a4b8; --text:#e9f1ff;
           --line:rgba(255,255,255,.08);
-          --bull:#10b981; --bear:#ef4444; --neu:#64748b;
+          --bull:#10b981; --bear:#ef4444; --neu:#64748b; --warn:#f59e0b;
           --btn:#1b2636; --btn2:#223047;
         }}
         body {{ font-family: Arial, sans-serif; background:var(--bg); color:var(--text); margin:0; }}
-        .wrap {{ max-width: 1100px; margin: 20px auto; padding: 0 14px; }}
+        .wrap {{ max-width: 1120px; margin: 20px auto; padding: 0 14px; }}
         .top {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; }}
         h1 {{ margin:0; font-size: 28px; }}
         .muted {{ color:var(--muted); }}
@@ -977,13 +985,18 @@ def dashboard():
         .h2 {{ font-size:22px; font-weight:700; }}
         .h3 {{ font-size:14px; margin: 8px 0; color:#cfe0ff; }}
         .pill {{ padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; vertical-align:middle; }}
-        .pill-small {{ background:rgba(255,255,255,.06); border:1px solid var(--line); color:#cfe0ff; }}
         .pill-bull {{ background:rgba(16,185,129,.18); color:var(--bull); border:1px solid rgba(16,185,129,.35); }}
         .pill-bear {{ background:rgba(239,68,68,.18); color:var(--bear); border:1px solid rgba(239,68,68,.35); }}
         .pill-neutral {{ background:rgba(100,116,139,.18); color:#cbd5e1; border:1px solid rgba(100,116,139,.35); }}
-        .meta-line {{ margin-top:6px; display:flex; gap:10px; align-items:center; flex-wrap:wrap; }}
-        .grid {{ display:grid; grid-template-columns: 1.25fr 1fr; gap:16px; }}
-        @media(max-width: 980px) {{ .grid {{ grid-template-columns: 1fr; }} .card-head {{ flex-direction:column; }} }}
+        .pill-warn {{ background:rgba(245,158,11,.18); color:var(--warn); border:1px solid rgba(245,158,11,.35); }}
+        .grid {{ display:grid; grid-template-columns: 1.2fr 1fr; gap:16px; }}
+        .grid2 {{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }}
+        .box {{ border:1px solid var(--line); border-radius:14px; padding:10px; background:rgba(255,255,255,.02); }}
+        @media(max-width: 980px) {{
+          .grid {{ grid-template-columns: 1fr; }}
+          .grid2 {{ grid-template-columns: 1fr; }}
+          .card-head {{ flex-direction:column; }}
+        }}
         .why, .news {{ margin:0; padding-left:18px; }}
         .why li {{ margin: 10px 0; }}
         .why-row {{ display:flex; justify-content:space-between; gap:10px; }}
@@ -991,7 +1004,7 @@ def dashboard():
         .why-headline {{ margin-top:4px; }}
         a {{ color:#7dd3fc; text-decoration:none; }}
         a:hover {{ text-decoration:underline; }}
-        .actions {{ min-width: 260px; text-align:right; }}
+        .actions {{ min-width: 300px; text-align:right; }}
         .btnrow {{ display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }}
         .btn {{
           background:var(--btn);
@@ -1003,21 +1016,27 @@ def dashboard():
           font-weight:700;
         }}
         .btn:hover {{ background:var(--btn2); }}
-        .quality {{ margin-top:10px; }}
+        .quality {{ margin-top:8px; }}
         .q-label {{ font-weight:700; margin-bottom:6px; }}
         .bar {{ height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; }}
         .bar-fill {{ height:10px; background:linear-gradient(90deg, rgba(16,185,129,.9), rgba(239,68,68,.9)); }}
-        .bar.bar-v2 .bar-fill {{ background:linear-gradient(90deg, rgba(125,211,252,.9), rgba(16,185,129,.9)); }}
         .bar-num {{ margin-top:6px; font-weight:700; }}
-        .table {{ width:100%; border-collapse:collapse; }}
+        .table {{ width:100%; border-collapse:collapse; font-size: 13px; }}
+        .table th {{ text-align:left; color:#cfe0ff; font-weight:700; padding:8px 6px; border-top:1px solid var(--line); }}
         .table td {{ border-top:1px solid var(--line); padding:8px 6px; }}
+        .klist {{ list-style:none; margin:0; padding:0; }}
+        .klist li {{ display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-top:1px solid rgba(255,255,255,.06); }}
+        .klist li:first-child {{ border-top:none; }}
+        .kv {{ display:flex; justify-content:space-between; gap:12px; padding:6px 0; border-top:1px solid rgba(255,255,255,.06); }}
+        .kv:first-child {{ border-top:none; }}
+        .kvv {{ font-weight:700; }}
         .modal {{
           position:fixed; inset:0; background:rgba(0,0,0,.6);
           display:none; align-items:center; justify-content:center; padding:16px;
         }}
         .modal.show {{ display:flex; }}
         .modal-box {{
-          width:min(980px, 100%); max-height: 85vh; overflow:auto;
+          width:min(1040px, 100%); max-height: 85vh; overflow:auto;
           background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px;
         }}
         pre {{
@@ -1025,35 +1044,6 @@ def dashboard():
           padding:12px; border-radius:12px; overflow:auto;
         }}
         .modal-head {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
-
-        .cards-mini {{
-          display:grid;
-          grid-template-columns: repeat(2, minmax(0, 1fr));
-          gap:10px;
-          margin-top:8px;
-        }}
-        @media(max-width: 720px) {{
-          .cards-mini {{ grid-template-columns: 1fr; }}
-        }}
-        .mini {{
-          background:rgba(255,255,255,.04);
-          border:1px solid var(--line);
-          border-radius:14px;
-          padding:10px;
-        }}
-        .mini-h {{ font-weight:800; margin-bottom:6px; }}
-        .mini-ul {{ margin:0; padding-left:18px; }}
-        .kpi-row {{ display:flex; gap:10px; margin-top:6px; flex-wrap:wrap; }}
-        .kpi {{
-          flex:1;
-          min-width: 120px;
-          background:rgba(255,255,255,.04);
-          border:1px solid var(--line);
-          border-radius:12px;
-          padding:8px;
-        }}
-        .k {{ color:var(--muted); font-size:12px; }}
-        .v {{ font-size:18px; font-weight:900; }}
       </style>
     </head>
     <body>
@@ -1061,7 +1051,7 @@ def dashboard():
         <div class="top">
           <div>
             <h1>News Bias Dashboard</h1>
-            <div class="muted tiny">updated_utc: {html.escape(str(updated))}</div>
+            <div class="muted tiny">updated_utc: {updated}</div>
           </div>
           <div class="muted tiny">Tip: open <b>/</b> → redirects here. Use your domain as the short link.</div>
         </div>
@@ -1080,12 +1070,10 @@ def dashboard():
           <div class="muted tiny" style="margin-top:10px;">
             Deep debug: <a href="/feeds_health" target="_blank" rel="noopener">/feeds_health</a> (live parse now)
           </div>
-          <div class="muted tiny" style="margin-top:8px;">
-            FF calendar: enabled={str(FF_CAL_ENABLED).lower()} • url={html.escape(FF_CAL_URL)}
-          </div>
         </section>
       </div>
 
+      <!-- MODAL -->
       <div class="modal" id="modal">
         <div class="modal-box">
           <div class="modal-head">
@@ -1111,11 +1099,6 @@ def dashboard():
           el.innerText = 'Running...';
           try {{
             const resp = await fetch('/run', {{ method:'POST' }});
-            if (!resp.ok) {{
-              const t = await resp.text();
-              el.innerText = 'HTTP ' + resp.status + ': ' + t;
-              return;
-            }}
             const data = await resp.json();
             el.innerText = 'Updated: ' + (data.updated_utc || '');
             setTimeout(() => window.location.reload(), 350);
@@ -1134,9 +1117,19 @@ def dashboard():
           }}
         }}
 
+        async function showRules() {{
+          try {{
+            const resp = await fetch('/rules');
+            const txt = await resp.text();
+            openModal('Rules', '<pre>' + escapeHtml(txt) + '</pre>');
+          }} catch(e) {{
+            openModal('Rules', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
         async function showExplain(asset) {{
           try {{
-            const resp = await fetch('/explain?asset=' + encodeURIComponent(asset) + '&limit=50');
+            const resp = await fetch('/explain?asset=' + encodeURIComponent(asset) + '&limit=60');
             const data = await resp.json();
             if (data.error) {{
               openModal('Explain ' + asset, '<div class="muted">' + escapeHtml(data.error) + '</div>');
@@ -1144,11 +1137,12 @@ def dashboard():
             }}
             const rows = (data.top_matches || []).map(x => {{
               return `<tr>
-                <td style="padding:6px;border-top:1px solid rgba(255,255,255,.08);">
+                <td style="padding:8px 6px;border-top:1px solid rgba(255,255,255,.08);">
                   <b>${{escapeHtml(x.why || '')}}</b>
-                  <div class="muted tiny">${{escapeHtml(x.source || '')}} • age=${{x.age_min}}m • contrib=${{x.contrib}}</div>
+                  <div class="muted tiny">${{escapeHtml(x.source || '')}} • age=${{x.age_min}}m • contrib=${{x.contrib}} • w=${{x.base_w}} • src_w=${{x.src_w}} • time_w=${{x.time_w}}</div>
+                  <div class="muted tiny">pattern: ${{escapeHtml(x.pattern || '')}}</div>
                 </td>
-                <td style="padding:6px;border-top:1px solid rgba(255,255,255,.08);">
+                <td style="padding:8px 6px;border-top:1px solid rgba(255,255,255,.08);">
                   <a href="${{x.link}}" target="_blank" rel="noopener">${{escapeHtml(x.title || '')}}</a>
                 </td>
               </tr>`;
@@ -1176,4 +1170,4 @@ def dashboard():
     </body>
     </html>
     """
-    return html_page
+    return html

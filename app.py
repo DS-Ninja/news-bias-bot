@@ -3,12 +3,12 @@ import json
 import time
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import feedparser
 import psycopg2
 from fastapi import FastAPI
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 
 
 # ============================================================
@@ -48,12 +48,9 @@ RSS_FEEDS = {
     "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
     "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
     "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
-
-    # OPTIONAL (X / POTUS): нет нативного RSS, держи placeholder
-    # "POTUS_X_RSS": "https://<your-rss-generator>/x.com/POTUS",
 }
 
-# impact weights by source (heuristic)
+# impact weights by source (MVP heuristic)
 SOURCE_WEIGHT = {
     "FED": 3.0,
     "BLS": 3.0,
@@ -92,7 +89,6 @@ BIAS_THRESH = {
 
 # ============================================================
 # RULES: regex patterns -> signed weight + explanation
-# Each match adds (weight * source_weight * time_decay)
 # ============================================================
 
 RULES: Dict[str, List[Tuple[str, float, str]]] = {
@@ -177,51 +173,45 @@ def fingerprint(title: str, link: str) -> str:
 
 
 # ============================================================
+# FEEDS HEALTH (live parse)
+# ============================================================
+
+def feeds_health_live() -> Dict[str, Any]:
+    out: Dict[str, Any] = {}
+    for src, url in RSS_FEEDS.items():
+        try:
+            d = feedparser.parse(url)
+            entries = getattr(d, "entries", []) or []
+            out[src] = {
+                "ok": True,
+                "bozo": int(getattr(d, "bozo", 0)),
+                "entries": len(entries),
+                "bozo_exception": str(getattr(d, "bozo_exception", ""))[:240] if getattr(d, "bozo", 0) else "",
+            }
+        except Exception as e:
+            out[src] = {"ok": False, "error": str(e)}
+    return out
+
+
+# ============================================================
 # INGEST
 # ============================================================
 
-def _entry_published_ts(e: dict, now_ts: int) -> int:
-    # Prefer published_parsed, but some feeds use updated_parsed
-    pp = e.get("published_parsed")
-    if pp:
-        return int(time.mktime(pp))
-    up = e.get("updated_parsed")
-    if up:
-        return int(time.mktime(up))
-    return now_ts
-
-
-def ingest_once(limit_per_feed: int = 30) -> Dict[str, Any]:
+def ingest_once(limit_per_feed: int = 30) -> int:
     inserted = 0
     now = int(time.time())
-
-    per_feed = {}
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             for src, url in RSS_FEEDS.items():
-                try:
-                    d = feedparser.parse(url)
-                except Exception as ex:
-                    per_feed[src] = {"ok": False, "error": str(ex), "entries": 0, "bozo": 1}
-                    continue
-
+                d = feedparser.parse(url)
                 entries = getattr(d, "entries", []) or []
-                bozo = int(getattr(d, "bozo", 0))
 
-                # IMPORTANT:
-                # bozo=1 can still be usable (you already saw: FED/BLS can be bozo=1 but entries exist)
-                # We only skip when it's bozo AND empty.
-                if bozo == 1 and len(entries) == 0:
-                    per_feed[src] = {
-                        "ok": False,
-                        "error": str(getattr(d, "bozo_exception", "bozo + empty")),
-                        "entries": 0,
-                        "bozo": 1,
-                    }
+                # Important nuance:
+                # If bozo==1 but entries exist — still ingest (FED/OILPRICE often do this).
+                # If bozo==1 and entries==0 — skip as truly broken.
+                if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
                     continue
-
-                per_feed[src] = {"ok": True, "entries": len(entries), "bozo": bozo}
 
                 for e in entries[:limit_per_feed]:
                     title = (e.get("title") or "").strip()
@@ -229,7 +219,12 @@ def ingest_once(limit_per_feed: int = 30) -> Dict[str, Any]:
                     if not title or not link:
                         continue
 
-                    published_ts = _entry_published_ts(e, now)
+                    published_parsed = e.get("published_parsed")
+                    if published_parsed:
+                        published_ts = int(time.mktime(published_parsed))
+                    else:
+                        published_ts = now
+
                     fp = fingerprint(title, link)
 
                     try:
@@ -249,7 +244,7 @@ def ingest_once(limit_per_feed: int = 30) -> Dict[str, Any]:
 
         conn.commit()
 
-    return {"inserted": inserted, "feeds": per_feed}
+    return inserted
 
 
 # ============================================================
@@ -269,28 +264,7 @@ def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
     return out
 
 
-def _quality_score(abs_score: float, threshold: float, evidence_count: int, src_diversity: int) -> int:
-    """
-    Quality: 0..100
-    - core: abs_score vs threshold (clipped)
-    - bonus: more evidence and more sources (diversity)
-    """
-    if threshold <= 0:
-        threshold = 1.0
-
-    core = min(1.5, abs_score / threshold)  # allow >1 for strong signals, but clip
-    core01 = min(1.0, core)                 # 0..1
-
-    # evidence bonus: saturates quickly
-    ev_bonus = min(0.20, evidence_count * 0.02)     # up to +0.20
-    src_bonus = min(0.15, src_diversity * 0.03)     # up to +0.15
-
-    q = (core01 + ev_bonus + src_bonus)
-    q = max(0.0, min(1.0, q))
-    return int(round(q * 100))
-
-
-def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> Dict[str, Any]:
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 800):
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -314,9 +288,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> Dict[str, A
         total = 0.0
         why_all = []
 
-        src_set = set()
-        evidence_fp = set()  # unique news items contributing (by link/title)
-
         for (source, title, link, ts) in rows:
             age = now - int(ts)
             w_src = SOURCE_WEIGHT.get(source, 1.0)
@@ -325,9 +296,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> Dict[str, A
             matches = match_rules(asset, title)
             if not matches:
                 continue
-
-            src_set.add(source)
-            evidence_fp.add(fingerprint(title, link))
 
             for m in matches:
                 base_w = m["w"]
@@ -357,20 +325,19 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> Dict[str, A
 
         why_top5 = sorted(why_all, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
 
-        quality = _quality_score(
-            abs_score=abs(total),
-            threshold=th,
-            evidence_count=len(evidence_fp),
-            src_diversity=len(src_set),
-        )
+        # Simple quality score (v1): evidence + diversity + strength vs threshold
+        evidence_count = len(why_all)
+        src_div = len(set([w["source"] for w in why_all])) if why_all else 0
+        strength = min(1.0, abs(total) / max(th, 1e-9))
+        quality = int(min(100, (strength * 60.0) + min(30, evidence_count * 2.0) + min(10, src_div * 2.0)))
 
         assets_out[asset] = {
             "bias": bias,
             "score": round(total, 4),
             "threshold": th,
-            "quality": quality,                    # 0..100
-            "evidence_count": len(evidence_fp),     # how many unique news items drove the score
-            "source_diversity": len(src_set),
+            "quality": quality,
+            "evidence_count": evidence_count,
+            "source_diversity": src_div,
             "why_top5": why_top5,
         }
 
@@ -405,23 +372,26 @@ def save_bias(payload: dict):
         conn.commit()
 
 
-def load_bias():
+def load_bias() -> Optional[dict]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("SELECT updated_ts, payload_json FROM bias_state WHERE id=1;")
             row = cur.fetchone()
     if not row:
         return None
-    updated_ts, payload_json = row
-    return {"updated_ts": updated_ts, "payload": json.loads(payload_json)}
+    _updated_ts, payload_json = row
+    return json.loads(payload_json)
 
 
-def pipeline_run() -> Dict[str, Any]:
+def pipeline_run():
     db_init()
-    ingest_meta = ingest_once(limit_per_feed=30)
+    inserted = ingest_once(limit_per_feed=30)
     payload = compute_bias(lookback_hours=24, limit_rows=800)
-    payload["meta"]["inserted_last_run"] = ingest_meta.get("inserted", 0)
-    payload["meta"]["feeds_status"] = ingest_meta.get("feeds", {})
+
+    # Attach feeds snapshot (last run)
+    payload["meta"]["inserted_last_run"] = inserted
+    payload["meta"]["feeds_status"] = feeds_health_live()
+
     save_bias(payload)
     return payload
 
@@ -435,7 +405,6 @@ app = FastAPI(title="News Bias Bot (MVP)")
 
 @app.get("/", include_in_schema=False)
 def root():
-    # Short entrypoint -> dashboard
     return RedirectResponse(url="/dashboard", status_code=302)
 
 
@@ -445,17 +414,20 @@ def health():
 
 
 @app.get("/bias")
-def bias():
+def bias(pretty: int = 0):
     db_init()
     state = load_bias()
     if not state:
-        return pipeline_run()
-    return state["payload"]
+        state = pipeline_run()
+
+    if pretty:
+        return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
+
+    return JSONResponse(state)
 
 
-@app.get("/run")
+@app.post("/run")
 def run_now():
-    # Manual trigger from browser
     return pipeline_run()
 
 
@@ -536,189 +508,328 @@ def explain(asset: str = "US500", limit: int = 50):
 
 @app.get("/feeds_health")
 def feeds_health():
-    out = {}
-    for src, url in RSS_FEEDS.items():
-        try:
-            d = feedparser.parse(url)
-            out[src] = {
-                "bozo": int(getattr(d, "bozo", 0)),
-                "entries": len(getattr(d, "entries", []) or []),
-                "ok": True if len(getattr(d, "entries", []) or []) > 0 else False,
-            }
-        except Exception as e:
-            out[src] = {"ok": False, "error": str(e)}
-    return out
+    # Live parse (deep debug)
+    return feeds_health_live()
 
 
 # ============================================================
-# DASHBOARD
+# DASHBOARD UI
 # ============================================================
 
 def _badge(bias: str) -> str:
     if bias == "BULLISH":
-        return '<span style="padding:4px 10px;border-radius:10px;background:#0b6; color:#fff;">BULLISH</span>'
+        return '<span class="pill pill-bull">BULLISH</span>'
     if bias == "BEARISH":
-        return '<span style="padding:4px 10px;border-radius:10px;background:#d33; color:#fff;">BEARISH</span>'
-    return '<span style="padding:4px 10px;border-radius:10px;background:#666; color:#fff;">NEUTRAL</span>'
+        return '<span class="pill pill-bear">BEARISH</span>'
+    return '<span class="pill pill-neutral">NEUTRAL</span>'
 
 
-def _bar(pct: int) -> str:
-    pct = max(0, min(100, int(pct)))
-    # neutral gray background, colored fill by pct thresholds
-    fill = "#d33" if pct >= 70 else ("#f0a000" if pct >= 45 else "#666")
+def _bar(value: int) -> str:
+    v = max(0, min(100, int(value)))
     return f"""
-    <div style="width:220px;background:#eee;border-radius:999px;overflow:hidden;border:1px solid #ddd;display:inline-block;vertical-align:middle;">
-      <div style="width:{pct}%;background:{fill};height:10px;"></div>
+    <div class="bar">
+      <div class="bar-fill" style="width:{v}%;"></div>
     </div>
-    <span style="margin-left:8px;color:#555;">{pct}/100</span>
+    <div class="bar-num">{v}/100</div>
     """
 
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
-    st = load_bias()
-    payload = st["payload"] if st else pipeline_run()
+    db_init()
+    payload = load_bias()
+    if not payload:
+        payload = pipeline_run()
 
     assets = payload.get("assets", {})
     updated = payload.get("updated_utc", "")
-    feeds_status = payload.get("meta", {}).get("feeds_status", {})
 
+    # Pull last headlines (raw) and show limited
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 ORDER BY published_ts DESC
-                LIMIT 70;
+                LIMIT 80;
             """)
             rows = cur.fetchall()
 
+    feeds_status = (payload.get("meta", {}) or {}).get("feeds_status", {})
+
     def render_asset(asset: str) -> str:
-        a = assets.get(asset, {"bias": "NEUTRAL", "score": 0.0, "why_top5": []})
+        a = assets.get(asset, {"bias": "NEUTRAL", "score": 0.0, "threshold": 1.0, "quality": 0, "why_top5": []})
         bias = a.get("bias", "NEUTRAL")
         score = a.get("score", 0.0)
-        th = a.get("threshold", BIAS_THRESH.get(asset, 1.0))
+        th = a.get("threshold", 1.0)
         quality = int(a.get("quality", 0))
-        evid = int(a.get("evidence_count", 0))
+        ev = int(a.get("evidence_count", 0))
         div = int(a.get("source_diversity", 0))
         why = a.get("why_top5", [])
 
         why_html = ""
         for w in why:
             why_html += f"""
-            <li style="margin-bottom:8px;">
-              <div><b>{w.get('why','')}</b>
-              <span style="color:#999;">(contrib={w.get('contrib','')}, src={w.get('source','')}, age={w.get('age_min','')}m)</span></div>
-              <div style="color:#333;">{w.get('title','')}</div>
-              <div style="margin-top:3px;"><a href="{w.get('link','')}" target="_blank" style="color:#2157f3;text-decoration:none;">open</a></div>
+            <li>
+              <div class="why-row">
+                <div class="why-title"><b>{w.get('why','')}</b></div>
+                <div class="why-meta">contrib={w.get('contrib','')}, src={w.get('source','')}, age={w.get('age_min','')}m</div>
+              </div>
+              <div class="why-headline">{w.get('title','')}</div>
+              <a class="tiny" href="{w.get('link','')}" target="_blank" rel="noopener">open</a>
             </li>
             """
 
         kw = {
-            "XAU": ["fed", "fomc", "cpi", "inflation", "yields", "usd", "risk", "gold", "treasury", "vix"],
-            "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "rout", "slides", "rebound", "sp", "s&p", "nasdaq"],
-            "WTI": ["oil", "crude", "opec", "inventory", "stocks", "tanker", "pipeline", "storm", "spr", "sanctions"],
+            "XAU": ["fed","fomc","cpi","inflation","yields","usd","risk","gold"],
+            "US500": ["stocks","futures","earnings","downgrade","upgrade","rout","slides","rebound","sp","s&p","nasdaq"],
+            "WTI": ["oil","crude","opec","inventory","stocks","tanker","pipeline","storm","spr"],
         }[asset]
 
         news_html = ""
         shown = 0
-        for (source, title, link, ts) in rows:
+        for (source, title, link, _ts) in rows:
             t = (title or "").lower()
             if not any(k in t for k in kw):
                 continue
             shown += 1
-            if shown > 10:
+            if shown > 9:
                 break
-            news_html += f'<li><a href="{link}" target="_blank" style="text-decoration:none;color:#222;">{title}</a> <span style="color:#999;">[{source}]</span></li>'
+            news_html += f'<li><a href="{link}" target="_blank" rel="noopener">{title}</a> <span class="muted">[{source}]</span></li>'
 
         return f"""
-        <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:12px 0;background:#fff;">
-          <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
+        <section class="card" id="card-{asset}">
+          <div class="card-head">
             <div>
-              <h2 style="margin:0 0 6px 0;">{asset} {_badge(bias)}
-                <span style="color:#666;font-size:14px;margin-left:10px;">score={score} / th={th}</span>
-              </h2>
-              <div style="margin:6px 0;color:#444;">
-                <span style="margin-right:10px;"><b>Quality</b> { _bar(quality) }</span>
-              </div>
-              <div style="margin:6px 0;color:#666;font-size:13px;">
-                evidence={evid} • source_diversity={div}
+              <div class="h2">{asset} {_badge(bias)} <span class="muted">score={score} / th={th}</span></div>
+              <div class="quality">
+                <div class="q-label">Quality</div>
+                {_bar(quality)}
+                <div class="muted tiny">evidence={ev} • source_diversity={div}</div>
               </div>
             </div>
-            <div style="min-width:260px;">
-              <div style="border:1px solid #eee;border-radius:12px;padding:10px;background:#fafafa;">
-                <div style="color:#555;font-size:12px;margin-bottom:6px;">Quick actions</div>
-                <div style="display:flex;gap:8px;flex-wrap:wrap;">
-                  <a href="/run" style="padding:6px 10px;border-radius:10px;background:#222;color:#fff;text-decoration:none;">Run now</a>
-                  <a href="/bias" style="padding:6px 10px;border-radius:10px;background:#eee;color:#111;text-decoration:none;border:1px solid #ddd;">JSON</a>
-                  <a href="/explain?asset={asset}" style="padding:6px 10px;border-radius:10px;background:#eee;color:#111;text-decoration:none;border:1px solid #ddd;">Explain</a>
-                </div>
+
+            <div class="actions">
+              <div class="muted tiny" style="margin-bottom:6px;">Quick actions</div>
+              <div class="btnrow">
+                <button class="btn" onclick="runNow('{asset}')">Run now</button>
+                <button class="btn" onclick="showJson()">JSON</button>
+                <button class="btn" onclick="showExplain('{asset}')">Explain</button>
               </div>
+              <div class="tiny muted" id="status-{asset}" style="margin-top:6px;"></div>
             </div>
           </div>
 
-          <div style="margin:12px 0;">
-            <h3 style="margin:0 0 8px 0;">WHY (top 5)</h3>
-            <ol style="margin:0;padding-left:18px;">{why_html or "<li>—</li>"}</ol>
-          </div>
+          <div class="grid">
+            <div>
+              <div class="h3">WHY (top 5)</div>
+              <ol class="why">{why_html or "<li>—</li>"}</ol>
+            </div>
 
-          <div style="margin:12px 0;">
-            <h3 style="margin:0 0 8px 0;">Latest relevant headlines</h3>
-            <ul style="margin:0;padding-left:18px;line-height:1.5;">{news_html or "<li>—</li>"}</ul>
+            <div>
+              <div class="h3">Latest relevant headlines</div>
+              <ul class="news">{news_html or "<li>—</li>"}</ul>
+            </div>
           </div>
-        </div>
+        </section>
         """
 
-    # feed summary
-    feed_rows = ""
-    for k, v in (feeds_status or {}).items():
-        ok = "✅" if v.get("ok") else "⚠️"
-        feed_rows += f"<tr><td style='padding:6px 8px;border-bottom:1px solid #eee;'>{ok} {k}</td>" \
-                     f"<td style='padding:6px 8px;border-bottom:1px solid #eee;color:#555;'>bozo={v.get('bozo')}</td>" \
-                     f"<td style='padding:6px 8px;border-bottom:1px solid #eee;color:#555;'>entries={v.get('entries')}</td></tr>"
+    # feeds health table (snapshot)
+    feeds_rows = ""
+    for src in RSS_FEEDS.keys():
+        st = feeds_status.get(src, {})
+        ok = st.get("ok", False)
+        bozo = st.get("bozo", "")
+        entries = st.get("entries", "")
+        icon = "✅" if ok and int(bozo or 0) == 0 else ("⚠️" if ok else "❌")
+        feeds_rows += f"""
+        <tr>
+          <td>{icon} {src}</td>
+          <td class="muted">bozo={bozo}</td>
+          <td class="muted">entries={entries}</td>
+        </tr>
+        """
 
     html = f"""
     <html>
     <head>
       <meta charset="utf-8">
-      <title>News Bias Dashboard</title>
       <meta name="viewport" content="width=device-width, initial-scale=1">
+      <title>News Bias Dashboard</title>
+      <style>
+        :root {{
+          --bg:#0b0f17; --card:#121a26; --muted:#93a4b8; --text:#e9f1ff;
+          --line:rgba(255,255,255,.08);
+          --bull:#10b981; --bear:#ef4444; --neu:#64748b;
+          --btn:#1b2636; --btn2:#223047;
+        }}
+        body {{ font-family: Arial, sans-serif; background:var(--bg); color:var(--text); margin:0; }}
+        .wrap {{ max-width: 1040px; margin: 20px auto; padding: 0 14px; }}
+        .top {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; }}
+        h1 {{ margin:0; font-size: 28px; }}
+        .muted {{ color:var(--muted); }}
+        .tiny {{ font-size:12px; }}
+        .card {{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; margin: 14px 0; }}
+        .card-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }}
+        .h2 {{ font-size:22px; font-weight:700; }}
+        .h3 {{ font-size:14px; margin: 8px 0; color:#cfe0ff; }}
+        .pill {{ padding:4px 10px; border-radius:999px; font-size:12px; font-weight:700; vertical-align:middle; }}
+        .pill-bull {{ background:rgba(16,185,129,.18); color:var(--bull); border:1px solid rgba(16,185,129,.35); }}
+        .pill-bear {{ background:rgba(239,68,68,.18); color:var(--bear); border:1px solid rgba(239,68,68,.35); }}
+        .pill-neutral {{ background:rgba(100,116,139,.18); color:#cbd5e1; border:1px solid rgba(100,116,139,.35); }}
+        .grid {{ display:grid; grid-template-columns: 1.15fr 1fr; gap:16px; }}
+        @media(max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} .card-head {{ flex-direction:column; }} }}
+        .why, .news {{ margin:0; padding-left:18px; }}
+        .why li {{ margin: 10px 0; }}
+        .why-row {{ display:flex; justify-content:space-between; gap:10px; }}
+        .why-meta {{ color:var(--muted); font-size:12px; }}
+        .why-headline {{ margin-top:4px; }}
+        a {{ color:#7dd3fc; text-decoration:none; }}
+        a:hover {{ text-decoration:underline; }}
+        .actions {{ min-width: 260px; text-align:right; }}
+        .btnrow {{ display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }}
+        .btn {{
+          background:var(--btn);
+          border:1px solid var(--line);
+          color:var(--text);
+          padding:8px 10px;
+          border-radius:12px;
+          cursor:pointer;
+          font-weight:700;
+        }}
+        .btn:hover {{ background:var(--btn2); }}
+        .quality {{ margin-top:8px; }}
+        .q-label {{ font-weight:700; margin-bottom:6px; }}
+        .bar {{ height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; }}
+        .bar-fill {{ height:10px; background:linear-gradient(90deg, rgba(16,185,129,.9), rgba(239,68,68,.9)); }}
+        .bar-num {{ margin-top:6px; font-weight:700; }}
+        .table {{ width:100%; border-collapse:collapse; }}
+        .table td {{ border-top:1px solid var(--line); padding:8px 6px; }}
+        .modal {{
+          position:fixed; inset:0; background:rgba(0,0,0,.6);
+          display:none; align-items:center; justify-content:center; padding:16px;
+        }}
+        .modal.show {{ display:flex; }}
+        .modal-box {{
+          width:min(980px, 100%); max-height: 85vh; overflow:auto;
+          background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px;
+        }}
+        pre {{
+          background:rgba(255,255,255,.06);
+          padding:12px; border-radius:12px; overflow:auto;
+        }}
+        .modal-head {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+      </style>
     </head>
-    <body style="font-family:Arial, sans-serif; max-width:1060px; margin:24px auto; padding:0 12px; background:#f6f7f9;">
-      <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap;">
-        <div>
-          <h1 style="margin:0 0 6px 0;">News Bias Dashboard</h1>
-          <div style="color:#666;margin-bottom:10px;">updated_utc: {updated}</div>
+    <body>
+      <div class="wrap">
+        <div class="top">
+          <div>
+            <h1>News Bias Dashboard</h1>
+            <div class="muted tiny">updated_utc: {updated}</div>
+          </div>
+          <div class="muted tiny">Tip: open <b>/</b> → redirects here. Use your domain as the short link.</div>
         </div>
-        <div style="color:#666;font-size:12px;margin-bottom:10px;">
-          Tip: open <b>/</b> (root) → redirects here. Use your domain as the short link.
+
+        {render_asset("XAU")}
+        {render_asset("US500")}
+        {render_asset("WTI")}
+
+        <section class="card">
+          <div class="h3">Feeds health (last run snapshot)</div>
+          <table class="table">
+            <tbody>
+              {feeds_rows}
+            </tbody>
+          </table>
+          <div class="muted tiny" style="margin-top:10px;">
+            Deep debug: <a href="/feeds_health" target="_blank" rel="noopener">/feeds_health</a> (live parse now)
+          </div>
+        </section>
+      </div>
+
+      <!-- MODALS -->
+      <div class="modal" id="modal">
+        <div class="modal-box">
+          <div class="modal-head">
+            <div class="h2" id="modal-title">Modal</div>
+            <button class="btn" onclick="closeModal()">Close</button>
+          </div>
+          <div id="modal-body" style="margin-top:10px;"></div>
         </div>
       </div>
 
-      {render_asset("XAU")}
-      {render_asset("US500")}
-      {render_asset("WTI")}
+      <script>
+        function openModal(title, bodyHtml) {{
+          document.getElementById('modal-title').innerText = title;
+          document.getElementById('modal-body').innerHTML = bodyHtml;
+          document.getElementById('modal').classList.add('show');
+        }}
+        function closeModal() {{
+          document.getElementById('modal').classList.remove('show');
+        }}
 
-      <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:12px 0;background:#fff;">
-        <h3 style="margin:0 0 8px 0;">Feeds health (last run snapshot)</h3>
-        <table style="width:100%;border-collapse:collapse;font-size:13px;">
-          <thead>
-            <tr>
-              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Feed</th>
-              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Status</th>
-              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Entries</th>
-            </tr>
-          </thead>
-          <tbody>{feed_rows or ""}</tbody>
-        </table>
-        <div style="color:#999;margin-top:10px;font-size:12px;">
-          Deep debug: /feeds_health (live parse now)
-        </div>
-      </div>
+        async function runNow(asset) {{
+          const el = document.getElementById('status-' + asset);
+          el.innerText = 'Running...';
+          try {{
+            const resp = await fetch('/run', {{ method:'POST' }});
+            const data = await resp.json();
+            el.innerText = 'Updated: ' + (data.updated_utc || '');
+            // simplest reliable refresh: reload dashboard to refresh all cards
+            // (fast + avoids partial UI bugs)
+            setTimeout(() => window.location.reload(), 350);
+          }} catch(e) {{
+            el.innerText = 'Error: ' + e;
+          }}
+        }}
 
-      <div style="color:#999;margin-top:16px;font-size:12px;">
-        Next upgrade: add “Signal Quality v2” (consensus, conflict, freshness buckets, macro-event tagging).
-      </div>
+        async function showJson() {{
+          try {{
+            const resp = await fetch('/bias?pretty=1');
+            const txt = await resp.text();
+            openModal('JSON (pretty)', '<pre>' + escapeHtml(txt) + '</pre>');
+          }} catch(e) {{
+            openModal('JSON', '<div class="muted">Error: ' + e + '</div>');
+          }}
+        }}
+
+        async function showExplain(asset) {{
+          try {{
+            const resp = await fetch('/explain?asset=' + encodeURIComponent(asset) + '&limit=50');
+            const data = await resp.json();
+            if (data.error) {{
+              openModal('Explain ' + asset, '<div class="muted">' + escapeHtml(data.error) + '</div>');
+              return;
+            }}
+            const rows = (data.top_matches || []).map(x => {{
+              return `<tr>
+                <td style="padding:6px;border-top:1px solid rgba(255,255,255,.08);">${{escapeHtml(x.why || '')}}<div class="muted tiny">${{escapeHtml(x.source || '')}} • age=${{x.age_min}}m • contrib=${{x.contrib}}</div></td>
+                <td style="padding:6px;border-top:1px solid rgba(255,255,255,.08);">
+                  <a href="${{x.link}}" target="_blank" rel="noopener">${{escapeHtml(x.title || '')}}</a>
+                </td>
+              </tr>`;
+            }}).join('');
+            const html = `
+              <div class="muted tiny">rules_count=${{data.rules_count}} • items=${{(data.top_matches||[]).length}}</div>
+              <table style="width:100%;border-collapse:collapse;margin-top:10px;">
+                <tbody>${{rows || '<tr><td class="muted">—</td></tr>'}}</tbody>
+              </table>
+            `;
+            openModal('Explain ' + asset, html);
+          }} catch(e) {{
+            openModal('Explain ' + asset, '<div class="muted">Error: ' + e + '</div>');
+          }}
+        }}
+
+        function escapeHtml(unsafe) {{
+          return (unsafe || '').replaceAll('&', '&amp;')
+            .replaceAll('<', '&lt;')
+            .replaceAll('>', '&gt;')
+            .replaceAll('"', '&quot;')
+            .replaceAll("'", '&#039;');
+        }}
+      </script>
     </body>
     </html>
     """

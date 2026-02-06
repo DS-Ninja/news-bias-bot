@@ -3,8 +3,7 @@ import json
 import time
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Any, Optional
-from urllib.parse import quote_plus
+from typing import Dict, List, Tuple, Any
 
 import feedparser
 import psycopg2
@@ -17,7 +16,6 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 # ============================================================
 
 ASSETS = ["XAU", "US500", "WTI"]
-DEFAULT_LOOKBACK_H = 24
 
 RSS_FEEDS = {
     # Macro / Rates / USD drivers
@@ -37,7 +35,7 @@ RSS_FEEDS = {
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
     "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
 
-    # MarketWatch
+    # MarketWatch (valid RSS feeds)
     "MARKETWATCH_TOP_STORIES": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "MARKETWATCH_REAL_TIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
     "MARKETWATCH_BREAKING": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
@@ -46,13 +44,16 @@ RSS_FEEDS = {
     # Financial Times (may be restricted; ok to try)
     "FT_PRECIOUS_METALS": "https://www.ft.com/precious-metals?format=rss",
 
-    # DailyForex
+    # DailyForex (RSS)
     "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
     "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
     "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
+
+    # OPTIONAL (X / POTUS): нет нативного RSS, держи placeholder
+    # "POTUS_X_RSS": "https://<your-rss-generator>/x.com/POTUS",
 }
 
-# impact weights by source (MVP heuristic)
+# impact weights by source (heuristic)
 SOURCE_WEIGHT = {
     "FED": 3.0,
     "BLS": 3.0,
@@ -130,13 +131,6 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
     ],
 }
 
-# dashboard relevance keywords (fast heuristic filter)
-DASH_KW = {
-    "XAU": ["gold", "xau", "fed", "fomc", "cpi", "inflation", "yields", "usd", "dollar", "risk", "treasury", "real yields"],
-    "US500": ["stocks", "equities", "futures", "earnings", "downgrade", "upgrade", "rout", "slides", "rebound", "s&p", "spx", "nasdaq", "dow"],
-    "WTI": ["oil", "crude", "wti", "opec", "inventory", "stocks", "tanker", "pipeline", "storm", "spr", "outage", "sanctions"],
-}
-
 
 # ============================================================
 # DB
@@ -146,13 +140,6 @@ def db_conn():
     url = os.environ.get("DATABASE_URL")
     if not url:
         raise RuntimeError("DATABASE_URL is not set")
-
-    # Ensure sslmode in URL if provider requires it (many do).
-    # If you already have it in DATABASE_URL, this does nothing.
-    if "sslmode=" not in url and "localhost" not in url and "127.0.0.1" not in url:
-        sep = "&" if "?" in url else "?"
-        url = f"{url}{sep}sslmode=require"
-
     return psycopg2.connect(url)
 
 
@@ -176,18 +163,6 @@ def db_init():
                 payload_json TEXT NOT NULL
             );
             """)
-            cur.execute("""
-            CREATE TABLE IF NOT EXISTS bias_history (
-                id BIGSERIAL PRIMARY KEY,
-                run_ts BIGINT NOT NULL,
-                asset TEXT NOT NULL,
-                bias TEXT NOT NULL,
-                score DOUBLE PRECISION NOT NULL,
-                quality INT NOT NULL,
-                details_json TEXT NOT NULL
-            );
-            """)
-            cur.execute("CREATE INDEX IF NOT EXISTS idx_bias_history_asset_ts ON bias_history(asset, run_ts);")
             conn.commit()
 
 
@@ -205,20 +180,48 @@ def fingerprint(title: str, link: str) -> str:
 # INGEST
 # ============================================================
 
-def ingest_once(limit_per_feed: int = 30) -> int:
+def _entry_published_ts(e: dict, now_ts: int) -> int:
+    # Prefer published_parsed, but some feeds use updated_parsed
+    pp = e.get("published_parsed")
+    if pp:
+        return int(time.mktime(pp))
+    up = e.get("updated_parsed")
+    if up:
+        return int(time.mktime(up))
+    return now_ts
+
+
+def ingest_once(limit_per_feed: int = 30) -> Dict[str, Any]:
     inserted = 0
     now = int(time.time())
+
+    per_feed = {}
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             for src, url in RSS_FEEDS.items():
-                d = feedparser.parse(url)
-                entries = getattr(d, "entries", []) or []
-
-                # Skip only if it's "bozo AND empty"
-                # (Some feeds set bozo but still have valid entries.)
-                if getattr(d, "bozo", 0) and len(entries) == 0:
+                try:
+                    d = feedparser.parse(url)
+                except Exception as ex:
+                    per_feed[src] = {"ok": False, "error": str(ex), "entries": 0, "bozo": 1}
                     continue
+
+                entries = getattr(d, "entries", []) or []
+                bozo = int(getattr(d, "bozo", 0))
+
+                # IMPORTANT:
+                # bozo=1 can still be usable (you already saw: FED/BLS can be bozo=1 but entries exist)
+                # We only skip when it's bozo AND empty.
+                if bozo == 1 and len(entries) == 0:
+                    per_feed[src] = {
+                        "ok": False,
+                        "error": str(getattr(d, "bozo_exception", "bozo + empty")),
+                        "entries": 0,
+                        "bozo": 1,
+                    }
+                    continue
+
+                per_feed[src] = {"ok": True, "entries": len(entries), "bozo": bozo}
 
                 for e in entries[:limit_per_feed]:
                     title = (e.get("title") or "").strip()
@@ -226,12 +229,7 @@ def ingest_once(limit_per_feed: int = 30) -> int:
                     if not title or not link:
                         continue
 
-                    published_parsed = e.get("published_parsed")
-                    if published_parsed:
-                        published_ts = int(time.mktime(published_parsed))
-                    else:
-                        published_ts = now
-
+                    published_ts = _entry_published_ts(e, now)
                     fp = fingerprint(title, link)
 
                     try:
@@ -251,15 +249,14 @@ def ingest_once(limit_per_feed: int = 30) -> int:
 
         conn.commit()
 
-    return inserted
+    return {"inserted": inserted, "feeds": per_feed}
 
 
 # ============================================================
-# SCORING + QUALITY
+# SCORING
 # ============================================================
 
 def decay_weight(age_sec: int) -> float:
-    # exp(-lambda * age)
     return float(pow(2.718281828, -LAMBDA * max(0, age_sec)))
 
 
@@ -272,68 +269,28 @@ def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
     return out
 
 
-def compute_quality(asset: str, total_score: float, th: float, why_all: List[Dict[str, Any]]) -> Dict[str, Any]:
+def _quality_score(abs_score: float, threshold: float, evidence_count: int, src_diversity: int) -> int:
     """
-    Quality is not "accuracy". It's a confidence heuristic:
-    - magnitude vs threshold (signal strength)
-    - number of contributing hits (coverage)
-    - distinct source diversity
-    - consensus (how one-sided the contributions are)
-    - recency (freshness)
+    Quality: 0..100
+    - core: abs_score vs threshold (clipped)
+    - bonus: more evidence and more sources (diversity)
     """
-    if not why_all:
-        return {"quality": 0, "components": {"strength": 0, "coverage": 0, "diversity": 0, "consensus": 0, "recency": 0}}
+    if threshold <= 0:
+        threshold = 1.0
 
-    # strength: |score| / (2*th) clipped to 1
-    strength = min(1.0, abs(total_score) / max(1e-9, (2.0 * th)))
+    core = min(1.5, abs_score / threshold)  # allow >1 for strong signals, but clip
+    core01 = min(1.0, core)                 # 0..1
 
-    # coverage: log-ish on number of matches
-    n = len(why_all)
-    coverage = min(1.0, (n / 12.0))  # 12+ matched contributions = "full enough"
+    # evidence bonus: saturates quickly
+    ev_bonus = min(0.20, evidence_count * 0.02)     # up to +0.20
+    src_bonus = min(0.15, src_diversity * 0.03)     # up to +0.15
 
-    # diversity: distinct sources ratio
-    srcs = {w.get("source") for w in why_all if w.get("source")}
-    diversity = min(1.0, len(srcs) / 6.0)  # 6 distinct sources = strong
-
-    # consensus: if contributions are mostly same sign
-    pos = sum(1 for w in why_all if w.get("contrib", 0) > 0)
-    neg = sum(1 for w in why_all if w.get("contrib", 0) < 0)
-    denom = max(1, pos + neg)
-    imbalance = abs(pos - neg) / denom  # 0..1
-    consensus = imbalance
-
-    # recency: median age min mapped (0 min => 1.0, 8h => ~0.5, 24h => low)
-    ages = sorted([int(w.get("age_min", 999999)) for w in why_all])
-    med_age = ages[len(ages) // 2]
-    # 0..1440
-    recency = max(0.0, min(1.0, 1.0 - (med_age / 1440.0)))
-
-    # weighted blend
-    q = (
-        0.34 * strength +
-        0.18 * coverage +
-        0.16 * diversity +
-        0.20 * consensus +
-        0.12 * recency
-    )
-    quality = int(round(100 * max(0.0, min(1.0, q))))
-
-    return {
-        "quality": quality,
-        "components": {
-            "strength": round(strength, 3),
-            "coverage": round(coverage, 3),
-            "diversity": round(diversity, 3),
-            "consensus": round(consensus, 3),
-            "recency": round(recency, 3),
-            "n_hits": n,
-            "n_sources": len(srcs),
-            "median_age_min": med_age,
-        }
-    }
+    q = (core01 + ev_bonus + src_bonus)
+    q = max(0.0, min(1.0, q))
+    return int(round(q * 100))
 
 
-def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800):
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 800) -> Dict[str, Any]:
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -357,6 +314,9 @@ def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800
         total = 0.0
         why_all = []
 
+        src_set = set()
+        evidence_fp = set()  # unique news items contributing (by link/title)
+
         for (source, title, link, ts) in rows:
             age = now - int(ts)
             w_src = SOURCE_WEIGHT.get(source, 1.0)
@@ -365,6 +325,9 @@ def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800
             matches = match_rules(asset, title)
             if not matches:
                 continue
+
+            src_set.add(source)
+            evidence_fp.add(fingerprint(title, link))
 
             for m in matches:
                 base_w = m["w"]
@@ -385,7 +348,6 @@ def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800
                 })
 
         th = BIAS_THRESH.get(asset, 1.0)
-
         if total >= th:
             bias = "BULLISH"
         elif total <= -th:
@@ -393,33 +355,23 @@ def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800
         else:
             bias = "NEUTRAL"
 
-        why_top = sorted(why_all, key=lambda x: abs(x["contrib"]), reverse=True)[:8]
+        why_top5 = sorted(why_all, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
 
-        q = compute_quality(asset, total, th, why_all)
-
-        # contradictions: show top opposite-sign items vs overall bias
-        overall_sign = 0
-        if bias == "BULLISH":
-            overall_sign = +1
-        elif bias == "BEARISH":
-            overall_sign = -1
-
-        contr = []
-        if overall_sign != 0:
-            for w in sorted(why_all, key=lambda x: abs(x["contrib"]), reverse=True):
-                if overall_sign * float(w.get("contrib", 0)) < 0:
-                    contr.append(w)
-                if len(contr) >= 4:
-                    break
+        quality = _quality_score(
+            abs_score=abs(total),
+            threshold=th,
+            evidence_count=len(evidence_fp),
+            src_diversity=len(src_set),
+        )
 
         assets_out[asset] = {
             "bias": bias,
             "score": round(total, 4),
             "threshold": th,
-            "quality": q["quality"],
-            "quality_components": q["components"],
-            "why_top": why_top,
-            "contradictions_top": contr,
+            "quality": quality,                    # 0..100
+            "evidence_count": len(evidence_fp),     # how many unique news items drove the score
+            "source_diversity": len(src_set),
+            "why_top5": why_top5,
         }
 
     payload = {
@@ -434,7 +386,7 @@ def compute_bias(lookback_hours: int = DEFAULT_LOOKBACK_H, limit_rows: int = 800
 
 
 # ============================================================
-# STATE + HISTORY
+# STATE
 # ============================================================
 
 def save_bias(payload: dict):
@@ -453,30 +405,6 @@ def save_bias(payload: dict):
         conn.commit()
 
 
-def save_history(payload: dict):
-    now = int(time.time())
-    assets = payload.get("assets", {}) or {}
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            for asset, a in assets.items():
-                cur.execute(
-                    """
-                    INSERT INTO bias_history (run_ts, asset, bias, score, quality, details_json)
-                    VALUES (%s, %s, %s, %s, %s, %s);
-                    """,
-                    (
-                        now,
-                        asset,
-                        str(a.get("bias", "NEUTRAL")),
-                        float(a.get("score", 0.0)),
-                        int(a.get("quality", 0)),
-                        json.dumps(a, ensure_ascii=False),
-                    )
-                )
-        conn.commit()
-
-
 def load_bias():
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -488,104 +416,14 @@ def load_bias():
     return {"updated_ts": updated_ts, "payload": json.loads(payload_json)}
 
 
-def get_history(asset: str, points: int = 32) -> List[Dict[str, Any]]:
-    asset = asset.upper().strip()
-    if asset not in ASSETS:
-        return []
-
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                SELECT run_ts, score, quality, bias
-                FROM bias_history
-                WHERE asset = %s
-                ORDER BY run_ts DESC
-                LIMIT %s;
-                """,
-                (asset, points)
-            )
-            rows = cur.fetchall()
-
-    out = []
-    for (run_ts, score, quality, bias) in reversed(rows):
-        out.append({
-            "run_ts": int(run_ts),
-            "score": float(score),
-            "quality": int(quality),
-            "bias": str(bias),
-        })
-    return out
-
-
-def pipeline_run():
+def pipeline_run() -> Dict[str, Any]:
     db_init()
-    inserted = ingest_once(limit_per_feed=30)
-    payload = compute_bias(lookback_hours=DEFAULT_LOOKBACK_H, limit_rows=900)
-    payload["meta"]["inserted_last_run"] = inserted
+    ingest_meta = ingest_once(limit_per_feed=30)
+    payload = compute_bias(lookback_hours=24, limit_rows=800)
+    payload["meta"]["inserted_last_run"] = ingest_meta.get("inserted", 0)
+    payload["meta"]["feeds_status"] = ingest_meta.get("feeds", {})
     save_bias(payload)
-    save_history(payload)
     return payload
-
-
-# ============================================================
-# DASHBOARD HELPERS
-# ============================================================
-
-def _badge(bias: str) -> str:
-    if bias == "BULLISH":
-        return '<span class="badge bull">BULLISH</span>'
-    if bias == "BEARISH":
-        return '<span class="badge bear">BEARISH</span>'
-    return '<span class="badge neut">NEUTRAL</span>'
-
-
-def _qbadge(q: int) -> str:
-    # quality 0..100
-    if q >= 75:
-        cls = "qhi"
-        txt = "HIGH"
-    elif q >= 45:
-        cls = "qmid"
-        txt = "MED"
-    else:
-        cls = "qlo"
-        txt = "LOW"
-    return f'<span class="qbadge {cls}">Q: {q} ({txt})</span>'
-
-
-def _fmt_age(mins: int) -> str:
-    if mins < 60:
-        return f"{mins}m"
-    h = mins // 60
-    m = mins % 60
-    return f"{h}h {m}m"
-
-
-def _sparkline(values: List[float], w: int = 140, h: int = 34) -> str:
-    if not values or len(values) < 2:
-        return '<svg width="140" height="34"></svg>'
-
-    vmin = min(values)
-    vmax = max(values)
-    if abs(vmax - vmin) < 1e-9:
-        vmax = vmin + 1.0
-
-    pts = []
-    for i, v in enumerate(values):
-        x = int(round((i / (len(values) - 1)) * (w - 2))) + 1
-        y = int(round((1.0 - (v - vmin) / (vmax - vmin)) * (h - 2))) + 1
-        pts.append(f"{x},{y}")
-    poly = " ".join(pts)
-    return f"""
-    <svg width="{w}" height="{h}" viewBox="0 0 {w} {h}">
-      <polyline fill="none" stroke="#444" stroke-width="2" points="{poly}" />
-    </svg>
-    """
-
-
-def _safe(s: str) -> str:
-    return (s or "").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
 
 
 # ============================================================
@@ -597,18 +435,13 @@ app = FastAPI(title="News Bias Bot (MVP)")
 
 @app.get("/", include_in_schema=False)
 def root():
-    # Short entry point
-    return RedirectResponse(url="/dashboard")
+    # Short entrypoint -> dashboard
+    return RedirectResponse(url="/dashboard", status_code=302)
 
 
 @app.get("/health")
 def health():
     return {"ok": True}
-
-
-@app.get("/run")
-def run_now():
-    return pipeline_run()
 
 
 @app.get("/bias")
@@ -618,6 +451,12 @@ def bias():
     if not state:
         return pipeline_run()
     return state["payload"]
+
+
+@app.get("/run")
+def run_now():
+    # Manual trigger from browser
+    return pipeline_run()
 
 
 @app.get("/latest")
@@ -644,29 +483,14 @@ def latest(limit: int = 30):
     }
 
 
-@app.get("/feeds_health")
-def feeds_health():
-    out = {}
-    for src, url in RSS_FEEDS.items():
-        try:
-            d = feedparser.parse(url)
-            out[src] = {
-                "bozo": int(getattr(d, "bozo", 0)),
-                "entries": len(getattr(d, "entries", []) or []),
-            }
-        except Exception as e:
-            out[src] = {"error": str(e)}
-    return out
-
-
 @app.get("/explain")
-def explain(asset: str = "US500", limit: int = 60):
+def explain(asset: str = "US500", limit: int = 50):
     asset = asset.upper().strip()
     if asset not in ASSETS:
         return {"error": f"asset must be one of {ASSETS}"}
 
     now = int(time.time())
-    cutoff = now - DEFAULT_LOOKBACK_H * 3600
+    cutoff = now - 24 * 3600
 
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -676,7 +500,7 @@ def explain(asset: str = "US500", limit: int = 60):
                 FROM news_items
                 WHERE published_ts >= %s
                 ORDER BY published_ts DESC
-                LIMIT 900;
+                LIMIT 800;
                 """,
                 (cutoff,)
             )
@@ -710,262 +534,190 @@ def explain(asset: str = "US500", limit: int = 60):
     return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
 
 
+@app.get("/feeds_health")
+def feeds_health():
+    out = {}
+    for src, url in RSS_FEEDS.items():
+        try:
+            d = feedparser.parse(url)
+            out[src] = {
+                "bozo": int(getattr(d, "bozo", 0)),
+                "entries": len(getattr(d, "entries", []) or []),
+                "ok": True if len(getattr(d, "entries", []) or []) > 0 else False,
+            }
+        except Exception as e:
+            out[src] = {"ok": False, "error": str(e)}
+    return out
+
+
+# ============================================================
+# DASHBOARD
+# ============================================================
+
+def _badge(bias: str) -> str:
+    if bias == "BULLISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#0b6; color:#fff;">BULLISH</span>'
+    if bias == "BEARISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#d33; color:#fff;">BEARISH</span>'
+    return '<span style="padding:4px 10px;border-radius:10px;background:#666; color:#fff;">NEUTRAL</span>'
+
+
+def _bar(pct: int) -> str:
+    pct = max(0, min(100, int(pct)))
+    # neutral gray background, colored fill by pct thresholds
+    fill = "#d33" if pct >= 70 else ("#f0a000" if pct >= 45 else "#666")
+    return f"""
+    <div style="width:220px;background:#eee;border-radius:999px;overflow:hidden;border:1px solid #ddd;display:inline-block;vertical-align:middle;">
+      <div style="width:{pct}%;background:{fill};height:10px;"></div>
+    </div>
+    <span style="margin-left:8px;color:#555;">{pct}/100</span>
+    """
+
+
 @app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(asset: str = "ALL", q: str = "", autorefresh: int = 60):
-    db_init()
-
+def dashboard():
     st = load_bias()
-    if not st:
-        payload = pipeline_run()
-    else:
-        payload = st["payload"]
+    payload = st["payload"] if st else pipeline_run()
 
-    assets = payload.get("assets", {}) or {}
+    assets = payload.get("assets", {})
     updated = payload.get("updated_utc", "")
+    feeds_status = payload.get("meta", {}).get("feeds_status", {})
 
-    # latest headlines pool
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 ORDER BY published_ts DESC
-                LIMIT 120;
+                LIMIT 70;
             """)
             rows = cur.fetchall()
 
-    asset = (asset or "ALL").upper().strip()
-    if asset not in ("ALL", *ASSETS):
-        asset = "ALL"
-
-    ql = (q or "").strip().lower()
-
-    feeds_h = {}
-    try:
-        # quick health snapshot
-        for src, url in RSS_FEEDS.items():
-            d = feedparser.parse(url)
-            feeds_h[src] = {"bozo": int(getattr(d, "bozo", 0)), "entries": len(getattr(d, "entries", []) or [])}
-    except Exception:
-        feeds_h = {}
-
-    def render_asset_card(sym: str) -> str:
-        a = assets.get(sym, {})
+    def render_asset(asset: str) -> str:
+        a = assets.get(asset, {"bias": "NEUTRAL", "score": 0.0, "why_top5": []})
         bias = a.get("bias", "NEUTRAL")
         score = a.get("score", 0.0)
-        th = a.get("threshold", BIAS_THRESH.get(sym, 1.0))
+        th = a.get("threshold", BIAS_THRESH.get(asset, 1.0))
         quality = int(a.get("quality", 0))
-        comps = a.get("quality_components", {}) or {}
+        evid = int(a.get("evidence_count", 0))
+        div = int(a.get("source_diversity", 0))
+        why = a.get("why_top5", [])
 
-        why = a.get("why_top", []) or []
-        contr = a.get("contradictions_top", []) or []
+        why_html = ""
+        for w in why:
+            why_html += f"""
+            <li style="margin-bottom:8px;">
+              <div><b>{w.get('why','')}</b>
+              <span style="color:#999;">(contrib={w.get('contrib','')}, src={w.get('source','')}, age={w.get('age_min','')}m)</span></div>
+              <div style="color:#333;">{w.get('title','')}</div>
+              <div style="margin-top:3px;"><a href="{w.get('link','')}" target="_blank" style="color:#2157f3;text-decoration:none;">open</a></div>
+            </li>
+            """
 
-        # sparkline from history
-        hist = get_history(sym, points=32)
-        spark = _sparkline([h["score"] for h in hist]) if hist else _sparkline([])
+        kw = {
+            "XAU": ["fed", "fomc", "cpi", "inflation", "yields", "usd", "risk", "gold", "treasury", "vix"],
+            "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "rout", "slides", "rebound", "sp", "s&p", "nasdaq"],
+            "WTI": ["oil", "crude", "opec", "inventory", "stocks", "tanker", "pipeline", "storm", "spr", "sanctions"],
+        }[asset]
 
-        # filter relevant headlines
-        kw = DASH_KW.get(sym, [])
         news_html = ""
         shown = 0
         for (source, title, link, ts) in rows:
             t = (title or "").lower()
-
-            if ql:
-                if ql not in t and ql not in (source or "").lower():
-                    continue
-            else:
-                if kw and not any(k in t for k in kw):
-                    continue
-
+            if not any(k in t for k in kw):
+                continue
             shown += 1
             if shown > 10:
                 break
-            age_min = int((int(time.time()) - int(ts)) / 60)
-            news_html += (
-                f'<li class="li">'
-                f'<a href="{link}" target="_blank">{_safe(title)}</a> '
-                f'<span class="muted">[{_safe(source)} • {_fmt_age(age_min)}]</span>'
-                f'</li>'
-            )
-
-        # WHY list
-        why_html = ""
-        for w in why:
-            why_html += f"""
-            <li class="li">
-              <div><b>{_safe(w.get('why',''))}</b> <span class="muted">contrib={w.get('contrib','')} • {_safe(w.get('source',''))} • age={_fmt_age(int(w.get('age_min',0)))}</span></div>
-              <div class="small">{_safe(w.get('title',''))}</div>
-            </li>
-            """
-
-        contr_html = ""
-        for w in contr:
-            contr_html += f"""
-            <li class="li">
-              <div><b>Opposite</b> <span class="muted">contrib={w.get('contrib','')} • {_safe(w.get('source',''))} • age={_fmt_age(int(w.get('age_min',0)))}</span></div>
-              <div class="small">{_safe(w.get('title',''))}</div>
-            </li>
-            """
-
-        # quality row
-        qc = comps
-        qc_html = f"""
-        <div class="qrow">
-          <div class="qcell"><span class="muted">Strength</span><br/><b>{qc.get('strength',0)}</b></div>
-          <div class="qcell"><span class="muted">Coverage</span><br/><b>{qc.get('coverage',0)} ({qc.get('n_hits',0)} hits)</b></div>
-          <div class="qcell"><span class="muted">Diversity</span><br/><b>{qc.get('diversity',0)} ({qc.get('n_sources',0)} src)</b></div>
-          <div class="qcell"><span class="muted">Consensus</span><br/><b>{qc.get('consensus',0)}</b></div>
-          <div class="qcell"><span class="muted">Recency</span><br/><b>{qc.get('recency',0)} (med {qc.get('median_age_min',0)}m)</b></div>
-        </div>
-        """
+            news_html += f'<li><a href="{link}" target="_blank" style="text-decoration:none;color:#222;">{title}</a> <span style="color:#999;">[{source}]</span></li>'
 
         return f"""
-        <div class="card">
-          <div class="cardhead">
+        <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:12px 0;background:#fff;">
+          <div style="display:flex;justify-content:space-between;gap:12px;align-items:flex-start;flex-wrap:wrap;">
             <div>
-              <div class="h2">{sym} {_badge(bias)} {_qbadge(quality)} <span class="muted">score={score} • th={th}</span></div>
-              <div class="muted small">history: {spark}</div>
+              <h2 style="margin:0 0 6px 0;">{asset} {_badge(bias)}
+                <span style="color:#666;font-size:14px;margin-left:10px;">score={score} / th={th}</span>
+              </h2>
+              <div style="margin:6px 0;color:#444;">
+                <span style="margin-right:10px;"><b>Quality</b> { _bar(quality) }</span>
+              </div>
+              <div style="margin:6px 0;color:#666;font-size:13px;">
+                evidence={evid} • source_diversity={div}
+              </div>
             </div>
-            <div class="actions">
-              <a class="btn" href="/dashboard?asset={sym}">Open</a>
-              <a class="btn" href="/explain?asset={sym}" target="_blank">Explain JSON</a>
-            </div>
-          </div>
-
-          <div class="section">
-            <div class="h3">Signal quality breakdown</div>
-            {qc_html}
-          </div>
-
-          <div class="grid">
-            <div class="section">
-              <div class="h3">WHY (top drivers)</div>
-              <ul class="ul">{why_html or "<li class='li muted'>—</li>"}</ul>
-            </div>
-
-            <div class="section">
-              <div class="h3">Contradictions (top)</div>
-              <ul class="ul">{contr_html or "<li class='li muted'>—</li>"}</ul>
+            <div style="min-width:260px;">
+              <div style="border:1px solid #eee;border-radius:12px;padding:10px;background:#fafafa;">
+                <div style="color:#555;font-size:12px;margin-bottom:6px;">Quick actions</div>
+                <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                  <a href="/run" style="padding:6px 10px;border-radius:10px;background:#222;color:#fff;text-decoration:none;">Run now</a>
+                  <a href="/bias" style="padding:6px 10px;border-radius:10px;background:#eee;color:#111;text-decoration:none;border:1px solid #ddd;">JSON</a>
+                  <a href="/explain?asset={asset}" style="padding:6px 10px;border-radius:10px;background:#eee;color:#111;text-decoration:none;border:1px solid #ddd;">Explain</a>
+                </div>
+              </div>
             </div>
           </div>
 
-          <div class="section">
-            <div class="h3">Latest relevant headlines</div>
-            <ul class="ul">{news_html or "<li class='li muted'>—</li>"}</ul>
+          <div style="margin:12px 0;">
+            <h3 style="margin:0 0 8px 0;">WHY (top 5)</h3>
+            <ol style="margin:0;padding-left:18px;">{why_html or "<li>—</li>"}</ol>
+          </div>
+
+          <div style="margin:12px 0;">
+            <h3 style="margin:0 0 8px 0;">Latest relevant headlines</h3>
+            <ul style="margin:0;padding-left:18px;line-height:1.5;">{news_html or "<li>—</li>"}</ul>
           </div>
         </div>
         """
 
-    # tabs
-    tab = lambda sym, label: f'<a class="tab {"active" if asset==sym else ""}" href="/dashboard?asset={sym}&q={quote_plus(q)}">{label}</a>'
-    tabs_html = (
-        tab("ALL", "ALL") +
-        tab("XAU", "XAU") +
-        tab("US500", "US500") +
-        tab("WTI", "WTI")
-    )
-
-    # feed health summary line
-    bad = [k for k,v in (feeds_h or {}).items() if int(v.get("bozo",0)) == 1 and int(v.get("entries",0)) == 0]
-    warn = [k for k,v in (feeds_h or {}).items() if int(v.get("bozo",0)) == 1 and int(v.get("entries",0)) > 0]
-
-    feeds_line = ""
-    if feeds_h:
-        feeds_line = (
-            f"<div class='muted small'>feeds: "
-            f"<b>bad(empty+bozo)</b>={len(bad)} • <b>warn(bozo+entries)</b>={len(warn)} • total={len(feeds_h)} "
-            f"(<a href='/feeds_health' target='_blank'>details</a>)"
-            f"</div>"
-        )
-
-    # choose which cards render
-    cards = ""
-    if asset == "ALL":
-        for sym in ASSETS:
-            cards += render_asset_card(sym)
-    else:
-        cards += render_asset_card(asset)
-
-    # auto refresh meta
-    ar = max(0, min(int(autorefresh), 600))
-    meta_refresh = f"<meta http-equiv='refresh' content='{ar}'>" if ar > 0 else ""
+    # feed summary
+    feed_rows = ""
+    for k, v in (feeds_status or {}).items():
+        ok = "✅" if v.get("ok") else "⚠️"
+        feed_rows += f"<tr><td style='padding:6px 8px;border-bottom:1px solid #eee;'>{ok} {k}</td>" \
+                     f"<td style='padding:6px 8px;border-bottom:1px solid #eee;color:#555;'>bozo={v.get('bozo')}</td>" \
+                     f"<td style='padding:6px 8px;border-bottom:1px solid #eee;color:#555;'>entries={v.get('entries')}</td></tr>"
 
     html = f"""
     <html>
     <head>
       <meta charset="utf-8">
       <title>News Bias Dashboard</title>
-      {meta_refresh}
-      <style>
-        body {{ font-family: Arial, sans-serif; background:#fafafa; margin:0; }}
-        .wrap {{ max-width: 1080px; margin: 22px auto; padding: 0 12px; }}
-        .top {{ display:flex; justify-content:space-between; align-items:flex-end; gap:12px; flex-wrap:wrap; }}
-        .h1 {{ margin:0; font-size: 24px; }}
-        .muted {{ color:#777; }}
-        .small {{ font-size: 12px; }}
-        .tabs {{ display:flex; gap:8px; margin:12px 0; flex-wrap:wrap; }}
-        .tab {{ padding:8px 12px; border:1px solid #ddd; border-radius:12px; background:#fff; text-decoration:none; color:#222; }}
-        .tab.active {{ border-color:#333; }}
-        .card {{ background:#fff; border:1px solid #e3e3e3; border-radius:16px; padding:14px; margin: 12px 0; }}
-        .cardhead {{ display:flex; justify-content:space-between; align-items:flex-start; gap:10px; }}
-        .h2 {{ font-size: 18px; margin:0 0 6px 0; }}
-        .h3 {{ font-size: 14px; margin:0 0 8px 0; }}
-        .badge {{ padding:3px 10px; border-radius:999px; font-weight:700; font-size:12px; color:#fff; }}
-        .bull {{ background:#0b6; }}
-        .bear {{ background:#d33; }}
-        .neut {{ background:#666; }}
-        .qbadge {{ padding:3px 10px; border-radius:999px; font-weight:700; font-size:12px; color:#111; background:#eee; margin-left:6px; }}
-        .qhi {{ background:#c9f7d7; }}
-        .qmid {{ background:#fff2c6; }}
-        .qlo {{ background:#ffd0d0; }}
-        .actions {{ display:flex; gap:8px; }}
-        .btn {{ padding:8px 10px; border:1px solid #ddd; border-radius:12px; background:#fff; text-decoration:none; color:#222; font-size:12px; }}
-        .section {{ margin-top: 10px; }}
-        .grid {{ display:grid; grid-template-columns: 1fr 1fr; gap:12px; }}
-        @media (max-width: 900px) {{ .grid {{ grid-template-columns: 1fr; }} }}
-        .ul {{ margin:0; padding-left:16px; }}
-        .li {{ margin: 8px 0; }}
-        .qrow {{ display:grid; grid-template-columns: repeat(5, 1fr); gap:10px; }}
-        @media (max-width: 900px) {{ .qrow {{ grid-template-columns: repeat(2, 1fr); }} }}
-        .qcell {{ border:1px solid #eee; border-radius:12px; padding:10px; background:#fcfcfc; }}
-        .search {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-        input[type="text"] {{ padding:10px 12px; border:1px solid #ddd; border-radius:12px; width:260px; }}
-        select {{ padding:10px 12px; border:1px solid #ddd; border-radius:12px; }}
-      </style>
+      <meta name="viewport" content="width=device-width, initial-scale=1">
     </head>
-    <body>
-      <div class="wrap">
-        <div class="top">
-          <div>
-            <div class="h1">News Bias Dashboard</div>
-            <div class="muted small">updated_utc: {updated} • lookback={payload.get("meta",{}).get("lookback_hours",DEFAULT_LOOKBACK_H)}h • inserted_last_run={payload.get("meta",{}).get("inserted_last_run",0)}</div>
-            {feeds_line}
-          </div>
-
-          <form class="search" method="get" action="/dashboard">
-            <input type="hidden" name="asset" value="{asset}">
-            <label class="muted small">Search:</label>
-            <input type="text" name="q" value="{_safe(q)}" placeholder="title/source contains...">
-            <label class="muted small">Auto-refresh:</label>
-            <select name="autorefresh">
-              <option value="0" {"selected" if ar==0 else ""}>OFF</option>
-              <option value="30" {"selected" if ar==30 else ""}>30s</option>
-              <option value="60" {"selected" if ar==60 else ""}>60s</option>
-              <option value="120" {"selected" if ar==120 else ""}>120s</option>
-            </select>
-            <button class="btn" type="submit">Apply</button>
-            <a class="btn" href="/run">Run now</a>
-          </form>
+    <body style="font-family:Arial, sans-serif; max-width:1060px; margin:24px auto; padding:0 12px; background:#f6f7f9;">
+      <div style="display:flex;justify-content:space-between;align-items:flex-end;gap:10px;flex-wrap:wrap;">
+        <div>
+          <h1 style="margin:0 0 6px 0;">News Bias Dashboard</h1>
+          <div style="color:#666;margin-bottom:10px;">updated_utc: {updated}</div>
         </div>
-
-        <div class="tabs">{tabs_html}</div>
-
-        {cards}
-
-        <div class="muted small" style="margin:18px 0;">
-          Tip: /explain?asset=XAU gives raw contributions. Root "/" redirects here.
+        <div style="color:#666;font-size:12px;margin-bottom:10px;">
+          Tip: open <b>/</b> (root) → redirects here. Use your domain as the short link.
         </div>
+      </div>
+
+      {render_asset("XAU")}
+      {render_asset("US500")}
+      {render_asset("WTI")}
+
+      <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:12px 0;background:#fff;">
+        <h3 style="margin:0 0 8px 0;">Feeds health (last run snapshot)</h3>
+        <table style="width:100%;border-collapse:collapse;font-size:13px;">
+          <thead>
+            <tr>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Feed</th>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Status</th>
+              <th style="text-align:left;padding:6px 8px;border-bottom:1px solid #eee;">Entries</th>
+            </tr>
+          </thead>
+          <tbody>{feed_rows or ""}</tbody>
+        </table>
+        <div style="color:#999;margin-top:10px;font-size:12px;">
+          Deep debug: /feeds_health (live parse now)
+        </div>
+      </div>
+
+      <div style="color:#999;margin-top:16px;font-size:12px;">
+        Next upgrade: add “Signal Quality v2” (consensus, conflict, freshness buckets, macro-event tagging).
       </div>
     </body>
     </html>

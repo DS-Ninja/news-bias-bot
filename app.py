@@ -3,11 +3,12 @@ import json
 import time
 import re
 from datetime import datetime, timezone
-from typing import Dict, List, Tuple, Any
+from typing import Dict, List, Tuple, Any, Optional
 
 import feedparser
 import psycopg2
 from fastapi import FastAPI
+from fastapi.responses import HTMLResponse
 
 
 # ============================================================
@@ -19,7 +20,7 @@ ASSETS = ["XAU", "US500", "WTI"]
 RSS_FEEDS = {
     # Macro / Rates / USD drivers
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
-    "BLS": "https://www.bls.gov/feed/bls_latest.rss",
+    # "BLS": "https://www.bls.gov/feed/bls_latest.rss",  # <- disabled: currently returns 0 entries (and bozo=1)
     "BEA": "https://apps.bea.gov/rss/rss.xml",
 
     # Energy / WTI
@@ -34,7 +35,7 @@ RSS_FEEDS = {
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
     "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
 
-    # MarketWatch (valid RSS feeds)
+    # MarketWatch
     "MARKETWATCH_TOP_STORIES": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "MARKETWATCH_REAL_TIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
     "MARKETWATCH_BREAKING": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
@@ -43,7 +44,7 @@ RSS_FEEDS = {
     # Financial Times (may be restricted; ok to try)
     "FT_PRECIOUS_METALS": "https://www.ft.com/precious-metals?format=rss",
 
-    # DailyForex (RSS)
+    # DailyForex
     "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
     "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
     "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
@@ -52,7 +53,6 @@ RSS_FEEDS = {
 # impact weights by source (MVP heuristic)
 SOURCE_WEIGHT = {
     "FED": 3.0,
-    "BLS": 3.0,
     "BEA": 2.5,
     "EIA": 3.0,
 
@@ -93,49 +93,67 @@ BIAS_THRESH = {
 
 RULES: Dict[str, List[Tuple[str, float, str]]] = {
     "US500": [
-        # Risk-on / equities positive
         (r"\b(upgrades?|upgrade|raises? (price )?target|rebound|stabilize|demand lifts|beats?|strong (results|earnings))\b",
          +1.0, "Equity positive tone"),
-        # Risk-off / equities negative
         (r"\b(plunges?|rout|slides?|downgrade|downgrades?|cuts? .* to (neutral|sell)|writedowns?|bill for .* pullback|warns?|wary)\b",
          -1.2, "Equity negative tone"),
-        # Macro / rates-sensitive (direction ambiguous → small negative as risk)
         (r"\b(unemployment|jobs|payrolls|cpi|inflation|fomc|federal reserve|fed)\b",
          -0.2, "Macro event headline (direction unknown)"),
-        # Capex risk (AI capex scares equity multiples sometimes)
         (r"\b(ai capex|capex)\b",
          -0.1, "Capex / valuation uncertainty"),
     ],
 
     "XAU": [
-        # Gold bullish: risk-off, stress
         (r"\b(wall st|wall street|futures|s&p|spx|nasdaq|dow|treasur(y|ies)|yields?|vix|risk[- ]off)\b.*\b(rout|plunges?|slides?|sell[- ]off|wary)\b"
-        r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|futures|s&p|nasdaq|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
-        +0.9, "Market-wide risk-off supports gold"),
-
-        # Gold bearish: risk-on / strong equities
+         r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|futures|s&p|nasdaq|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
+         +0.9, "Market-wide risk-off supports gold"),
         (r"\b(rebound|risk[- ]on|stocks to buy|buy after .* drop|strong earnings)\b",
          -0.7, "Risk-on pressures gold"),
-        # Fed mention (small positive because event risk often adds bid; we'll refine later)
         (r"\b(fomc statement|fed issues.*statement|federal open market committee|longer[- ]run goals)\b",
          +0.2, "Fed event risk (watch yields/USD)"),
-        # Strong USD/yields (if present in titles later)
         (r"\b(strong dollar|usd strengthens|yields rise|real yields)\b",
          -0.8, "Stronger USD / higher yields weighs on gold"),
     ],
 
     "WTI": [
-        # Crude / supply / shipping / disruptions
         (r"\b(crude oil|tanker rates|winter storm|disruption|outage|pipeline|opec|output cut|sanctions)\b",
          +0.9, "Supply / flow supports oil"),
-        # Inventories (you'll get better signals once we add weekly EIA petroleum status)
         (r"\b(inventory draw|stocks fall|draw)\b",
          +0.8, "Inventories draw supports oil"),
         (r"\b(inventory build|stocks rise|build)\b",
          -0.8, "Inventories build pressures oil"),
-        # Gas/power items: neutral for crude
         (r"\b(natural gas|electricity|nuclear|coal)\b",
          0.0, "Not crude-direct"),
+    ],
+}
+
+# ============================================================
+# TOPICS (for "smart dashboard" summary)
+# ============================================================
+
+TOPICS: Dict[str, List[Tuple[str, str]]] = {
+    "XAU": [
+        ("FED/FOMC", r"\b(fed|fomc|federal reserve|powell)\b"),
+        ("CPI/INFL", r"\b(cpi|inflation|ppi)\b"),
+        ("USD", r"\b(usd|dollar|dxy)\b"),
+        ("YIELDS", r"\b(yield|yields|treasury|treasuries|real yields)\b"),
+        ("RISK-OFF", r"\b(risk[- ]off|sell[- ]off|rout|plunge|slides?)\b"),
+        ("GOLD", r"\b(gold|xau)\b"),
+        ("GEO", r"\b(sanction|war|attack|missile|iran|israel|red sea)\b"),
+    ],
+    "US500": [
+        ("EARNINGS", r"\b(earnings|results|guidance|quarter|q[1-4])\b"),
+        ("RATES/FED", r"\b(fed|fomc|rates?|yield|yields)\b"),
+        ("RISK-OFF", r"\b(rout|sell[- ]off|plunge|slides?|wary)\b"),
+        ("TECH/AI", r"\b(ai|capex|nvidia|amazon|microsoft|google|meta)\b"),
+        ("UP/DOWNGR", r"\b(upgrade|upgrades|downgrade|downgrades|raises? target|cuts? .* to)\b"),
+    ],
+    "WTI": [
+        ("OPEC", r"\b(opec|opec\+|saudi|russia)\b"),
+        ("INVENT", r"\b(inventory|inventories|stocks (rise|fall)|build|draw)\b"),
+        ("SUPPLY", r"\b(outage|disruption|pipeline|sanction|attack)\b"),
+        ("SHIPPING", r"\b(tanker|freight|rates|red sea)\b"),
+        ("CRUDE", r"\b(crude|oil|wti|brent)\b"),
     ],
 }
 
@@ -171,6 +189,14 @@ def db_init():
                 payload_json TEXT NOT NULL
             );
             """)
+            # history for shift metrics
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS bias_history (
+                id BIGSERIAL PRIMARY KEY,
+                ts BIGINT NOT NULL,
+                payload_json TEXT NOT NULL
+            );
+            """)
             conn.commit()
 
 
@@ -197,13 +223,13 @@ def ingest_once(limit_per_feed: int = 30) -> int:
             for src, url in RSS_FEEDS.items():
                 d = feedparser.parse(url)
 
-                # If feedparser flags issues, skip feed (FT can be restricted)
-                if getattr(d, "bozo", 0):
-                    # Uncomment for debugging:
-                    # print(f"[WARN] bad feed {src}: {getattr(d, 'bozo_exception', None)}")
+                entries = getattr(d, "entries", []) or []
+
+                # If feedparser flags issues and feed is empty, skip (FT can be restricted sometimes)
+                if getattr(d, "bozo", 0) and len(entries) == 0:
                     continue
 
-                for e in d.entries[:limit_per_feed]:
+                for e in entries[:limit_per_feed]:
                     title = (e.get("title") or "").strip()
                     link = (e.get("link") or "").strip()
                     if not title or not link:
@@ -236,6 +262,7 @@ def ingest_once(limit_per_feed: int = 30) -> int:
 
     return inserted
 
+
 # ============================================================
 # SCORING
 # ============================================================
@@ -246,7 +273,6 @@ def decay_weight(age_sec: int) -> float:
 
 
 def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
-    """Return all matches with their base weight and why."""
     t = (text or "")
     tl = t.lower()
     out = []
@@ -340,8 +366,11 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 800):
 
 def save_bias(payload: dict):
     now = int(time.time())
+    payload_json = json.dumps(payload, ensure_ascii=False)
+
     with db_conn() as conn:
         with conn.cursor() as cur:
+            # current state (single row)
             cur.execute(
                 """
                 INSERT INTO bias_state (id, updated_ts, payload_json)
@@ -349,7 +378,15 @@ def save_bias(payload: dict):
                 ON CONFLICT (id)
                 DO UPDATE SET updated_ts = EXCLUDED.updated_ts, payload_json = EXCLUDED.payload_json;
                 """,
-                (now, json.dumps(payload, ensure_ascii=False))
+                (now, payload_json)
+            )
+            # history (append)
+            cur.execute(
+                """
+                INSERT INTO bias_history (ts, payload_json)
+                VALUES (%s, %s);
+                """,
+                (now, payload_json)
             )
         conn.commit()
 
@@ -372,6 +409,62 @@ def pipeline_run():
     payload["meta"]["inserted_last_run"] = inserted
     save_bias(payload)
     return payload
+
+
+# ============================================================
+# SMART DASHBOARD HELPERS
+# ============================================================
+
+def topic_stats(asset: str, rows: List[Tuple[str, str, str, int]], max_items: int = 120):
+    counts = {name: 0 for (name, _) in TOPICS.get(asset, [])}
+    for (_, title, _, _) in rows[:max_items]:
+        t = (title or "").lower()
+        for (name, pat) in TOPICS.get(asset, []):
+            if re.search(pat, t, flags=re.IGNORECASE):
+                counts[name] += 1
+    items = sorted(counts.items(), key=lambda x: x[1], reverse=True)
+    return [(k, v) for (k, v) in items if v > 0][:5]
+
+
+def load_bias_shift(hours: int) -> Optional[dict]:
+    now = int(time.time())
+    cutoff = now - hours * 3600
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT payload_json
+                FROM bias_history
+                WHERE ts >= %s
+                ORDER BY ts ASC
+                LIMIT 1;
+                """,
+                (cutoff,)
+            )
+            row = cur.fetchone()
+    if not row:
+        return None
+    try:
+        return json.loads(row[0])
+    except Exception:
+        return None
+
+
+def score_of(payload: Optional[dict], asset: str) -> float:
+    if not payload:
+        return 0.0
+    try:
+        return float(payload.get("assets", {}).get(asset, {}).get("score", 0.0))
+    except Exception:
+        return 0.0
+
+
+def _badge(bias: str) -> str:
+    if bias == "BULLISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#0b6; color:#fff;">BULLISH</span>'
+    if bias == "BEARISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#d33; color:#fff;">BEARISH</span>'
+    return '<span style="padding:4px 10px;border-radius:10px;background:#666; color:#fff;">NEUTRAL</span>'
 
 
 # ============================================================
@@ -426,10 +519,6 @@ def latest(limit: int = 30):
 
 @app.get("/explain")
 def explain(asset: str = "US500", limit: int = 50):
-    """
-    Debug endpoint:
-    returns top contributing matched headlines for selected asset.
-    """
     asset = asset.upper().strip()
     if asset not in ASSETS:
         return {"error": f"asset must be one of {ASSETS}"}
@@ -478,43 +567,59 @@ def explain(asset: str = "US500", limit: int = 50):
     out_sorted = sorted(out, key=lambda x: abs(x["contrib"]), reverse=True)[:limit]
     return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
 
-from fastapi.responses import HTMLResponse
-
-def _badge(bias: str) -> str:
-    if bias == "BULLISH":
-        return '<span style="padding:4px 10px;border-radius:10px;background:#0b6; color:#fff;">BULLISH</span>'
-    if bias == "BEARISH":
-        return '<span style="padding:4px 10px;border-radius:10px;background:#d33; color:#fff;">BEARISH</span>'
-    return '<span style="padding:4px 10px;border-radius:10px;background:#666; color:#fff;">NEUTRAL</span>'
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
+    db_init()
     st = load_bias()
-    if not st:
-        payload = pipeline_run()
-    else:
-        payload = st["payload"]
+    payload = st["payload"] if st else pipeline_run()
 
     assets = payload.get("assets", {})
     updated = payload.get("updated_utc", "")
 
-    # Pull last headlines (raw) and show limited
+    # Last headlines
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 ORDER BY published_ts DESC
-                LIMIT 40;
+                LIMIT 120;
             """)
             rows = cur.fetchall()
 
+    base_1h = load_bias_shift(1)
+    base_6h = load_bias_shift(6)
+
     def render_asset(asset: str) -> str:
-        a = assets.get(asset, {"bias":"NEUTRAL","score":0.0,"why_top5":[]})
-        bias = a.get("bias", "NEUTRAL")
-        score = a.get("score", 0.0)
+        a = assets.get(asset, {"bias": "NEUTRAL", "score": 0.0, "why_top5": []})
+        bias_v = a.get("bias", "NEUTRAL")
+        score_v = float(a.get("score", 0.0))
         why = a.get("why_top5", [])
 
+        # Topics
+        topics = topic_stats(asset, rows, max_items=120)
+        topics_html = " | ".join([f"{k}({v})" for (k, v) in topics]) or "—"
+
+        # Shift
+        s1 = score_of(base_1h, asset) if base_1h else None
+        s6 = score_of(base_6h, asset) if base_6h else None
+
+        def fmt_delta(base_score: Optional[float]) -> str:
+            if base_score is None:
+                return "—"
+            d = score_v - float(base_score)
+            sign = "+" if d >= 0 else ""
+            return f"{sign}{d:.2f}"
+
+        shift_html = f"""
+        <div style="color:#666;font-size:13px;margin:6px 0 10px 0;">
+          <b>Shift</b>: 1h {fmt_delta(s1)} | 6h {fmt_delta(s6)}
+          <span style="margin-left:10px;"><b>Topics</b>: {topics_html}</span>
+        </div>
+        """
+
+        # WHY list
         why_html = ""
         for w in why:
             why_html += f"""
@@ -525,11 +630,11 @@ def dashboard():
             </li>
             """
 
-        # simple relevance filter for headlines list
+        # Relevance filter for headline list
         kw = {
-            "XAU": ["fed","fomc","cpi","inflation","yields","usd","risk","gold"],
-            "US500": ["stocks","futures","earnings","downgrade","upgrade","rout","slides","rebound","sp","s&p"],
-            "WTI": ["oil","crude","opec","inventory","stocks","tanker","pipeline","storm","spr"],
+            "XAU": ["fed", "fomc", "cpi", "inflation", "yields", "usd", "risk", "gold"],
+            "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "rout", "slides", "rebound", "sp", "s&p"],
+            "WTI": ["oil", "crude", "opec", "inventory", "stocks", "tanker", "pipeline", "storm", "spr"],
         }[asset]
 
         news_html = ""
@@ -545,7 +650,8 @@ def dashboard():
 
         return f"""
         <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:10px 0;">
-          <h2 style="margin:0 0 6px 0;">{asset} {_badge(bias)} <span style="color:#666;font-size:14px;">score={score}</span></h2>
+          <h2 style="margin:0 0 6px 0;">{asset} {_badge(bias_v)} <span style="color:#666;font-size:14px;">score={score_v:.4f}</span></h2>
+          {shift_html}
           <div style="margin:10px 0;">
             <h3 style="margin:0 0 6px 0;">WHY (top 5)</h3>
             <ol style="margin:0;padding-left:18px;">{why_html or "<li>—</li>"}</ol>
@@ -566,11 +672,14 @@ def dashboard():
       {render_asset("XAU")}
       {render_asset("US500")}
       {render_asset("WTI")}
-      <div style="color:#999;margin-top:16px;font-size:12px;">Tip: open /explain?asset=XAU for deeper debug.</div>
+      <div style="color:#999;margin-top:16px;font-size:12px;">
+        Tip: open /explain?asset=XAU for deeper debug. | Run /run несколько раз, чтобы Shift стал информативным.
+      </div>
     </body>
     </html>
     """
     return html
+
 
 @app.get("/feeds_health")
 def feeds_health():

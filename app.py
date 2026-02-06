@@ -1,24 +1,40 @@
+# app.py
+# News Bias Bot (MVP++) — RSS + Trade Gate + iPhone-friendly UI + FRED macro drivers + Morning Plan
+#
+# Features:
+# - RSS ingestion -> Postgres
+# - Bias scoring per asset (XAU / US500 / WTI) using regex RULES + decay
+# - Signal Quality v1 + v2 (consensus/conflict/freshness + event penalty)
+# - Event mode (ForexFactory calendar via faireconomy mirror) + macro recent (FED/BLS/BEA)
+# - Trade Gate (OK/NO) per asset: Bias + Quality v2 + Conflict + Event Mode + Flip guard
+# - Unified Trump headlines flag (single feed + switch)
+# - FRED macro drivers (real/nominal yields, USD broad, VIX, etc.) injected as evidence
+# - Dashboard: compact mode, sticky mini-header tabs, tooltips, iPhone Safari friendly
+#
+# ENV:
+# - DATABASE_URL (postgres) OR PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD
+# - GATE_PROFILE=STRICT|MODERATE
+# - EVENT_LOOKAHEAD_HOURS=18, EVENT_RECENT_HOURS=6
+# - TRUMP_ENABLED=1|0
+# - FRED_ENABLED=1|0, FRED_API_KEY=..., FRED_WINDOW_DAYS=120
+#
+# Run:
+#   uvicorn app:app --host 0.0.0.0 --port 8000
+
 import os
 import json
 import time
 import re
+import hashlib
 import math
-import xml.etree.ElementTree as ET
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
+import requests
 import feedparser
 import psycopg2
 from fastapi import FastAPI
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
-
-try:
-    # no extra dependency required; urllib is stdlib
-    from urllib.request import urlopen, Request
-    from urllib.parse import urlencode
-except Exception:
-    urlopen = None
-
 
 # ============================================================
 # CONFIG
@@ -26,151 +42,197 @@ except Exception:
 
 ASSETS = ["XAU", "US500", "WTI"]
 
-# --- Added feeds you provided + extra Investing feeds
+# --- Gate profile: STRICT (default) or MODERATE
+GATE_PROFILE = os.environ.get("GATE_PROFILE", "STRICT").strip().upper()
+if GATE_PROFILE not in ("STRICT", "MODERATE"):
+    GATE_PROFILE = "STRICT"
+
+GATE_THRESHOLDS = {
+    "STRICT": {
+        "quality_v2_min": 55,
+        "conflict_max": 0.55,
+        "min_opp_flip_dist": 0.35,
+        "neutral_allow": False,
+        "neutral_flip_dist_max": 0.20,   # unused in strict (kept for UI)
+        "event_mode_block": True,
+        "event_override_quality": 70,
+        "event_override_conflict": 0.45,
+    },
+    "MODERATE": {
+        "quality_v2_min": 42,
+        "conflict_max": 0.70,
+        "min_opp_flip_dist": 0.20,
+        "neutral_allow": True,
+        "neutral_flip_dist_max": 0.20,
+        "event_mode_block": False,
+        "event_override_quality": 60,
+        "event_override_conflict": 0.60,
+    }
+}
+
+# Decay (half-life ~ 8 hours)
+HALF_LIFE_SEC = 8 * 3600
+LAMBDA = 0.69314718056 / HALF_LIFE_SEC
+
+# Bias thresholds (per-asset)
+BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9}
+
+# Trump headlines unified
+TRUMP_ENABLED = os.environ.get("TRUMP_ENABLED", "1").strip() == "1"
+TRUMP_PAT = re.compile(r"\b(trump|donald trump|white house)\b", re.I)
+
+# Event mode config
+EVENT_CFG = {
+    "enabled": True,
+    "lookahead_hours": int(os.environ.get("EVENT_LOOKAHEAD_HOURS", "18")),
+    "recent_hours": float(os.environ.get("EVENT_RECENT_HOURS", "6")),
+    "max_upcoming": 6,
+}
+
+# FRED config + series list
+FRED_CFG = {
+    "enabled": os.environ.get("FRED_ENABLED", "1").strip() == "1",
+    "api_key": os.environ.get("FRED_API_KEY", "").strip(),
+    "window_days": int(os.environ.get("FRED_WINDOW_DAYS", "120")),
+}
+FRED_SERIES = {
+    "DGS10":    {"name": "US 10Y Nominal", "freq": "d"},
+    "DFII10":   {"name": "US 10Y Real",    "freq": "d"},
+    "T10YIE":   {"name": "10Y Breakeven",  "freq": "d"},
+    "DTWEXBGS": {"name": "Broad USD",      "freq": "d"},
+    "VIXCLS":   {"name": "VIX",            "freq": "d"},
+    "BAA10Y":   {"name": "BAA-10Y Spread", "freq": "d"},
+}
+
+# ============================================================
+# RSS FEEDS (deduped keys)
+# ============================================================
+
 RSS_FEEDS: Dict[str, str] = {
-    # Macro / Rates / USD drivers
+    # Macro / policy
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
-    "BLS": "https://www.bls.gov/feed/bls_latest.rss",
+    "BLS": "https://www.bls.gov/feed/news_release.rss",
     "BEA": "https://apps.bea.gov/rss/rss.xml",
 
-    # Energy / WTI
-    "EIA": "https://www.eia.gov/rss/todayinenergy.xml",
+    # Commodities / oil
     "OILPRICE": "https://oilprice.com/rss/main",
 
-    # Broad market headlines
-    "INVESTING_NEWS_25": "https://www.investing.com/rss/news_25.rss",
-
-    # Investing additional
-    "INVESTING_STOCK_FUND": "https://www.investing.com/rss/stock_Fundamental.rss",
-    "INVESTING_COMMOD_TECH": "https://www.investing.com/rss/commodities_Technical.rss",
-    "INVESTING_NEWS_11": "https://www.investing.com/rss/news_11.rss",
-    "INVESTING_NEWS_95": "https://www.investing.com/rss/news_95.rss",
-    "INVESTING_MKT_TECH": "https://www.investing.com/rss/market_overview_Technical.rss",
-    "INVESTING_MKT_FUND": "https://www.investing.com/rss/market_overview_Fundamental.rss",
-    "INVESTING_IDEAS": "https://www.investing.com/rss/market_overview_investing_ideas.rss",
-    "INVESTING_FX_TECH": "https://www.investing.com/rss/forex_Technical.rss",
-    "INVESTING_FX_FUND": "https://www.investing.com/rss/forex_Fundamental.rss",
-
-    # FXStreet
+    # FX / macro commentary
     "FXSTREET_NEWS": "https://www.fxstreet.com/rss/news",
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
-    "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
 
     # MarketWatch
     "MARKETWATCH_TOP": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
-    "MARKETWATCH_RT": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
-    "MARKETWATCH_BREAKING": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
-    "MARKETWATCH_PULSE": "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
+    "MARKETWATCH_REALTIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
 
-    # Financial Times
-    "FT_PRECIOUS": "https://www.ft.com/precious-metals?format=rss",
-
-    # DailyForex
-    "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
-    "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
-    "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
+    # Investing.com (requested) — keep, but no duplicates
+    "INV_STOCK_FUND": "https://www.investing.com/rss/stock_Fundamental.rss",
+    "INV_COMMOD_TECH": "https://www.investing.com/rss/commodities_Technical.rss",
+    "INV_NEWS_11": "https://www.investing.com/rss/news_11.rss",
+    "INV_NEWS_95": "https://www.investing.com/rss/news_95.rss",
+    "INV_MKT_TECH": "https://www.investing.com/rss/market_overview_Technical.rss",
+    "INV_MKT_FUND": "https://www.investing.com/rss/market_overview_Fundamental.rss",
+    "INV_MKT_IDEAS": "https://www.investing.com/rss/market_overview_investing_ideas.rss",
+    "INV_FX_TECH": "https://www.investing.com/rss/forex_Technical.rss",
+    "INV_FX_FUND": "https://www.investing.com/rss/forex_Fundamental.rss",
 
     # Your extra RSS
     "RSSAPP_1": "https://rss.app/feeds/X1lZYAmHwbEHR8OY.xml",
     "RSSAPP_2": "https://rss.app/feeds/BDVzmd6sW0mF8DJ6.xml",
-    "POLITICO_TRUMP": "https://rss.politico.com/donald-trump.xml",
+
+    # Unified Trump headlines
+    "TRUMP_HEADLINES": "https://rss.politico.com/donald-trump.xml",
+
+    # ForexFactory calendar (faireconomy mirror)
+    "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
 }
 
-# ForexFactory calendar XML (weekly)
-FOREXFACTORY_CAL_XML = "https://nfs.faireconomy.media/ff_calendar_thisweek.xml"
+CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR"}  # not ingested into news_items
 
-# Source weights (MVP; tune later)
+# ============================================================
+# SOURCE WEIGHTS
+# ============================================================
+
 SOURCE_WEIGHT: Dict[str, float] = {
-    "FED": 3.0, "BLS": 3.0, "BEA": 2.5, "EIA": 3.0,
+    "FED": 3.0,
+    "BLS": 3.0,
+    "BEA": 2.8,
+
+    "FXSTREET_NEWS": 1.4,
+    "FXSTREET_ANALYSIS": 1.2,
+
+    "MARKETWATCH_TOP": 1.2,
+    "MARKETWATCH_REALTIME": 1.3,
 
     "OILPRICE": 1.2,
 
-    "INVESTING_NEWS_25": 1.0,
-    "INVESTING_STOCK_FUND": 1.1,
-    "INVESTING_COMMOD_TECH": 1.1,
-    "INVESTING_NEWS_11": 1.0,
-    "INVESTING_NEWS_95": 1.0,
-    "INVESTING_MKT_TECH": 1.0,
-    "INVESTING_MKT_FUND": 1.0,
-    "INVESTING_IDEAS": 0.9,
-    "INVESTING_FX_TECH": 1.0,
-    "INVESTING_FX_FUND": 1.0,
+    "INV_STOCK_FUND": 1.0,
+    "INV_COMMOD_TECH": 1.0,
+    "INV_NEWS_11": 1.0,
+    "INV_NEWS_95": 1.0,
+    "INV_MKT_TECH": 1.0,
+    "INV_MKT_FUND": 1.0,
+    "INV_MKT_IDEAS": 0.9,
+    "INV_FX_TECH": 0.95,
+    "INV_FX_FUND": 0.95,
 
-    "FXSTREET_NEWS": 1.4, "FXSTREET_ANALYSIS": 1.2, "FXSTREET_STOCKS": 1.2,
+    "RSSAPP_1": 1.0,
+    "RSSAPP_2": 1.0,
 
-    "MARKETWATCH_TOP": 1.6, "MARKETWATCH_RT": 1.6, "MARKETWATCH_BREAKING": 1.8, "MARKETWATCH_PULSE": 1.5,
+    "TRUMP_HEADLINES": 1.2,
 
-    "FT_PRECIOUS": 1.6,
-
-    "DAILYFOREX_NEWS": 1.2, "DAILYFOREX_TECH": 1.0, "DAILYFOREX_FUND": 1.2,
-
-    "RSSAPP_1": 1.0, "RSSAPP_2": 1.0,
-    "POLITICO_TRUMP": 1.1,
-}
-
-# Exponential decay: half-life 8h
-HALF_LIFE_SEC = 8 * 3600
-LAMBDA = 0.69314718056 / HALF_LIFE_SEC
-
-BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9}
-
-# Trade Gate tuning (you asked strict vs moderate)
-# default: moderate
-GATE_PROFILE_DEFAULT = os.environ.get("GATE_PROFILE", "moderate").lower().strip()
-GATE_PROFILES = {
-    "strict":   {"q_min": 75, "conf_max": 0.45, "delta_to_th_max": 0.25, "event_q_min": 82},
-    "moderate": {"q_min": 60, "conf_max": 0.60, "delta_to_th_max": 0.45, "event_q_min": 70},
+    "FOREXFACTORY_CALENDAR": 0.0,
+    "FRED": 1.0,
 }
 
 # ============================================================
-# RULES
+# RULES (regex -> signed weight + explanation)
 # ============================================================
 
 RULES: Dict[str, List[Tuple[str, float, str]]] = {
-    "US500": [
-        (r"\b(upgrades?|upgrade|raises? (price )?target|rebound|stabilize|demand lifts|beats?|strong (results|earnings))\b",
-         +1.0, "Equity positive tone"),
-        (r"\b(plunges?|rout|slides?|downgrade|downgrades?|cuts? .* to (neutral|sell)|writedowns?|bill for .* pullback|warns?|wary)\b",
-         -1.2, "Equity negative tone"),
-        (r"\b(unemployment|jobs|payrolls|cpi|inflation|fomc|federal reserve|fed)\b",
-         -0.2, "Macro event headline (direction unknown)"),
-        (r"\b(ai capex|capex)\b",
-         -0.1, "Capex / valuation uncertainty"),
-    ],
     "XAU": [
-        (r"\b(wall st|wall street|futures|s&p|spx|nasdaq|dow|treasur(y|ies)|yields?|vix|risk[- ]off)\b.*\b(rout|plunges?|slides?|sell[- ]off|wary)\b"
-         r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|futures|s&p|nasdaq|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
-         +0.9, "Market-wide risk-off supports gold"),
-        (r"\b(rebound|risk[- ]on|stocks to buy|buy after .* drop|strong earnings)\b",
-         -0.7, "Risk-on pressures gold"),
-        (r"\b(fomc statement|fed issues.*statement|federal open market committee|longer[- ]run goals)\b",
-         +0.2, "Fed event risk (watch yields/USD)"),
-        (r"\b(strong dollar|usd strengthens|yields rise|real yields)\b",
-         -0.8, "Stronger USD / higher yields weighs on gold"),
+        (r"\b(fed|fomc|powell|rate hike|rates higher|hawkish)\b", -0.7, "Hawkish Fed / higher rates weighs on gold"),
+        (r"\b(rate cut|cuts rates|dovish|easing)\b", +0.6, "Dovish Fed supports gold"),
+        (r"\b(cpi|inflation)\b", +0.2, "Inflation prints can support gold (context: yields/USD)"),
+        (r"\b(strong dollar|usd strengthens|yields rise|real yields)\b", -0.8, "Stronger USD / higher yields weighs on gold"),
+        (r"\b(geopolitical|safe[- ]haven|risk aversion|flight to safety)\b", +0.5, "Safe-haven demand supports gold"),
+        (r"\b(risk-on|stocks rally|equities rally)\b", -0.2, "Risk-on reduces safe-haven demand"),
+    ],
+    "US500": [
+        (r"\b(earnings beat|earnings surge|guidance raised)\b", +0.6, "Earnings optimism supports equities"),
+        (r"\b(earnings miss|guidance cut|profit warning)\b", -0.7, "Earnings disappointment pressures equities"),
+        (r"\b(yields rise|bond yields jump|rates higher|hawkish)\b", -0.6, "Higher yields pressure equity multiples"),
+        (r"\b(rate cut|dovish|easing)\b", +0.5, "Easing supports risk assets"),
+        (r"\b(risk-off|selloff|panic|crash)\b", -0.7, "Risk-off headlines"),
+        (r"\b(rally|rebound|risk-on)\b", +0.3, "Risk-on tape"),
+        (r"\b(vix spikes|volatility spikes)\b", -0.6, "Volatility spike (risk-off)"),
     ],
     "WTI": [
-        (r"\b(crude oil|tanker rates|winter storm|disruption|outage|pipeline|opec|output cut|sanctions)\b",
-         +0.9, "Supply / flow supports oil"),
-        (r"\b(inventory draw|stocks fall|draw)\b",
-         +0.8, "Inventories draw supports oil"),
-        (r"\b(inventory build|stocks rise|build)\b",
-         -0.8, "Inventories build pressures oil"),
-        (r"\b(natural gas|electricity|nuclear|coal)\b",
-         0.0, "Not crude-direct"),
+        (r"\b(crude|oil|wti|brent)\b", +0.1, "Oil headlines (generic)"),
+        (r"\b(opec|output cut|cuts output|production cut)\b", +0.8, "Supply cuts support oil"),
+        (r"\b(output increase|ramp up production|supply increase)\b", -0.6, "Supply increase pressures oil"),
+        (r"\b(inventories rise|stockpile build|build in stocks|inventory build)\b", -0.8, "Inventories build pressures oil"),
+        (r"\b(inventories fall|draw in stocks|inventory draw)\b", +0.8, "Inventory draw supports oil"),
+        (r"\b(disruption|outage|pipeline|attack|sanctions|shipping disruption)\b", +0.7, "Supply disruption supports oil"),
+        (r"\b(demand weakens|recession fears|slowdown)\b", -0.6, "Demand concerns pressure oil"),
     ],
 }
-
 
 # ============================================================
 # DB
 # ============================================================
 
 def db_conn():
-    url = os.environ.get("DATABASE_URL")
-    if not url:
-        raise RuntimeError("DATABASE_URL is not set")
-    return psycopg2.connect(url)
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if db_url:
+        return psycopg2.connect(db_url)
 
+    host = os.environ.get("PGHOST", "localhost")
+    port = os.environ.get("PGPORT", "5432")
+    db = os.environ.get("PGDATABASE", "postgres")
+    user = os.environ.get("PGUSER", "postgres")
+    pwd = os.environ.get("PGPASSWORD", "")
+    return psycopg2.connect(host=host, port=port, dbname=db, user=user, password=pwd)
 
 def db_init():
     with db_conn() as conn:
@@ -185,6 +247,8 @@ def db_init():
                 fingerprint TEXT UNIQUE NOT NULL
             );
             """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_news_items_published_ts ON news_items(published_ts DESC);")
+
             cur.execute("""
             CREATE TABLE IF NOT EXISTS bias_state (
                 id SMALLINT PRIMARY KEY DEFAULT 1,
@@ -192,77 +256,113 @@ def db_init():
                 payload_json TEXT NOT NULL
             );
             """)
-            conn.commit()
 
+            # FRED cache table
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS fred_series (
+                series_id TEXT NOT NULL,
+                obs_date  DATE NOT NULL,
+                value     DOUBLE PRECISION,
+                PRIMARY KEY(series_id, obs_date)
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
 
-def norm_text(s: str) -> str:
-    return (s or "").strip().lower()
+        conn.commit()
 
+def save_bias(payload: Dict[str, Any]):
+    now = int(time.time())
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO bias_state(id, updated_ts, payload_json)
+                VALUES (1, %s, %s)
+                ON CONFLICT (id) DO UPDATE
+                SET updated_ts=EXCLUDED.updated_ts, payload_json=EXCLUDED.payload_json;
+            """, (now, json.dumps(payload, ensure_ascii=False)))
+        conn.commit()
+
+def load_bias() -> Optional[dict]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("SELECT updated_ts, payload_json FROM bias_state WHERE id=1;")
+            row = cur.fetchone()
+    if not row:
+        return None
+    _updated_ts, payload_json = row
+    try:
+        return json.loads(payload_json)
+    except:
+        return None
+
+# ============================================================
+# HELPERS
+# ============================================================
 
 def fingerprint(title: str, link: str) -> str:
-    t = norm_text(title)[:200]
-    l = (link or "").strip()[:200]
-    return f"{t}||{l}"
-
-
-# ============================================================
-# UTIL
-# ============================================================
-
-def now_ts() -> int:
-    return int(time.time())
-
+    s = (title or "").strip() + "||" + (link or "").strip()
+    return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
 
 def decay_weight(age_sec: int) -> float:
-    return float(math.exp(-LAMBDA * max(0, age_sec)))
+    if age_sec < 0:
+        age_sec = 0
+    return math.exp(-LAMBDA * float(age_sec))
 
+def _fresh_bucket(age_sec: int) -> str:
+    if age_sec <= 2 * 3600:
+        return "0-2h"
+    if age_sec <= 8 * 3600:
+        return "2-8h"
+    return "8-24h"
 
-def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
-    tl = (text or "").lower()
+def match_rules(asset: str, title: str) -> List[Dict[str, Any]]:
     out = []
-    for pattern, w, why in RULES.get(asset, []):
-        if re.search(pattern, tl, flags=re.IGNORECASE):
-            out.append({"pattern": pattern, "w": float(w), "why": why})
+    t = (title or "").lower()
+    for (pat, w, why) in RULES.get(asset, []):
+        if re.search(pat, t, flags=re.I):
+            out.append({"pattern": pat, "w": float(w), "why": why})
     return out
-
-
-# ============================================================
-# FEEDS HEALTH
-# ============================================================
 
 def feeds_health_live() -> Dict[str, Any]:
-    out: Dict[str, Any] = {}
+    res = {}
     for src, url in RSS_FEEDS.items():
         try:
+            if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
+                res[src] = {"ok": True, "skipped": True, "entries": 0}
+                continue
             d = feedparser.parse(url)
             entries = getattr(d, "entries", []) or []
-            out[src] = {
+            res[src] = {
                 "ok": True,
                 "bozo": int(getattr(d, "bozo", 0)),
-                "entries": len(entries),
-                "bozo_exception": str(getattr(d, "bozo_exception", ""))[:240] if getattr(d, "bozo", 0) else "",
+                "entries": int(len(entries)),
             }
         except Exception as e:
-            out[src] = {"ok": False, "error": str(e)}
-    return out
-
+            res[src] = {"ok": False, "error": str(e), "entries": 0}
+    return res
 
 # ============================================================
 # INGEST
 # ============================================================
 
-def ingest_once(limit_per_feed: int = 30) -> int:
+def ingest_once(limit_per_feed: int = 40) -> int:
     inserted = 0
-    now = now_ts()
+    now = int(time.time())
 
     with db_conn() as conn:
         with conn.cursor() as cur:
             for src, url in RSS_FEEDS.items():
-                d = feedparser.parse(url)
-                entries = getattr(d, "entries", []) or []
+                if src in CALENDAR_FEEDS:
+                    continue
+                if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
+                    continue
 
-                # If bozo==1 but entries exist — ingest anyway (FED/OILPRICE often do this).
-                # If bozo==1 and entries==0 — truly broken, skip.
+                try:
+                    d = feedparser.parse(url)
+                except Exception:
+                    continue
+
+                entries = getattr(d, "entries", []) or []
                 if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
                     continue
 
@@ -281,492 +381,575 @@ def ingest_once(limit_per_feed: int = 30) -> int:
                     fp = fingerprint(title, link)
 
                     try:
-                        cur.execute(
-                            """
-                            INSERT INTO news_items (source, title, link, published_ts, fingerprint)
+                        cur.execute("""
+                            INSERT INTO news_items(source, title, link, published_ts, fingerprint)
                             VALUES (%s, %s, %s, %s, %s)
                             ON CONFLICT (fingerprint) DO NOTHING;
-                            """,
-                            (src, title, link, published_ts, fp)
-                        )
+                        """, (src, title, link, int(published_ts), fp))
                         if cur.rowcount == 1:
                             inserted += 1
                     except Exception:
-                        conn.rollback()
-                        continue
+                        pass
 
         conn.commit()
 
     return inserted
 
-
 # ============================================================
-# EVENT MODE (ForexFactory XML)
+# EVENT MODE (Calendar + recent macro)
 # ============================================================
 
-def _http_get_text(url: str, headers: Optional[Dict[str, str]] = None, timeout: int = 12) -> str:
-    if urlopen is None:
-        raise RuntimeError("urllib not available")
-    req = Request(url, headers=headers or {})
-    with urlopen(req, timeout=timeout) as r:
-        return r.read().decode("utf-8", errors="ignore")
-
-
-def parse_ff_calendar_thisweek(max_items: int = 120) -> Dict[str, Any]:
-    """
-    Best-effort parser for ForexFactory weekly XML.
-    We only need: upcoming USD High/Medium events within next N hours.
-    """
-    out = {"ok": False, "items": [], "error": ""}
+def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
+    url = RSS_FEEDS.get("FOREXFACTORY_CALENDAR")
+    if not url:
+        return []
     try:
-        xml_txt = _http_get_text(FOREXFACTORY_CAL_XML, headers={"User-Agent": "Mozilla/5.0"})
-        root = ET.fromstring(xml_txt)
+        d = feedparser.parse(url)
+        entries = getattr(d, "entries", []) or []
+    except Exception:
+        return []
 
-        now = datetime.now(timezone.utc)
-        items = []
+    out: List[Dict[str, Any]] = []
+    lookahead_sec = int(EVENT_CFG["lookahead_hours"] * 3600)
+    horizon = now_ts + lookahead_sec
 
-        # The ff xml structure may vary; we try robust find.
-        # Typical: <event> <title> <country> <impact> <date> <time> ...
-        for ev in root.findall(".//event"):
-            title = (ev.findtext("title") or "").strip()
-            country = (ev.findtext("country") or "").strip()
-            impact = (ev.findtext("impact") or "").strip()
-            date_s = (ev.findtext("date") or "").strip()
-            time_s = (ev.findtext("time") or "").strip()
+    for e in entries[:200]:
+        title = (e.get("title") or "").strip()
+        link = (e.get("link") or "").strip()
 
-            if not title:
-                continue
+        ts = None
+        published_parsed = e.get("published_parsed")
+        if published_parsed:
+            ts = int(time.mktime(published_parsed))
 
-            # Parse datetime best-effort
-            dt_utc = None
-            # FF sometimes uses "Jan 06" + "13:30" etc; timezone unclear.
-            # We treat it as UTC best-effort; this is "event mode", not exact trading execution.
-            try:
-                # Try: "Feb 06" + "13:30"
-                # Add current year
-                year = now.year
-                dt = datetime.strptime(f"{date_s} {year} {time_s}".strip(), "%b %d %Y %H:%M")
-                dt_utc = dt.replace(tzinfo=timezone.utc)
-            except Exception:
-                pass
+        if ts is not None:
+            if now_ts <= ts <= horizon:
+                out.append({
+                    "title": title,
+                    "link": link,
+                    "ts": int(ts),
+                    "in_hours": round((ts - now_ts) / 3600.0, 2),
+                })
+        else:
+            if len([x for x in out if x.get("ts") is None]) < 2:
+                out.append({
+                    "title": title,
+                    "link": link,
+                    "ts": None,
+                    "in_hours": None,
+                })
 
-            items.append({
-                "title": title,
-                "country": country,
-                "impact": impact,
-                "dt_utc": dt_utc.isoformat() if dt_utc else "",
-            })
+        if len(out) >= EVENT_CFG["max_upcoming"]:
+            break
 
-            if len(items) >= max_items:
+    out.sort(key=lambda x: (x["ts"] is None, x["ts"] or 0))
+    return out
+
+def _macro_recent_flag(rows: List[Tuple[str, str, str, int]], now_ts: int) -> bool:
+    recent_sec = int(EVENT_CFG["recent_hours"] * 3600)
+    macro_sources = {"FED", "BLS", "BEA"}
+    for (source, _title, _link, ts) in rows:
+        if source in macro_sources and (now_ts - int(ts)) <= recent_sec:
+            return True
+    return False
+
+def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours: float = 12.0) -> Dict[str, Any]:
+    cutoff = now_ts - int(hours * 3600)
+    hits = []
+    for (source, title, link, ts) in rows:
+        if int(ts) < cutoff:
+            continue
+        if source == "TRUMP_HEADLINES" or TRUMP_PAT.search(title or ""):
+            hits.append({"source": source, "title": title, "link": link, "published_ts": int(ts)})
+            if len(hits) >= 6:
                 break
-
-        out["ok"] = True
-        out["items"] = items
-        return out
-    except Exception as e:
-        out["error"] = str(e)
-        return out
-
-
-def event_mode_flag(ff: Dict[str, Any], hours_ahead: int = 12) -> Dict[str, Any]:
-    """
-    Returns per-asset event flags (simple v1):
-    - if there is a USD high-impact event within next 12h -> event_mode = True for XAU/US500/WTI
-    """
-    now = datetime.now(timezone.utc)
-    until = now.timestamp() + hours_ahead * 3600
-    reasons = []
-
-    if not ff.get("ok"):
-        return {"event_mode": False, "reasons": ["FF calendar not available"]}
-
-    for it in ff.get("items", []):
-        if (it.get("country") or "").upper() not in ("USD", "US", "UNITED STATES"):
-            continue
-        impact = (it.get("impact") or "").lower()
-        if "high" not in impact and "medium" not in impact:
-            continue
-
-        dt_s = it.get("dt_utc") or ""
-        if not dt_s:
-            continue
-        try:
-            dt = datetime.fromisoformat(dt_s.replace("Z", "+00:00"))
-            if now.timestamp() <= dt.timestamp() <= until:
-                reasons.append(f"{it.get('impact','').upper()} USD: {it.get('title','')}")
-        except Exception:
-            continue
-
-    if reasons:
-        return {"event_mode": True, "reasons": reasons[:5]}
-    return {"event_mode": False, "reasons": []}
-
+    return {"enabled": bool(TRUMP_ENABLED), "flag": bool(len(hits) > 0), "items": hits}
 
 # ============================================================
-# SCORING + QUALITY V2 + CONSENSUS + CONFLICT + FRESHNESS
+# FRED
 # ============================================================
 
-def compute_bias(lookback_hours: int = 24, limit_rows: int = 900) -> Dict[str, Any]:
-    now = now_ts()
+def fred_fetch_observations(series_id: str, days: int = 120) -> List[Tuple[str, Optional[float]]]:
+    if not (FRED_CFG["enabled"] and FRED_CFG["api_key"]):
+        return []
+    url = "https://api.stlouisfed.org/fred/series/observations"
+    params = {
+        "series_id": series_id,
+        "api_key": FRED_CFG["api_key"],
+        "file_type": "json",
+        "sort_order": "desc",
+        "limit": max(60, min(5000, days * 2)),
+    }
+    r = requests.get(url, params=params, timeout=12)
+    r.raise_for_status()
+    js = r.json()
+    out = []
+    for o in js.get("observations", []):
+        d = o.get("date")
+        v = o.get("value")
+        if v in (None, ".", ""):
+            out.append((d, None))
+        else:
+            try:
+                out.append((d, float(v)))
+            except Exception:
+                out.append((d, None))
+    return out
+
+def fred_ingest_series(series_id: str, days: int = 120) -> int:
+    obs = fred_fetch_observations(series_id, days=days)
+    if not obs:
+        return 0
+    inserted = 0
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for d, v in obs:
+                if not d:
+                    continue
+                cur.execute("""
+                    INSERT INTO fred_series(series_id, obs_date, value)
+                    VALUES (%s, %s::date, %s)
+                    ON CONFLICT (series_id, obs_date) DO UPDATE SET value=EXCLUDED.value;
+                """, (series_id, d, v))
+                inserted += 1
+        conn.commit()
+    return inserted
+
+def fred_last_values(series_id: str, n: int = 90) -> List[float]:
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT value FROM fred_series
+                WHERE series_id=%s AND value IS NOT NULL
+                ORDER BY obs_date DESC
+                LIMIT %s;
+            """, (series_id, n))
+            rows = cur.fetchall()
+    return [float(x[0]) for x in rows if x and x[0] is not None]
+
+def _pct_change(latest: float, past: float) -> float:
+    den = abs(past) if abs(past) > 1e-12 else 1.0
+    return (latest - past) / den
+
+def compute_fred_drivers() -> Dict[str, Any]:
+    out = {"XAU": [], "US500": [], "WTI": []}
+
+    def add(asset: str, key: str, w: float, note: str, value: float, delta: float):
+        out[asset].append({
+            "driver": key,
+            "w": round(float(w), 4),
+            "value": round(float(value), 4),
+            "delta": round(float(delta), 6),
+            "why": note,
+        })
+
+    dgs10  = fred_last_values("DGS10", 90)
+    dfii10 = fred_last_values("DFII10", 90)
+    t10yie = fred_last_values("T10YIE", 90)
+    usd    = fred_last_values("DTWEXBGS", 120)
+    vix    = fred_last_values("VIXCLS", 120)
+    baa    = fred_last_values("BAA10Y", 120)
+
+    # XAU: real yields, nominal yields, USD, breakevens
+    if len(dfii10) >= 6:
+        latest, past = dfii10[0], dfii10[5]
+        d = latest - past
+        add("XAU", "DFII10", w=(-1.2 if d > 0 else +1.0), note="Real yields move (DFII10)", value=latest, delta=d)
+
+    if len(dgs10) >= 6:
+        latest, past = dgs10[0], dgs10[5]
+        d = latest - past
+        add("XAU", "DGS10", w=(-0.7 if d > 0 else +0.5), note="Nominal yields move (DGS10)", value=latest, delta=d)
+
+    if len(usd) >= 6:
+        latest, past = usd[0], usd[5]
+        d = _pct_change(latest, past)
+        add("XAU", "DTWEXBGS", w=(-0.9 if d > 0 else +0.7), note="USD broad index move", value=latest, delta=d)
+
+    if len(t10yie) >= 6:
+        latest, past = t10yie[0], t10yie[5]
+        d = latest - past
+        add("XAU", "T10YIE", w=(+0.4 if d > 0 else -0.2), note="Inflation expectations move (T10YIE)", value=latest, delta=d)
+
+    # US500: yields, VIX, credit stress
+    if len(dgs10) >= 6:
+        latest, past = dgs10[0], dgs10[5]
+        d = latest - past
+        add("US500", "DGS10", w=(-0.9 if d > 0 else +0.5), note="Rates pressure/support equities", value=latest, delta=d)
+
+    if len(vix) >= 6:
+        latest, past = vix[0], vix[5]
+        d = _pct_change(latest, past)
+        add("US500", "VIXCLS", w=(-1.0 if d > 0 else +0.4), note="VIX risk regime shift", value=latest, delta=d)
+
+    if len(baa) >= 6:
+        latest, past = baa[0], baa[5]
+        d = latest - past
+        add("US500", "BAA10Y", w=(-0.6 if d > 0 else +0.3), note="Credit stress proxy", value=latest, delta=d)
+
+    # WTI: USD headwind/tailwind (light)
+    if len(usd) >= 6:
+        latest, past = usd[0], usd[5]
+        d = _pct_change(latest, past)
+        add("WTI", "DTWEXBGS", w=(-0.4 if d > 0 else +0.2), note="USD headwind/tailwind", value=latest, delta=d)
+
+    return out
+
+# ============================================================
+# SCORING / QUALITY
+# ============================================================
+
+def _flip_distances(score: float, th: float) -> Dict[str, float]:
+    to_bullish = max(0.0, th - score)
+    to_bearish = max(0.0, score + th)
+    return {
+        "to_bullish": round(to_bullish, 4),
+        "to_bearish": round(to_bearish, 4),
+        "note": "Δ needed in score units to reach +th (bullish) or -th (bearish).",
+    }
+
+def _consensus_stats(contribs: List[Dict[str, Any]]) -> Tuple[float, float, float]:
+    net = sum(float(x.get("contrib", 0.0)) for x in contribs)
+    abs_sum = sum(abs(float(x.get("contrib", 0.0))) for x in contribs)
+    if abs_sum <= 1e-12:
+        return 0.0, 1.0, 0.0
+    consensus_ratio = abs(net) / abs_sum
+    conflict_index = 1.0 - consensus_ratio
+    return round(consensus_ratio, 4), round(conflict_index, 4), round(abs_sum, 4)
+
+def _top_drivers(contribs: List[Dict[str, Any]], topn: int = 3) -> List[Dict[str, Any]]:
+    acc: Dict[str, float] = {}
+    for x in contribs:
+        why = str(x.get("why", ""))
+        c = float(x.get("contrib", 0.0))
+        acc[why] = acc.get(why, 0.0) + abs(c)
+    out = [{"why": k, "abs_contrib_sum": round(v, 4)} for k, v in acc.items()]
+    out.sort(key=lambda x: x["abs_contrib_sum"], reverse=True)
+    return out[:topn]
+
+def _consensus_by_source(contribs: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+    acc: Dict[str, Dict[str, float]] = {}
+    cnt: Dict[str, int] = {}
+    for x in contribs:
+        src = str(x.get("source", ""))
+        c = float(x.get("contrib", 0.0))
+        if src not in acc:
+            acc[src] = {"net": 0.0, "abs": 0.0}
+            cnt[src] = 0
+        acc[src]["net"] += c
+        acc[src]["abs"] += abs(c)
+        cnt[src] += 1
+    out = []
+    for src, v in acc.items():
+        out.append({"source": src, "net": round(v["net"], 4), "abs": round(v["abs"], 4), "count": int(cnt[src])})
+    out.sort(key=lambda x: x["abs"], reverse=True)
+    return out
+
+# ============================================================
+# BIAS COMPUTE
+# ============================================================
+
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, Any]:
+    now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 WHERE published_ts >= %s
                 ORDER BY published_ts DESC
                 LIMIT %s;
-                """,
-                (cutoff, limit_rows)
-            )
-            rows = cur.fetchall()
+            """, (cutoff, limit_rows))
+            rows: List[Tuple[str, str, str, int]] = cur.fetchall()
 
-    ff = parse_ff_calendar_thisweek()
-    evflag = event_mode_flag(ff, hours_ahead=12)
+    # --- FRED ingest + drivers
+    fred_inserted = 0
+    fred_drivers = {"XAU": [], "US500": [], "WTI": []}
+    if FRED_CFG["enabled"] and FRED_CFG["api_key"]:
+        for sid in FRED_SERIES.keys():
+            try:
+                fred_inserted += fred_ingest_series(sid, days=FRED_CFG["window_days"])
+            except Exception:
+                pass
+        try:
+            fred_drivers = compute_fred_drivers()
+        except Exception:
+            fred_drivers = {"XAU": [], "US500": [], "WTI": []}
+
+    # --- Event mode
+    upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
+    recent_macro = _macro_recent_flag(rows, now)
+    event_mode = False
+    if EVENT_CFG["enabled"]:
+        event_mode = bool(recent_macro or any(x.get("ts") is not None for x in upcoming_events))
+
+    # --- Trump flag
+    trump = trump_flag_recent(rows, now, hours=12.0)
 
     assets_out: Dict[str, Any] = {}
-
     for asset in ASSETS:
-        total = 0.0
-        why_all: List[Dict[str, Any]] = []
-        abs_sum = 0.0
-
-        # for consensus/conflict
-        by_source: Dict[str, float] = {}
-        pos_abs = 0.0
-        neg_abs = 0.0
-
-        # freshness buckets
-        b_0_2 = 0
-        b_2_8 = 0
-        b_8_24 = 0
+        score = 0.0
+        contribs: List[Dict[str, Any]] = []
+        freshness = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
 
         for (source, title, link, ts) in rows:
-            age = now - int(ts)
-            w_src = SOURCE_WEIGHT.get(source, 1.0)
-            w_time = decay_weight(age)
+            age_sec = now - int(ts)
+            if age_sec < 0:
+                age_sec = 0
+            w_src = float(SOURCE_WEIGHT.get(source, 1.0))
+            w_time = decay_weight(age_sec)
 
             matches = match_rules(asset, title)
             if not matches:
                 continue
 
-            # freshness counters (by matched headlines)
-            age_h = age / 3600.0
-            if age_h <= 2:
-                b_0_2 += 1
-            elif age_h <= 8:
-                b_2_8 += 1
-            else:
-                b_8_24 += 1
+            freshness[_fresh_bucket(age_sec)] += 1
 
             for m in matches:
                 base_w = float(m["w"])
                 contrib = base_w * w_src * w_time
-
-                total += contrib
-                abs_sum += abs(contrib)
-
-                if contrib >= 0:
-                    pos_abs += abs(contrib)
-                else:
-                    neg_abs += abs(contrib)
-
-                by_source[source] = by_source.get(source, 0.0) + contrib
-
-                why_all.append({
+                score += contrib
+                contribs.append({
                     "source": source,
                     "title": title,
                     "link": link,
                     "published_ts": int(ts),
-                    "age_min": int(age / 60),
+                    "age_min": int(age_sec / 60),
                     "base_w": base_w,
-                    "src_w": w_src,
-                    "time_w": round(w_time, 4),
-                    "contrib": round(contrib, 4),
+                    "src_w": round(w_src, 4),
+                    "time_w": round(float(w_time), 4),
+                    "contrib": round(float(contrib), 4),
                     "why": m["why"],
+                    "pattern": m["pattern"],
                 })
 
+        # Inject FRED drivers as evidence (fresh, deterministic)
+        for d in (fred_drivers.get(asset) or []):
+            c = float(d.get("w", 0.0))
+            if abs(c) < 1e-12:
+                continue
+            score += c
+            contribs.append({
+                "source": "FRED",
+                "title": f'{d.get("driver","")} value={d.get("value","")} delta={d.get("delta","")}',
+                "link": "https://fred.stlouisfed.org/",
+                "published_ts": now,
+                "age_min": 0,
+                "base_w": float(d.get("w", 0.0)),
+                "src_w": 1.0,
+                "time_w": 1.0,
+                "contrib": round(c, 4),
+                "why": str(d.get("why", "FRED driver")),
+                "pattern": "FRED",
+            })
+
         th = float(BIAS_THRESH.get(asset, 1.0))
-        if total >= th:
+        if score >= th:
             bias = "BULLISH"
-        elif total <= -th:
+        elif score <= -th:
             bias = "BEARISH"
         else:
             bias = "NEUTRAL"
 
-        why_sorted = sorted(why_all, key=lambda x: abs(float(x["contrib"])), reverse=True)
-        why_top5 = why_sorted[:5]
+        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
+        evidence_count = len(contribs)
+        src_div = len(set([w["source"] for w in contribs])) if contribs else 0
 
-        # --- Conflict index (0..1): opposite pressure vs total
-        # If total >=0, conflict = neg_abs/(pos_abs+neg_abs)
-        # If total <0, conflict = pos_abs/(pos_abs+neg_abs)
-        denom = max(1e-9, (pos_abs + neg_abs))
-        if total >= 0:
-            conflict = float(neg_abs / denom)
-        else:
-            conflict = float(pos_abs / denom)
-        conflict = max(0.0, min(1.0, conflict))
+        # Quality v1 (simple)
+        strength = min(1.0, abs(score) / max(th, 1e-9))
+        quality_v1 = int(min(100, (strength * 60.0) + min(30, evidence_count * 2.0) + min(10, src_div * 2.0)))
 
-        # --- Consensus (sources for/against)
-        src_for = sum(1 for s, v in by_source.items() if v * total > 0 and abs(v) > 1e-6)
-        src_against = sum(1 for s, v in by_source.items() if v * total < 0 and abs(v) > 1e-6)
+        # Consensus/conflict
+        consensus_ratio, conflict_index, _abs_sum = _consensus_stats(contribs)
 
-        # --- Delta to threshold (what to flip)
-        # If NEUTRAL: need reach +th or -th (we compute nearest)
-        if bias == "NEUTRAL":
-            delta_to_bull = th - total
-            delta_to_bear = th + total  # how far to go down to -th
-            delta_to_th = min(delta_to_bull, delta_to_bear)
-        else:
-            delta_to_th = max(0.0, th - abs(total))
-        delta_to_th = float(delta_to_th)
+        # Quality v2 (strict)
+        strength_2 = min(1.2, abs(score) / max(th, 1e-9))
+        ev_term = min(1.0, evidence_count / 18.0)
+        div_term = min(1.0, src_div / 7.0)
 
-        # --- Quality v2 (0..100)
-        # components:
-        # 1) strength vs threshold (0..1)
-        strength = min(1.0, abs(total) / max(th, 1e-9))
-        # 2) evidence saturation (0..1)
-        evidence = len(why_all)
-        ev_sat = min(1.0, evidence / 20.0)
-        # 3) source diversity (0..1)
-        src_div = len(set([w["source"] for w in why_all])) if why_all else 0
-        div_sat = min(1.0, src_div / 8.0)
-        # 4) freshness (0..1)
-        fresh = (min(10, b_0_2) * 1.0 + min(10, b_2_8) * 0.6 + min(10, b_8_24) * 0.2) / 10.0
-        fresh = max(0.0, min(1.0, fresh))
-        # 5) conflict penalty
-        # high conflict reduces quality
-        conf_pen = (1.0 - conflict)
+        fresh_total = sum(int(v) for v in freshness.values())
+        fresh02 = freshness["0-2h"]
+        fresh28 = freshness["2-8h"]
+        fresh_score = 0.0
+        if fresh_total > 0:
+            fresh_score = min(1.0, (fresh02 * 1.0 + fresh28 * 0.6) / max(1.0, fresh_total))
 
-        q = 100.0 * (0.40 * strength + 0.18 * ev_sat + 0.14 * div_sat + 0.18 * fresh + 0.10 * conf_pen)
-        quality_v2 = int(max(0, min(100, round(q))))
+        event_penalty = 0.15 if event_mode else 0.0
 
-        # --- Trade Gate (per asset)
-        prof = GATE_PROFILES.get(GATE_PROFILE_DEFAULT, GATE_PROFILES["moderate"])
-        q_min = int(prof["q_min"])
-        conf_max = float(prof["conf_max"])
-        delta_max = float(prof["delta_to_th_max"])
-        event_q_min = int(prof["event_q_min"])
+        raw_v2 = (
+            0.45 * min(1.0, strength_2) +
+            0.20 * ev_term +
+            0.10 * div_term +
+            0.10 * fresh_score +
+            0.15 * consensus_ratio -
+            0.35 * conflict_index -
+            event_penalty
+        )
+        quality_v2 = int(max(0, min(100, round(raw_v2 * 100))))
 
-        event_mode = bool(evflag.get("event_mode", False))
-        gate_ok = True
-        gate_reasons_no = []
-        gate_reasons_yes = []
-
-        if bias == "NEUTRAL":
-            gate_ok = False
-            gate_reasons_no.append("Bias NEUTRAL")
-        else:
-            gate_reasons_yes.append(f"Bias {bias}")
-
-        if quality_v2 < q_min:
-            gate_ok = False
-            gate_reasons_no.append(f"Quality_v2<{q_min}")
-        else:
-            gate_reasons_yes.append(f"Quality_v2≥{q_min}")
-
-        if conflict > conf_max:
-            gate_ok = False
-            gate_reasons_no.append(f"Conflict>{conf_max}")
-        else:
-            gate_reasons_yes.append(f"Conflict≤{conf_max}")
-
-        if delta_to_th > delta_max:
-            gate_ok = False
-            gate_reasons_no.append(f"ΔtoTH>{delta_max}")
-        else:
-            gate_reasons_yes.append(f"ΔtoTH≤{delta_max}")
-
-        if event_mode and quality_v2 < event_q_min:
-            gate_ok = False
-            gate_reasons_no.append(f"EventMode and Quality<{event_q_min}")
-
-        # "What would flip to OK" targets
-        flip_conditions = {
-            "need_conflict_below": conf_max,
-            "need_quality_at_least": max(q_min, event_q_min if event_mode else q_min),
-            "need_delta_to_th_below": delta_max,
-            "need_bias_non_neutral": True,
-        }
-
-        # Top drivers now: take top 3 contributions
-        top3 = why_sorted[:3]
+        top3 = _top_drivers(contribs, topn=3)
+        flip = _flip_distances(score, th)
+        cons_by_src = _consensus_by_source(contribs)
 
         assets_out[asset] = {
             "bias": bias,
-            "score": round(total, 4),
+            "score": round(score, 4),
             "threshold": th,
-            "delta_to_th": round(delta_to_th, 4),
 
-            "quality_v2": quality_v2,
-            "evidence_count": int(evidence),
+            "quality": int(quality_v1),
+            "quality_v2": int(quality_v2),
+
+            "evidence_count": int(evidence_count),
             "source_diversity": int(src_div),
 
-            "consensus": {"sources_for": int(src_for), "sources_against": int(src_against)},
-            "conflict_index": round(conflict, 4),
-
-            "freshness": {"h0_2": int(b_0_2), "h2_8": int(b_2_8), "h8_24": int(b_8_24)},
-
-            "trade_gate": {
-                "ok": bool(gate_ok),
-                "profile": GATE_PROFILE_DEFAULT,
-                "why_yes": gate_reasons_yes[:3],
-                "why_no": gate_reasons_no[:3],
-                "flip_conditions": flip_conditions,
-            },
+            "consensus_ratio": float(consensus_ratio),
+            "conflict_index": float(conflict_index),
+            "freshness": freshness,
 
             "top3_drivers": top3,
+            "flip": flip,
+            "consensus_by_source": cons_by_src,
+
             "why_top5": why_top5,
         }
 
-    payload = {
+    payload: Dict[str, Any] = {
         "updated_utc": datetime.now(timezone.utc).isoformat(),
         "assets": assets_out,
         "meta": {
             "lookback_hours": lookback_hours,
             "feeds": list(RSS_FEEDS.keys()),
-            "feeds_status": feeds_health_live(),
-            "event_mode": evflag,
-            "ff_calendar_ok": bool(ff.get("ok")),
+            "gate_profile": GATE_PROFILE,
+            "fred": {
+                "enabled": bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"])),
+                "inserted_points_last_run": int(fred_inserted),
+                "series": list(FRED_SERIES.keys()),
+            },
+            "trump": trump,
+        },
+        "event": {
+            "enabled": bool(EVENT_CFG["enabled"]),
+            "event_mode": bool(event_mode),
+            "recent_macro": bool(recent_macro),
+            "upcoming_events": upcoming_events,
+            "lookahead_hours": float(EVENT_CFG["lookahead_hours"]),
+            "recent_hours": float(EVENT_CFG["recent_hours"]),
+            "ff_calendar_enabled": "FOREXFACTORY_CALENDAR" in RSS_FEEDS,
         }
     }
     return payload
-
-
-# ============================================================
-# STATE
-# ============================================================
-
-def save_bias(payload: dict):
-    now = now_ts()
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute(
-                """
-                INSERT INTO bias_state (id, updated_ts, payload_json)
-                VALUES (1, %s, %s)
-                ON CONFLICT (id)
-                DO UPDATE SET updated_ts = EXCLUDED.updated_ts, payload_json = EXCLUDED.payload_json;
-                """,
-                (now, json.dumps(payload, ensure_ascii=False))
-            )
-        conn.commit()
-
-
-def load_bias() -> Optional[dict]:
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT payload_json FROM bias_state WHERE id=1;")
-            row = cur.fetchone()
-    if not row:
-        return None
-    return json.loads(row[0])
-
 
 def pipeline_run():
     db_init()
-    inserted = ingest_once(limit_per_feed=30)
-    payload = compute_bias(lookback_hours=24, limit_rows=900)
-    payload["meta"]["inserted_last_run"] = inserted
+    inserted = ingest_once(limit_per_feed=40)
+    payload = compute_bias(lookback_hours=24, limit_rows=1200)
+    payload["meta"]["inserted_last_run"] = int(inserted)
+    payload["meta"]["feeds_status"] = feeds_health_live()
     save_bias(payload)
     return payload
 
-
 # ============================================================
-# DRIVERS (FRED) - cached
+# TRADE GATE
 # ============================================================
 
-DRIVERS_CACHE: Dict[str, Any] = {"ts": 0, "payload": None}
-DRIVERS_TTL_SEC = 120  # 2 min
+def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -> Dict[str, Any]:
+    cfg = GATE_THRESHOLDS.get(profile, GATE_THRESHOLDS["STRICT"])
 
-FRED_BASE = "https://api.stlouisfed.org/fred/series/observations"
+    bias = str(asset_obj.get("bias", "NEUTRAL"))
+    score = float(asset_obj.get("score", 0.0))
+    th = float(asset_obj.get("threshold", 1.0))
+    q2 = int(asset_obj.get("quality_v2", 0))
+    conflict = float(asset_obj.get("conflict_index", 1.0))
+    flip = asset_obj.get("flip", {}) or {}
+    to_bull = float(flip.get("to_bullish", max(0.0, th - score)))
+    to_bear = float(flip.get("to_bearish", max(0.0, score + th)))
 
-FRED_SERIES = {
-    # USD / FX
-    "DEXUSEU": "EURUSD (USD per EUR)",
-    "DEXJPUS": "USDJPY (JPY per USD)",
-    "DTWEXBGS": "Broad USD index (proxy)",
-    # rates / real yields / inflation
-    "DGS10": "US 10Y nominal yield",
-    "DFII10": "US 10Y real yield (TIPS)",
-    "T10YIE": "US 10Y breakeven inflation",
-    # risk
-    "VIXCLS": "VIX",
-    "SP500": "S&P 500",
-    # oil
-    "DCOILWTICO": "WTI spot",
-}
+    if bias == "BULLISH":
+        opp_dist = to_bear
+        opp_label = "to_bearish"
+    elif bias == "BEARISH":
+        opp_dist = to_bull
+        opp_label = "to_bullish"
+    else:
+        opp_dist = min(to_bull, to_bear)
+        opp_label = "min(to_bullish,to_bearish)"
 
-def fred_latest(series_id: str) -> Dict[str, Any]:
-    api_key = os.environ.get("FRED_API_KEY", "").strip()
-    if not api_key:
-        return {"ok": False, "error": "FRED_API_KEY not set"}
+    fail_reasons: List[str] = []
+    must_change: List[str] = []
 
-    params = {
-        "series_id": series_id,
-        "api_key": api_key,
-        "file_type": "json",
-        "sort_order": "desc",
-        "limit": 2,
+    # Bias gate
+    if bias == "NEUTRAL" and not cfg.get("neutral_allow", False):
+        fail_reasons.append("Bias is NEUTRAL")
+        must_change.append("bias must become BULLISH or BEARISH (score must cross ±threshold)")
+    elif bias == "NEUTRAL" and cfg.get("neutral_allow", False):
+        maxd = float(cfg.get("neutral_flip_dist_max", 0.20))
+        if min(to_bull, to_bear) > maxd:
+            fail_reasons.append("Bias is NEUTRAL (not near flip)")
+            must_change.append(f"Δ to threshold must shrink: min(to_bullish,to_bearish) ≤ {maxd}")
+
+    # Quality v2 gate
+    qmin = int(cfg["quality_v2_min"])
+    if q2 < qmin:
+        fail_reasons.append(f"Quality v2 too low ({q2} < {qmin})")
+        must_change.append(f"quality_v2 must be ≥ {qmin}")
+
+    # Conflict gate
+    cmax = float(cfg["conflict_max"])
+    if conflict > cmax:
+        fail_reasons.append(f"Conflict too high ({conflict} > {cmax})")
+        must_change.append(f"conflict_index must be ≤ {cmax}")
+
+    # Opp flip distance guard
+    mind = float(cfg["min_opp_flip_dist"])
+    if bias in ("BULLISH", "BEARISH"):
+        if opp_dist < mind:
+            fail_reasons.append(f"Too close to opposite flip ({opp_label}={round(opp_dist,4)} < {mind})")
+            must_change.append(f"{opp_label} must be ≥ {mind}")
+
+    # Event mode gate
+    if event_mode:
+        if cfg.get("event_mode_block", True):
+            oq = int(cfg.get("event_override_quality", 70))
+            oc = float(cfg.get("event_override_conflict", 0.45))
+            if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
+                fail_reasons.append("Event mode ON (macro risk window)")
+                must_change.append(f"Either wait until event_mode=OFF, or require quality_v2 ≥ {oq} and conflict_index ≤ {oc} (and bias != NEUTRAL).")
+
+    ok = (len(fail_reasons) == 0)
+
+    # WHY from top drivers
+    td = asset_obj.get("top3_drivers", []) or []
+    why_short = [x.get("why", "") for x in td[:3] if x.get("why")]
+    if not why_short:
+        why_short = ["Insufficient matched evidence (rules)"]
+
+    return {
+        "ok": bool(ok),
+        "label": "TRADE OK" if ok else "NO TRADE",
+        "why": why_short[:3],
+        "fail_reasons": fail_reasons[:4],
+        "must_change": must_change[:4],
     }
-    url = FRED_BASE + "?" + urlencode(params)
-    try:
-        txt = _http_get_text(url, headers={"User-Agent": "Mozilla/5.0"})
-        data = json.loads(txt)
-        obs = (data.get("observations") or [])
-        # pick first non "." value
-        for o in obs:
-            v = o.get("value")
-            if v is None or v == ".":
-                continue
-            return {"ok": True, "series_id": series_id, "date": o.get("date"), "value": v}
-        return {"ok": False, "error": "no valid observations"}
-    except Exception as e:
-        return {"ok": False, "error": str(e)}
-
-def drivers_payload() -> Dict[str, Any]:
-    # cached
-    now = now_ts()
-    if DRIVERS_CACHE["payload"] and (now - int(DRIVERS_CACHE["ts"])) < DRIVERS_TTL_SEC:
-        return DRIVERS_CACHE["payload"]
-
-    snap = {}
-    for sid, name in FRED_SERIES.items():
-        snap[sid] = {"name": name, **fred_latest(sid)}
-
-    payload = {
-        "updated_utc": datetime.now(timezone.utc).isoformat(),
-        "series": snap,
-        "mapping": {
-            "GOLD": ["DTWEXBGS", "DEXUSEU", "DFII10", "DGS10", "VIXCLS", "SP500"],
-            "US500": ["SP500", "VIXCLS", "DGS10", "DFII10", "DTWEXBGS", "DEXUSEU"],
-            "WTI": ["DCOILWTICO", "DTWEXBGS", "DGS10", "VIXCLS", "SP500"],
-        }
-    }
-    DRIVERS_CACHE["ts"] = now
-    DRIVERS_CACHE["payload"] = payload
-    return payload
-
 
 # ============================================================
 # API
 # ============================================================
 
-app = FastAPI(title="News Bias Bot (MVP)")
-
+app = FastAPI(title="News Bias Bot (MVP++)")
 
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/dashboard", status_code=302)
 
-
 @app.get("/health")
 def health():
-    return {"ok": True}
+    return {"ok": True, "gate_profile": GATE_PROFILE}
 
+@app.get("/rules")
+def rules():
+    return {"assets": ASSETS, "rules": RULES}
 
 @app.get("/bias")
 def bias(pretty: int = 0):
@@ -774,66 +957,49 @@ def bias(pretty: int = 0):
     state = load_bias()
     if not state:
         state = pipeline_run()
-
     if pretty:
         return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
-
     return JSONResponse(state)
-
 
 @app.post("/run")
 def run_now():
     return pipeline_run()
 
-
 @app.get("/latest")
-def latest(limit: int = 30):
+def latest(limit: int = 40):
     db_init()
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 ORDER BY published_ts DESC
                 LIMIT %s;
-                """,
-                (limit,)
-            )
+            """, (limit,))
             rows = cur.fetchall()
-
     return {
         "items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]
     }
 
-
 @app.get("/explain")
-def explain(asset: str = "US500", limit: int = 50):
+def explain(asset: str = "US500", limit: int = 60):
     asset = asset.upper().strip()
     if asset not in ASSETS:
-        return {"error": f"asset must be one of {ASSETS}"}
+        return {"error": "Unknown asset. Use XAU, US500, WTI."}
 
     db_init()
-    payload = load_bias()
-    if not payload:
-        payload = pipeline_run()
-
-    # reuse already computed detailed matches via re-run light computation on recent rows
-    now = now_ts()
+    now = int(time.time())
     cutoff = now - 24 * 3600
 
     with db_conn() as conn:
         with conn.cursor() as cur:
-            cur.execute(
-                """
+            cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 WHERE published_ts >= %s
                 ORDER BY published_ts DESC
-                LIMIT 900;
-                """,
-                (cutoff,)
-            )
+                LIMIT 1200;
+            """, (cutoff,))
             rows = cur.fetchall()
 
     out = []
@@ -842,20 +1008,21 @@ def explain(asset: str = "US500", limit: int = 50):
         if not matches:
             continue
         age = now - int(ts)
-        w_src = SOURCE_WEIGHT.get(source, 1.0)
+        if age < 0:
+            age = 0
+        w_src = float(SOURCE_WEIGHT.get(source, 1.0))
         w_time = decay_weight(age)
-
         for m in matches:
-            contrib = float(m["w"]) * w_src * w_time
+            contrib = float(m["w"]) * w_src * float(w_time)
             out.append({
                 "source": source,
                 "title": title,
                 "link": link,
                 "age_min": int(age / 60),
                 "base_w": float(m["w"]),
-                "src_w": w_src,
-                "time_w": round(w_time, 4),
-                "contrib": round(contrib, 4),
+                "src_w": float(w_src),
+                "time_w": round(float(w_time), 4),
+                "contrib": round(float(contrib), 4),
                 "why": m["why"],
                 "pattern": m["pattern"],
             })
@@ -863,170 +1030,236 @@ def explain(asset: str = "US500", limit: int = 50):
     out_sorted = sorted(out, key=lambda x: abs(float(x["contrib"])), reverse=True)[:limit]
     return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
 
-
 @app.get("/feeds_health")
 def feeds_health():
     return feeds_health_live()
 
-
-@app.get("/drivers")
-def drivers(pretty: int = 0):
-    p = drivers_payload()
-    if pretty:
-        return PlainTextResponse(json.dumps(p, ensure_ascii=False, indent=2), media_type="application/json")
-    return JSONResponse(p)
-
-
-# ============================================================
-# DASHBOARD UI (iPhone-friendly, theme+compact)
-# ============================================================
-
-def _pill(kind: str, text: str) -> str:
-    cls = "pill"
-    if kind == "bull":
-        cls += " pill-bull"
-    elif kind == "bear":
-        cls += " pill-bear"
-    elif kind == "ok":
-        cls += " pill-ok"
-    elif kind == "no":
-        cls += " pill-no"
-    else:
-        cls += " pill-neutral"
-    return f'<span class="{cls}">{text}</span>'
-
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(theme: str = "dark", compact: int = 0):
+@app.get("/morning_plan")
+def morning_plan():
     db_init()
     payload = load_bias()
     if not payload:
         payload = pipeline_run()
 
-    assets = payload.get("assets", {})
+    assets = payload.get("assets", {}) or {}
+    meta = payload.get("meta", {}) or {}
+    event = payload.get("event", {}) or {}
+    trump = meta.get("trump", {}) or {}
+
+    gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
+    event_mode = bool(event.get("event_mode", False))
+
+    def pack(asset: str) -> Dict[str, Any]:
+        a = assets.get(asset, {}) or {}
+        gate = eval_trade_gate(a, event_mode, gate_profile)
+        return {
+            "asset": asset,
+            "bias": a.get("bias"),
+            "score": a.get("score"),
+            "th": a.get("threshold"),
+            "quality_v2": a.get("quality_v2"),
+            "conflict": a.get("conflict_index"),
+            "top_drivers": (a.get("top3_drivers", []) or [])[:3],
+            "gate": gate,
+            "flip": a.get("flip", {}),
+        }
+
+    out = {
+        "updated_utc": payload.get("updated_utc"),
+        "gate_profile": gate_profile,
+        "event_mode": event_mode,
+        "upcoming_events": (event.get("upcoming_events", []) or [])[:6],
+        "trump": trump,
+        "plan": {
+            "XAU": pack("XAU"),
+            "US500": pack("US500"),
+            "WTI": pack("WTI"),
+        }
+    }
+    return JSONResponse(out)
+
+# ============================================================
+# UI (Dashboard)
+# ============================================================
+
+def _pill(bias: str) -> str:
+    if bias == "BULLISH":
+        return '<span class="pill pill-bull">BULLISH</span>'
+    if bias == "BEARISH":
+        return '<span class="pill pill-bear">BEARISH</span>'
+    return '<span class="pill pill-neutral">NEUTRAL</span>'
+
+def _pill_gate(ok: bool) -> str:
+    if ok:
+        return '<span class="pill pill-ok">✅ TRADE OK</span>'
+    return '<span class="pill pill-no">❌ NO TRADE</span>'
+
+def _bar(v: int) -> str:
+    vv = max(0, min(100, int(v)))
+    return f"""
+    <div class="bar"><div class="bar-fill" style="width:{vv}%"></div></div>
+    <div class="bar-num">{vv}/100</div>
+    """
+
+def _tooltip(label: str, text: str) -> str:
+    return f"""
+    <span class="tipwrap">
+      <span class="tipicon" tabindex="0" role="button" aria-label="{label}" data-tip="{text}">ⓘ</span>
+    </span>
+    """
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(compact: int = 0):
+    db_init()
+    payload = load_bias()
+    if not payload:
+        payload = pipeline_run()
+
+    assets = payload.get("assets", {}) or {}
     updated = payload.get("updated_utc", "")
     meta = payload.get("meta", {}) or {}
     feeds_status = meta.get("feeds_status", {}) or {}
-    ev = meta.get("event_mode", {}) or {}
+    gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
 
-    # latest headlines
+    event = payload.get("event", {}) or {}
+    event_mode = bool(event.get("event_mode", False))
+    upcoming = event.get("upcoming_events", []) or []
+
+    trump = meta.get("trump", {}) or {}
+    trump_flag = bool(trump.get("flag", False))
+    trump_enabled = bool(trump.get("enabled", False))
+
+    # Pull last headlines for "Latest relevant"
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT source, title, link, published_ts
                 FROM news_items
                 ORDER BY published_ts DESC
-                LIMIT 120;
+                LIMIT 220;
             """)
             rows = cur.fetchall()
 
-    # rules overview
-    rules_overview = ""
-    for a in ASSETS:
-        rules_overview += f"<li><b>{a}</b>: {len(RULES.get(a, []))} rules</li>"
+    # Event panel
+    ev_html = ""
+    if event_mode:
+        ev_html += '<div class="pill pill-warn">⚠️ EVENT MODE: ON</div>'
+    else:
+        ev_html += '<div class="pill pill-ok">✅ EVENT MODE: OFF</div>'
 
-    # feeds table
+    tr_badge = ""
+    if trump_enabled:
+        tr_badge = '<span class="pill pill-warn">TRUMP: ON</span>' if trump_flag else '<span class="pill pill-neutral">TRUMP: quiet</span>'
+    else:
+        tr_badge = '<span class="pill pill-neutral">TRUMP: disabled</span>'
+
+    up_html = ""
+    for x in upcoming[:6]:
+        t = x.get("title", "")
+        link = x.get("link", "")
+        inh = x.get("in_hours", None)
+        tag = f"in {inh}h" if inh is not None else "time unknown"
+        up_html += f'<li><a href="{link}" target="_blank" rel="noopener">{t}</a> <span class="muted tiny">({tag})</span></li>'
+    if not up_html:
+        up_html = "<li class='muted'>—</li>"
+
+    # Feeds health rows
     feeds_rows = ""
     for src in RSS_FEEDS.keys():
         st = feeds_status.get(src, {})
         ok = bool(st.get("ok", False))
-        bozo = st.get("bozo", "")
-        entries = st.get("entries", "")
-        icon = "✅" if ok and int(bozo or 0) == 0 else ("⚠️" if ok else "❌")
-        feeds_rows += f"""
-        <tr>
-          <td>{icon} {src}</td>
-          <td class="muted">bozo={bozo}</td>
-          <td class="muted">entries={entries}</td>
-        </tr>
-        """
-
-    dark = (theme or "dark").lower().strip() != "light"
-    compact_cls = "compact" if int(compact or 0) == 1 else ""
+        skipped = bool(st.get("skipped", False))
+        entries = st.get("entries", 0)
+        status = "OK" if ok else "ERR"
+        if skipped:
+            status = "SKIP"
+        pill = '<span class="pill pill-ok">OK</span>' if status == "OK" else ('<span class="pill pill-neutral">SKIP</span>' if status == "SKIP" else '<span class="pill pill-no">ERR</span>')
+        feeds_rows += f"<tr><td>{src}</td><td>{pill}</td><td class='muted'>{entries}</td></tr>"
 
     def render_asset(asset: str) -> str:
-        a = assets.get(asset, {})
-        bias = a.get("bias", "NEUTRAL")
-        score = a.get("score", 0.0)
-        th = a.get("threshold", 1.0)
-        delta = a.get("delta_to_th", 0.0)
+        a = assets.get(asset, {}) or {}
+        bias = str(a.get("bias", "NEUTRAL"))
+        score = float(a.get("score", 0.0))
+        th = float(a.get("threshold", 1.0))
 
+        q1 = int(a.get("quality", 0))
         q2 = int(a.get("quality_v2", 0))
-        conflict = float(a.get("conflict_index", 0.0))
-        cons = a.get("consensus", {}) or {}
-        fresh = a.get("freshness", {}) or {}
 
-        gate = a.get("trade_gate", {}) or {}
-        gate_ok = bool(gate.get("ok", False))
-        gate_prof = gate.get("profile", "")
-        why_yes = gate.get("why_yes", []) or []
-        why_no = gate.get("why_no", []) or []
-        flip = gate.get("flip_conditions", {}) or {}
+        evc = int(a.get("evidence_count", 0))
+        div = int(a.get("source_diversity", 0))
 
-        top3 = a.get("top3_drivers", []) or []
+        consensus_ratio = float(a.get("consensus_ratio", 0.0))
+        conflict_index = float(a.get("conflict_index", 1.0))
+
+        freshness = a.get("freshness", {"0-2h": 0, "2-8h": 0, "8-24h": 0}) or {}
+        flip = a.get("flip", {}) or {}
+        cons_by_src = a.get("consensus_by_source", []) or []
         why_top5 = a.get("why_top5", []) or []
+        top3 = a.get("top3_drivers", []) or []
 
-        if bias == "BULLISH":
-            btag = _pill("bull", "BULLISH")
-        elif bias == "BEARISH":
-            btag = _pill("bear", "BEARISH")
-        else:
-            btag = _pill("neutral", "NEUTRAL")
+        gate = eval_trade_gate(a, event_mode, gate_profile)
 
-        gtag = _pill("ok", "✅ TRADE OK") if gate_ok else _pill("no", "❌ NO TRADE")
+        # Tooltips
+        tip_q1 = _tooltip("Quality v1", "v1 = strength vs threshold + evidence count + source diversity.")
+        tip_q2 = _tooltip("Quality v2", "v2 = strength + evidence + diversity + freshness + consensus − conflict − (event penalty).")
+        tip_conf = _tooltip("Conflict", "conflict_index = 1 - consensus_ratio. High conflict = unstable bias.")
+        tip_cons = _tooltip("Consensus", "consensus_ratio = |net| / sum_abs. Higher = agreement in direction.")
+        tip_flip = _tooltip("Flip", "Δ needed for score to reach bullish (+th) or bearish (-th) threshold.")
+        tip_gate = _tooltip("Trade Gate", f"Gate = Bias + Quality v2 + Conflict + Event Mode + Flip guard. Profile: {gate_profile}.")
 
-        # WHY (2-3)
-        why_short = (why_yes if gate_ok else why_no)[:3]
-        why_short_html = "".join([f"<li>{x}</li>" for x in why_short]) or "<li>—</li>"
+        # Gate lists
+        gate_why = "".join([f"<li>{x}</li>" for x in (gate.get("why", []) or [])[:3]]) or "<li>—</li>"
+        gate_need = "".join([f"<li>{x}</li>" for x in (gate.get('must_change', []) or [])[:3]]) or "<li>—</li>"
 
-        # What would flip
-        flip_html = f"""
-          <div class="muted tiny">
-            Flip-to-OK conditions:
-            conflict&lt;{flip.get("need_conflict_below")} • quality≥{flip.get("need_quality_at_least")} • ΔtoTH&lt;{flip.get("need_delta_to_th_below")}
-          </div>
-        """
-
-        # drivers top3 from RSS scoring
-        top3_html = ""
-        for w in top3:
-            top3_html += f"""
-            <li>
-              <div class="why-row">
-                <div class="why-title"><b>{w.get('why','')}</b></div>
-                <div class="why-meta">contrib={w.get('contrib','')}, {w.get('source','')}, age={w.get('age_min','')}m</div>
+        # Top drivers (simple list)
+        td_html = ""
+        for i, x in enumerate(top3[:3], start=1):
+            td_html += f"""
+              <div class="td-row">
+                <div><b>{i}. {x.get('why','')}</b></div>
+                <div class="muted tiny">abs={x.get('abs_contrib_sum','')}</div>
               </div>
-              <div class="why-headline">{w.get('title','')}</div>
-            </li>
             """
-        if not top3_html:
-            top3_html = "<li>—</li>"
+        if not td_html:
+            td_html = '<div class="muted">—</div>'
 
-        # why top5 detailed
+        # consensus by source table
+        cs_rows = ""
+        for x in cons_by_src[:8]:
+            net = float(x.get("net", 0.0))
+            net_cls = "pos" if net > 0 else ("neg" if net < 0 else "muted")
+            cs_rows += f"""
+            <tr>
+              <td>{x.get('source','')}</td>
+              <td class="{net_cls}">{x.get('net','')}</td>
+              <td class="muted">{x.get('abs','')}</td>
+              <td class="muted">{x.get('count','')}</td>
+            </tr>
+            """
+        if not cs_rows:
+            cs_rows = '<tr><td class="muted">—</td><td></td><td></td><td></td></tr>'
+
+        # WHY top 5 list
         why_html = ""
-        for w in why_top5:
+        for w in why_top5[:5]:
             why_html += f"""
             <li>
               <div class="why-row">
-                <div class="why-title"><b>{w.get('why','')}</b></div>
-                <div class="why-meta">contrib={w.get('contrib','')}, {w.get('source','')}, age={w.get('age_min','')}m</div>
+                <div><b>{w.get("why","")}</b></div>
+                <div class="why-meta">{w.get("source","")} • age={w.get("age_min","")}m • contrib={w.get("contrib","")}</div>
               </div>
-              <div class="why-headline">{w.get('title','')}</div>
-              <a class="tiny" href="{w.get('link','')}" target="_blank" rel="noopener">open</a>
+              <div class="why-headline"><a href="{w.get("link","")}" target="_blank" rel="noopener">{w.get("title","")}</a></div>
             </li>
             """
-        if not why_html:
-            why_html = "<li>—</li>"
 
-        # latest relevant headlines
+        # Latest relevant headlines
         kw = {
-            "XAU": ["fed", "fomc", "cpi", "inflation", "yields", "usd", "risk", "gold", "treasury", "dollar"],
-            "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "rout", "slides", "rebound", "s&p", "nasdaq", "dow"],
-            "WTI": ["oil", "crude", "opec", "inventory", "stocks", "tanker", "pipeline", "storm", "spr", "sanctions"],
+            "XAU": ["gold", "xau", "fed", "fomc", "cpi", "inflation", "yields", "usd", "treasury", "safe-haven", "real"],
+            "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "s&p", "nasdaq", "equities", "vix", "rates", "yields"],
+            "WTI": ["oil", "crude", "wti", "opec", "inventory", "stocks", "pipeline", "sanctions", "outage", "spr", "output"],
         }[asset]
-
-        news_html = ""
         shown = 0
+        news_html = ""
         for (source, title, link, _ts) in rows:
             t = (title or "").lower()
             if not any(k in t for k in kw):
@@ -1035,202 +1268,345 @@ def dashboard(theme: str = "dark", compact: int = 0):
             if shown > (6 if compact else 10):
                 break
             news_html += f'<li><a href="{link}" target="_blank" rel="noopener">{title}</a> <span class="muted">[{source}]</span></li>'
-        if not news_html:
-            news_html = "<li>—</li>"
 
-        # small metrics
-        metrics = f"""
-        <div class="metrics">
-          <div class="m">{_pill("neutral", f"Qv2 {q2}/100")}</div>
-          <div class="m">{_pill("neutral", f"Conflict {round(conflict,2)}")}</div>
-          <div class="m">{_pill("neutral", f"Consensus +{cons.get('sources_for',0)} / -{cons.get('sources_against',0)}")}</div>
-          <div class="m">{_pill("neutral", f"Fresh 0–2h:{fresh.get('h0_2',0)} 2–8h:{fresh.get('h2_8',0)} 8–24h:{fresh.get('h8_24',0)}")}</div>
-        </div>
-        """
+        to_bull = float(flip.get("to_bullish", 0.0))
+        to_bear = float(flip.get("to_bearish", 0.0))
 
         return f"""
         <section class="card" id="card-{asset}">
           <div class="card-head">
-            <div class="left">
-              <div class="h2">{asset} {btag} <span class="muted">score={score} / th={th} / Δ={delta}</span></div>
-              <div class="gate">{gtag} <span class="muted tiny">profile={gate_prof}</span></div>
-              {metrics}
-              <div class="block">
-                <div class="h3">WHY gate (2–3)</div>
-                <ul class="bul">{why_short_html}</ul>
-                {flip_html}
+            <div class="head-left">
+              <div class="h2">
+                {asset} {_pill(bias)}
+                <span class="muted">score={round(score,3)} / th={round(th,3)}</span>
+                <span class="spacer"></span>
+                {_pill_gate(bool(gate.get("ok")))} {tip_gate}
+              </div>
+              <div class="sub muted tiny">
+                evidence={evc} • source_diversity={div} • {tip_cons} consensus={consensus_ratio} • {tip_conf} conflict={conflict_index}
               </div>
             </div>
-
             <div class="actions">
-              <div class="muted tiny" style="margin-bottom:6px;">Quick actions</div>
               <div class="btnrow">
-                <button class="btn" onclick="runNow('{asset}')">Run now</button>
-                <button class="btn" onclick="showJson()">JSON</button>
+                <button class="btn" onclick="runNow('ALL')">Run now</button>
                 <button class="btn" onclick="showExplain('{asset}')">Explain</button>
               </div>
               <div class="tiny muted" id="status-{asset}" style="margin-top:6px;"></div>
             </div>
           </div>
 
-          <div class="grid">
-            <div>
-              <div class="h3">Top 3 drivers now (RSS)</div>
-              <ol class="why">{top3_html}</ol>
-              <div class="h3" style="margin-top:12px;">WHY (top 5)</div>
-              <ol class="why">{why_html}</ol>
+          <div class="grid3">
+            <div class="panel">
+              <div class="h3">Signal Quality</div>
+              <div class="qblock">
+                <div class="qrow">
+                  <div class="muted tiny">v1 {tip_q1}</div>
+                  <div class="qval">{q1}/100</div>
+                </div>
+                {_bar(q1)}
+              </div>
+              <div class="qblock">
+                <div class="qrow">
+                  <div class="muted tiny">v2 {tip_q2}</div>
+                  <div class="qval">{q2}/100</div>
+                </div>
+                {_bar(q2)}
+              </div>
+              <div class="muted tiny">freshness: 0-2h={freshness.get("0-2h",0)} • 2-8h={freshness.get("2-8h",0)} • 8-24h={freshness.get("8-24h",0)}</div>
             </div>
-            <div>
+
+            <div class="panel">
+              <div class="h3">Trade Gate</div>
+              <div class="gatebox">
+                <div class="gatebadge">{_pill_gate(bool(gate.get("ok")))} </div>
+                <div class="muted tiny">WHY (top)</div>
+                <ul class="mini">{gate_why}</ul>
+                <div class="muted tiny" style="margin-top:10px;">To become OK:</div>
+                <ul class="mini">{gate_need}</ul>
+              </div>
+            </div>
+
+            <div class="panel">
+              <div class="h3">What would flip bias {tip_flip}</div>
+              <div class="flipgrid">
+                <div class="flipcard">
+                  <div class="muted tiny">to bullish</div>
+                  <div class="flipnum">{to_bull}</div>
+                </div>
+                <div class="flipcard">
+                  <div class="muted tiny">to bearish</div>
+                  <div class="flipnum">{to_bear}</div>
+                </div>
+              </div>
+              <div class="h3" style="margin-top:12px;">Top 3 drivers now</div>
+              <div class="td">{td_html}</div>
+            </div>
+          </div>
+
+          <div class="grid2">
+            <div class="panel compact-hide">
+              <div class="h3">Consensus by source</div>
+              <table class="ctable">
+                <thead>
+                  <tr><th>Source</th><th>Net</th><th>Abs</th><th>n</th></tr>
+                </thead>
+                <tbody>{cs_rows}</tbody>
+              </table>
+            </div>
+
+            <div class="panel compact-hide">
+              <div class="h3">WHY (top 5)</div>
+              <ol class="why">{why_html or "<li>—</li>"}</ol>
+            </div>
+
+            <div class="panel">
               <div class="h3">Latest relevant headlines</div>
-              <ul class="news">{news_html}</ul>
+              <ul class="news">{news_html or "<li>—</li>"}</ul>
             </div>
           </div>
         </section>
         """
 
-    ev_html = ""
-    if ev.get("event_mode"):
-        rs = ev.get("reasons", []) or []
-        ev_html = "<ul class='bul'>" + "".join([f"<li>{r}</li>" for r in rs]) + "</ul>"
-    else:
-        ev_html = "<div class='muted tiny'>No USD High/Medium events detected in next 12h (best-effort).</div>"
-
-    # Theme variables
-    if dark:
-        css_vars = """
-          --bg:#0b0f17; --card:#121a26; --muted:#93a4b8; --text:#e9f1ff;
-          --line:rgba(255,255,255,.10);
-          --bull:#10b981; --bear:#ef4444; --neu:#64748b;
-          --btn:#1b2636; --btn2:#223047;
-          --ok:#22c55e; --no:#ef4444;
-        """
-    else:
-        css_vars = """
-          --bg:#f6f7fb; --card:#ffffff; --muted:#52657a; --text:#0b1220;
-          --line:rgba(2,6,23,.12);
-          --bull:#0f766e; --bear:#b91c1c; --neu:#475569;
-          --btn:#eef2ff; --btn2:#e0e7ff;
-          --ok:#16a34a; --no:#dc2626;
-        """
+    compact_on = "1" if compact else "0"
 
     html = f"""
-    <html>
+    <html data-compact="{compact_on}">
     <head>
       <meta charset="utf-8">
       <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+      <meta name="color-scheme" content="dark light">
+      <meta name="theme-color" content="#0b0f17" media="(prefers-color-scheme: dark)">
+      <meta name="theme-color" content="#f7f8fb" media="(prefers-color-scheme: light)">
+      <meta name="apple-mobile-web-app-capable" content="yes">
+      <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+      <meta name="apple-mobile-web-app-title" content="News Bias">
+      <meta name="format-detection" content="telephone=no">
       <title>News Bias Dashboard</title>
+
       <style>
         :root {{
-          {css_vars}
+          --bg:#0b0f17; --card:#121a26; --muted:#93a4b8; --text:#e9f1ff;
+          --line:rgba(255,255,255,.08);
+          --bull:#10b981; --bear:#ef4444; --neu:#64748b; --warn:#f59e0b;
+          --ok:#22c55e; --no:#ef4444;
+          --btn:#1b2636; --btn2:#223047;
+          --link:#7dd3fc;
         }}
+        html[data-theme="light"] {{
+          --bg:#f7f8fb; --card:#ffffff; --muted:#5c6b7a; --text:#0b1220;
+          --line:rgba(15,23,42,.12);
+          --btn:#eef2f7; --btn2:#e5ecf5;
+          --link:#0369a1;
+          --ok:#16a34a; --no:#dc2626; --warn:#d97706;
+        }}
+        html, body {{ height:100%; }}
         body {{
-          font-family: Arial, sans-serif;
-          background:var(--bg);
-          color:var(--text);
-          margin:0;
+          -webkit-text-size-adjust: 100%;
+          font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
+          background:var(--bg); color:var(--text); margin:0;
           padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);
         }}
-        .wrap {{ max-width: 1080px; margin: 18px auto; padding: 0 14px; }}
+        a {{ color:var(--link); text-decoration:none; }}
+        a:hover {{ text-decoration:underline; }}
+
+        .wrap {{
+          max-width: 1120px;
+          margin: 14px auto;
+          padding-left: calc(14px + env(safe-area-inset-left));
+          padding-right: calc(14px + env(safe-area-inset-right));
+        }}
+
         .top {{
           display:flex; justify-content:space-between; align-items:flex-end; gap:12px;
           position: sticky; top: 0; z-index: 50;
-          background: linear-gradient(to bottom, rgba(0,0,0,0.18), rgba(0,0,0,0.0));
-          backdrop-filter: blur(6px);
+          background: color-mix(in srgb, var(--bg) 82%, transparent);
+          backdrop-filter: blur(10px);
           padding: 12px 0;
+          border-bottom: 1px solid var(--line);
         }}
         h1 {{ margin:0; font-size: 24px; }}
         .muted {{ color:var(--muted); }}
         .tiny {{ font-size:12px; }}
-        .card {{ background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px; margin: 12px 0; }}
-        .card-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }}
-        .h2 {{ font-size:20px; font-weight:800; }}
-        .h3 {{ font-size:14px; margin: 8px 0; }}
-        .pill {{ padding:4px 10px; border-radius:999px; font-size:12px; font-weight:800; display:inline-block; }}
-        .pill-bull {{ background:rgba(16,185,129,.14); color:var(--bull); border:1px solid rgba(16,185,129,.28); }}
-        .pill-bear {{ background:rgba(239,68,68,.14); color:var(--bear); border:1px solid rgba(239,68,68,.28); }}
-        .pill-neutral {{ background:rgba(100,116,139,.14); color:var(--neu); border:1px solid rgba(100,116,139,.28); }}
-        .pill-ok {{ background:rgba(34,197,94,.14); color:var(--ok); border:1px solid rgba(34,197,94,.28); }}
-        .pill-no {{ background:rgba(239,68,68,.14); color:var(--no); border:1px solid rgba(239,68,68,.28); }}
+        .spacer {{ display:inline-block; width: 10px; }}
 
-        .grid {{ display:grid; grid-template-columns: 1.15fr 1fr; gap:16px; }}
-        @media(max-width: 920px) {{
-          .grid {{ grid-template-columns: 1fr; }}
-          .card-head {{ flex-direction:column; }}
-          .actions {{ width:100%; text-align:left; }}
-          .btnrow {{ justify-content:flex-start; }}
+        /* Sticky mini header */
+        .mini {{
+          position: sticky; top: 62px; z-index: 40;
+          margin: 10px 0 14px 0;
         }}
+        .mini-inner {{
+          display:flex; gap:10px; align-items:center; justify-content:space-between;
+          background: color-mix(in srgb, var(--card) 92%, transparent);
+          border:1px solid var(--line);
+          border-radius: 16px;
+          padding: 10px 10px;
+          backdrop-filter: blur(10px);
+        }}
+        .tabs {{ display:flex; gap:8px; flex-wrap:wrap; }}
+        .tab {{
+          display:inline-flex; gap:8px; align-items:center;
+          padding:8px 10px; border-radius: 14px;
+          border: 1px solid var(--line);
+          background: var(--btn);
+          cursor:pointer;
+          font-weight:800;
+        }}
+        .tab:hover {{ background: var(--btn2); }}
+        .tab small {{ font-weight:800; color:var(--muted); }}
+        .toggles {{ display:flex; gap:8px; align-items:center; flex-wrap:wrap; justify-content:flex-end; }}
 
-        .why, .news {{ margin:0; padding-left:18px; }}
-        .why li {{ margin: 10px 0; }}
-        .why-row {{ display:flex; justify-content:space-between; gap:10px; }}
-        .why-meta {{ color:var(--muted); font-size:12px; white-space:nowrap; }}
-        .why-headline {{ margin-top:4px; }}
-        a {{ color:#0284c7; text-decoration:none; }}
-        a:hover {{ text-decoration:underline; }}
+        .card {{
+          background:var(--card); border:1px solid var(--line);
+          border-radius:18px; padding:14px; margin: 14px 0;
+        }}
+        .card-head {{ display:flex; justify-content:space-between; gap:14px; align-items:flex-start; }}
+        .head-left {{ flex:1; min-width: 240px; }}
+        .h2 {{ font-size:18px; font-weight:900; line-height: 1.25; display:flex; flex-wrap:wrap; gap:8px; align-items:center; }}
+        .h3 {{ font-size:13px; margin: 0 0 10px 0; color: color-mix(in srgb, var(--text) 85%, var(--muted)); font-weight:900; }}
+        .sub {{ margin-top:6px; }}
 
-        .actions {{ min-width: 280px; text-align:right; }}
+        .pill {{
+          padding:4px 10px; border-radius:999px; font-size:12px; font-weight:900;
+          border:1px solid var(--line);
+        }}
+        .pill-bull {{ background:rgba(16,185,129,.14); color:var(--bull); border-color: rgba(16,185,129,.30); }}
+        .pill-bear {{ background:rgba(239,68,68,.14); color:var(--bear); border-color: rgba(239,68,68,.30); }}
+        .pill-neutral {{ background:rgba(100,116,139,.14); color:#cbd5e1; border-color: rgba(100,116,139,.30); }}
+        .pill-ok {{ background:rgba(34,197,94,.14); color:var(--ok); border-color: rgba(34,197,94,.30); }}
+        .pill-no {{ background:rgba(239,68,68,.14); color:var(--no); border-color: rgba(239,68,68,.30); }}
+        .pill-warn {{ background:rgba(245,158,11,.14); color:var(--warn); border-color: rgba(245,158,11,.30); }}
+
+        .actions {{ min-width: 260px; text-align:right; }}
         .btnrow {{ display:flex; gap:8px; justify-content:flex-end; flex-wrap:wrap; }}
         .btn {{
           background:var(--btn);
           border:1px solid var(--line);
           color:var(--text);
           padding:10px 12px;
-          border-radius:12px;
+          border-radius:14px;
           cursor:pointer;
-          font-weight:800;
+          font-weight:900;
+          min-height: 40px;
         }}
         .btn:hover {{ background:var(--btn2); }}
 
-        .gate {{ margin-top:8px; display:flex; gap:8px; align-items:center; flex-wrap:wrap; }}
-        .metrics {{ margin-top:10px; display:flex; gap:8px; flex-wrap:wrap; }}
-        .block {{ margin-top:10px; padding-top:10px; border-top:1px solid var(--line); }}
-        .bul {{ margin:0; padding-left:18px; }}
-        .table {{ width:100%; border-collapse:collapse; }}
-        .table td {{ border-top:1px solid var(--line); padding:8px 6px; }}
+        .grid3 {{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; margin-top: 14px; }}
+        .grid2 {{ display:grid; grid-template-columns: 1.1fr 1.1fr 1.2fr; gap:12px; margin-top: 12px; }}
+        .panel {{ background: rgba(255,255,255,.03); border:1px solid var(--line); border-radius:16px; padding:12px; }}
 
-        .modal {{
-          position:fixed; inset:0; background:rgba(0,0,0,.55);
-          display:none; align-items:center; justify-content:center; padding:16px;
-        }}
-        .modal.show {{ display:flex; }}
-        .modal-box {{
-          width:min(980px, 100%); max-height: 85vh; overflow:auto;
-          background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px;
-        }}
-        pre {{
-          background:rgba(127,127,127,.12);
-          padding:12px; border-radius:12px; overflow:auto;
-        }}
-        .modal-head {{ display:flex; justify-content:space-between; align-items:center; gap:10px; }}
+        .bar {{ height:10px; background:rgba(255,255,255,.08); border-radius:999px; overflow:hidden; }}
+        html[data-theme="light"] .bar {{ background: rgba(15,23,42,.08); }}
+        .bar-fill {{ height:10px; background: linear-gradient(90deg, rgba(34,197,94,.9), rgba(245,158,11,.9), rgba(239,68,68,.9)); }}
+        .bar-num {{ margin-top:6px; font-weight:900; }}
 
-        /* compact mode */
-        .compact .card {{ padding: 12px; }}
-        .compact .why li {{ margin: 7px 0; }}
-        .compact .btn {{ padding: 9px 10px; border-radius: 10px; }}
+        .qblock {{ margin-bottom: 10px; }}
+        .qrow {{ display:flex; justify-content:space-between; align-items:baseline; gap:10px; }}
+        .qval {{ font-weight:1000; }}
+
+        .flipgrid {{ display:grid; grid-template-columns: 1fr 1fr; gap:10px; }}
+        .flipcard {{ background: rgba(255,255,255,.03); border:1px solid var(--line); border-radius:14px; padding:10px; }}
+        .flipnum {{ font-weight:1000; font-size: 18px; }}
+
+        .td-row {{ display:flex; justify-content:space-between; gap:10px; margin: 8px 0; }}
+        .ctable {{ width:100%; border-collapse:collapse; margin-top: 10px; }}
+        .ctable th, .ctable td {{ padding:8px 6px; border-top:1px solid var(--line); text-align:left; font-size: 13px; }}
+        .pos {{ color: var(--ok); font-weight:900; }}
+        .neg {{ color: var(--no); font-weight:900; }}
+
+        .why, .news {{ margin:0; padding-left:18px; }}
+        .why li {{ margin: 10px 0; }}
+        .why-row {{ display:flex; justify-content:space-between; gap:10px; }}
+        .why-meta {{ color:var(--muted); font-size:12px; }}
+
+        /* Tooltips */
+        .tipwrap {{ position: relative; display:inline-block; }}
+        .tipicon {{
+          display:inline-flex; align-items:center; justify-content:center;
+          width: 18px; height: 18px; border-radius: 999px;
+          border:1px solid var(--line); color: var(--muted);
+          font-size: 12px; font-weight: 1000;
+          cursor: pointer; user-select: none;
+        }}
+        .tipicon:focus {{ outline: 2px solid rgba(125,211,252,.35); outline-offset: 2px; }}
+        .tipbubble {{
+          position:absolute; right:0; top: 22px;
+          width: min(320px, 72vw);
+          background: rgba(18,26,38,.98);
+          border: 1px solid var(--line);
+          border-radius: 14px;
+          padding: 10px;
+          font-size: 12px;
+          color: var(--text);
+          z-index: 20;
+          display:none;
+          box-shadow: 0 10px 30px rgba(0,0,0,.35);
+        }}
+        .tipbubble.show {{ display:block; }}
+
+        /* Compact mode */
+        html[data-compact="1"] .compact-hide {{ display:none !important; }}
+        html[data-compact="1"] .grid2 {{ grid-template-columns: 1fr; }}
+        html[data-compact="1"] .grid3 {{ grid-template-columns: 1fr; }}
+
+        @media(max-width: 980px) {{
+          .grid3 {{ grid-template-columns: 1fr; }}
+          .grid2 {{ grid-template-columns: 1fr; }}
+          .card-head {{ flex-direction: column; }}
+          .actions {{ width: 100%; text-align:left; min-width: auto; }}
+          .btnrow {{ justify-content:flex-start; }}
+        }}
+        @media(max-width: 560px) {{
+          h1{{ font-size: 20px; }}
+          .mini-inner{{ flex-direction:column; align-items:stretch; }}
+          .toggles{{ justify-content:flex-start; }}
+        }}
       </style>
     </head>
-    <body class="{compact_cls}">
+    <body>
       <div class="wrap">
         <div class="top">
           <div>
             <h1>News Bias Dashboard</h1>
-            <div class="muted tiny">updated_utc: {updated}</div>
-            <div class="muted tiny">Event mode: {"ON" if ev.get("event_mode") else "OFF"}</div>
+            <div class="muted tiny">updated_utc: {updated} • gate_profile: <b>{gate_profile}</b></div>
+            <div class="muted tiny" style="margin-top:6px; display:flex; gap:8px; flex-wrap:wrap;">
+              {ev_html}
+              {tr_badge}
+              <span class="pill pill-neutral">FRED: {"on" if (meta.get("fred",{}).get("enabled", False)) else "off"}</span>
+            </div>
           </div>
-          <div class="muted tiny" style="text-align:right;">
-            <div>Short link: use your domain → <b>/</b></div>
-            <div>
-              <a href="/dashboard?theme={'light' if dark else 'dark'}&compact={1 if compact==0 else 0}">toggle theme/compact</a>
-              • <a href="/drivers?pretty=1" target="_blank" rel="noopener">drivers JSON</a>
+          <div class="muted tiny">Open <b>/</b> → redirects here. Works great in iPhone Safari.</div>
+        </div>
+
+        <div class="mini">
+          <div class="mini-inner">
+            <div class="tabs">
+              <button class="tab" onclick="jumpTo('card-XAU')">XAU <small id="mini-xau">—</small></button>
+              <button class="tab" onclick="jumpTo('card-US500')">US500 <small id="mini-us500">—</small></button>
+              <button class="tab" onclick="jumpTo('card-WTI')">WTI <small id="mini-wti">—</small></button>
+            </div>
+            <div class="toggles">
+              <button class="btn" onclick="toggleCompact()">Compact</button>
+              <button class="btn" onclick="toggleTheme()">Theme</button>
+              <button class="btn" onclick="shareLink()">Share</button>
+              <button class="btn" onclick="runNow('ALL')">Run now</button>
+              <button class="btn" onclick="showJson()">JSON</button>
+              <button class="btn" onclick="showRules()">Rules</button>
+              <button class="btn" onclick="showMorning()">Morning</button>
             </div>
           </div>
         </div>
 
         <section class="card">
-          <div class="h3">Macro event mode (next 12h, best-effort)</div>
-          {ev_html}
-          <div class="muted tiny" style="margin-top:8px;">
-            Source: ForexFactory weekly XML feed (parsed best-effort).
+          <div class="card-head" style="align-items:center;">
+            <div>
+              <div class="h2">Macro window</div>
+              <div class="muted tiny">event_mode={str(event_mode).lower()} • recent_macro={str(event.get("recent_macro", False)).lower()} • calendar_feed={str(event.get("ff_calendar_enabled", False)).lower()}</div>
+              <div class="muted tiny" style="margin-top:6px;">Upcoming (next):</div>
+              <ul class="news">{up_html}</ul>
+            </div>
+            <div class="actions" style="text-align:right;">
+              <button class="btn" onclick="showEvent()">Event JSON</button>
+            </div>
           </div>
         </section>
 
@@ -1239,102 +1615,70 @@ def dashboard(theme: str = "dark", compact: int = 0):
         {render_asset("WTI")}
 
         <section class="card">
-          <div class="h3">Rules overview</div>
-          <ul class="bul">{rules_overview}</ul>
+          <div class="h2">Feeds health (last run snapshot)</div>
+          <div class="muted tiny" style="margin-top:6px;">Deep debug: <a href="/feeds_health" target="_blank" rel="noopener">/feeds_health</a> (live parse)</div>
+          <table class="ctable" style="margin-top:10px;">
+            <thead><tr><th>Feed</th><th>Status</th><th>Entries</th></tr></thead>
+            <tbody>{feeds_rows}</tbody>
+          </table>
         </section>
 
-        <section class="card">
-          <div class="h3">Feeds health (last run snapshot)</div>
-          <table class="table"><tbody>{feeds_rows}</tbody></table>
-          <div class="muted tiny" style="margin-top:10px;">
-            Deep debug: <a href="/feeds_health" target="_blank" rel="noopener">/feeds_health</a>
-            • Bias JSON: <a href="/bias?pretty=1" target="_blank" rel="noopener">/bias?pretty=1</a>
-          </div>
-        </section>
       </div>
 
-      <div class="modal" id="modal">
-        <div class="modal-box">
-          <div class="modal-head">
+      <!-- MODAL -->
+      <div class="modal" id="modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); align-items:center; justify-content:center;
+           padding: calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));">
+        <div class="modal-box" style="width:min(1020px, 100%); max-height: 82vh; overflow:auto; -webkit-overflow-scrolling: touch;
+             background:var(--card); border:1px solid var(--line); border-radius:16px; padding:14px;">
+          <div class="modal-head" style="display:flex; justify-content:space-between; align-items:center; gap:10px; position: sticky; top: 0;
+               background: color-mix(in srgb, var(--card) 92%, transparent); padding-bottom: 10px;">
             <div class="h2" id="modal-title">Modal</div>
             <button class="btn" onclick="closeModal()">Close</button>
           </div>
-          <div id="modal-body" style="margin-top:10px;"></div>
+          <div id="modal-body"></div>
         </div>
       </div>
 
       <script>
+        const payloadMini = {json.dumps(assets, ensure_ascii=False)};
+
+        // Theme init
+        (function initTheme(){{
+          const saved = localStorage.getItem('theme');
+          if(saved === 'light' || saved === 'dark') {{
+            document.documentElement.setAttribute('data-theme', saved);
+          }} else {{
+            document.documentElement.setAttribute('data-theme', 'dark');
+          }}
+        }})();
+
+        // Compact init
+        (function initCompact(){{
+          const c = localStorage.getItem('compact') || '{compact_on}';
+          document.documentElement.setAttribute('data-compact', c);
+        }})();
+
+        // Mini status init
+        (function initMini(){{
+          function fmt(a) {{
+            if(!a) return '—';
+            const b = a.bias || 'NEUTRAL';
+            const q = (a.quality_v2 ?? a.quality ?? 0);
+            const s = (a.score ?? 0);
+            return `${{b}} • q=${{q}} • s=${{s}}`;
+          }}
+          document.getElementById('mini-xau').innerText = fmt(payloadMini['XAU']);
+          document.getElementById('mini-us500').innerText = fmt(payloadMini['US500']);
+          document.getElementById('mini-wti').innerText = fmt(payloadMini['WTI']);
+        }})();
+
         function openModal(title, bodyHtml) {{
           document.getElementById('modal-title').innerText = title;
           document.getElementById('modal-body').innerHTML = bodyHtml;
-          document.getElementById('modal').classList.add('show');
+          document.getElementById('modal').style.display = 'flex';
         }}
         function closeModal() {{
-          document.getElementById('modal').classList.remove('show');
-        }}
-
-        async function runNow(asset) {{
-          const el = document.getElementById('status-' + asset);
-          el.innerText = 'Running...';
-          try {{
-            const resp = await fetch('/run', {{ method:'POST' }});
-            const txt = await resp.text();
-            // try parse JSON
-            let data = null;
-            try {{ data = JSON.parse(txt); }} catch(e) {{}}
-            el.innerText = data ? ('Updated: ' + (data.updated_utc || '')) : 'Updated (non-json)';
-            setTimeout(() => window.location.reload(), 350);
-          }} catch(e) {{
-            el.innerText = 'Error: ' + e;
-          }}
-        }}
-
-        async function showJson() {{
-          try {{
-            const resp = await fetch('/bias?pretty=1');
-            const txt = await resp.text();
-            openModal('JSON (pretty)', '<pre>' + escapeHtml(txt) + '</pre>');
-          }} catch(e) {{
-            openModal('JSON', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
-          }}
-        }}
-
-        async function showExplain(asset) {{
-          try {{
-            const resp = await fetch('/explain?asset=' + encodeURIComponent(asset) + '&limit=80');
-            const txt = await resp.text();
-            let data = null;
-            try {{ data = JSON.parse(txt); }} catch(e) {{}}
-            if (!data) {{
-              openModal('Explain ' + asset, '<pre>' + escapeHtml(txt) + '</pre>');
-              return;
-            }}
-            if (data.error) {{
-              openModal('Explain ' + asset, '<div class="muted">' + escapeHtml(data.error) + '</div>');
-              return;
-            }}
-            const rows = (data.top_matches || []).map(x => {{
-              return `<tr>
-                <td style="padding:6px;border-top:1px solid rgba(127,127,127,.20);">
-                  <b>${{escapeHtml(x.why || '')}}</b>
-                  <div class="muted tiny">${{escapeHtml(x.source || '')}} • age=${{x.age_min}}m • contrib=${{x.contrib}}</div>
-                  <div class="muted tiny">pattern: ${{escapeHtml(x.pattern || '')}}</div>
-                </td>
-                <td style="padding:6px;border-top:1px solid rgba(127,127,127,.20);">
-                  <a href="${{x.link}}" target="_blank" rel="noopener">${{escapeHtml(x.title || '')}}</a>
-                </td>
-              </tr>`;
-            }}).join('');
-            const html = `
-              <div class="muted tiny">rules_count=${{data.rules_count}} • items=${{(data.top_matches||[]).length}}</div>
-              <table style="width:100%;border-collapse:collapse;margin-top:10px;">
-                <tbody>${{rows || '<tr><td class="muted">—</td></tr>'}}</tbody>
-              </table>
-            `;
-            openModal('Explain ' + asset, html);
-          }} catch(e) {{
-            openModal('Explain ' + asset, '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
-          }}
+          document.getElementById('modal').style.display = 'none';
         }}
 
         function escapeHtml(unsafe) {{
@@ -1344,8 +1688,163 @@ def dashboard(theme: str = "dark", compact: int = 0):
             .replaceAll('"', '&quot;')
             .replaceAll("'", '&#039;');
         }}
+
+        function jumpTo(id) {{
+          const el = document.getElementById(id);
+          if(el) el.scrollIntoView({{ behavior:'smooth', block:'start' }});
+        }}
+
+        function toggleTheme(){{
+          const cur = document.documentElement.getAttribute('data-theme') || 'dark';
+          const next = (cur === 'dark') ? 'light' : 'dark';
+          document.documentElement.setAttribute('data-theme', next);
+          localStorage.setItem('theme', next);
+        }}
+
+        function toggleCompact(){{
+          const cur = document.documentElement.getAttribute('data-compact') || '0';
+          const next = (cur === '1') ? '0' : '1';
+          document.documentElement.setAttribute('data-compact', next);
+          localStorage.setItem('compact', next);
+        }}
+
+        async function shareLink(){{
+          const url = window.location.origin + '/';
+          try {{
+            if(navigator.share) {{
+              await navigator.share({{ title:'News Bias Dashboard', url }});
+            }} else {{
+              await navigator.clipboard.writeText(url);
+              openModal('Share', '<div class="muted">Link copied:</div><pre style="white-space:pre-wrap;">' + escapeHtml(url) + '</pre>');
+            }}
+          }} catch(e) {{
+            openModal('Share', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
+        async function runNow(asset) {{
+          const ids = ['XAU','US500','WTI'];
+          ids.forEach(a => {{
+            const el = document.getElementById('status-' + a);
+            if(el) el.innerText = 'Running...';
+          }});
+          try {{
+            const resp = await fetch('/run', {{ method:'POST' }});
+            const data = await resp.json();
+            const upd = data.updated_utc || '';
+            ids.forEach(a => {{
+              const el = document.getElementById('status-' + a);
+              if(el) el.innerText = 'Updated: ' + upd;
+            }});
+            setTimeout(() => window.location.reload(), 350);
+          }} catch(e) {{
+            ids.forEach(a => {{
+              const el = document.getElementById('status-' + a);
+              if(el) el.innerText = 'Error: ' + e;
+            }});
+          }}
+        }}
+
+        async function showJson() {{
+          try {{
+            const resp = await fetch('/bias?pretty=1');
+            const txt = await resp.text();
+            openModal('JSON (pretty)', '<pre style="white-space:pre-wrap;">' + escapeHtml(txt) + '</pre>');
+          }} catch(e) {{
+            openModal('JSON', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
+        async function showRules() {{
+          try {{
+            const resp = await fetch('/rules');
+            const data = await resp.json();
+            openModal('Rules', '<pre style="white-space:pre-wrap;">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>');
+          }} catch(e) {{
+            openModal('Rules', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
+        async function showMorning() {{
+          try {{
+            const resp = await fetch('/morning_plan');
+            const data = await resp.json();
+            openModal('Morning Plan', '<pre style="white-space:pre-wrap;">' + escapeHtml(JSON.stringify(data, null, 2)) + '</pre>');
+          }} catch(e) {{
+            openModal('Morning Plan', '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
+        async function showExplain(asset) {{
+          try {{
+            const resp = await fetch('/explain?asset=' + encodeURIComponent(asset) + '&limit=60');
+            const data = await resp.json();
+            if (data.error) {{
+              openModal('Explain ' + asset, '<div class="muted">' + escapeHtml(data.error) + '</div>');
+              return;
+            }}
+            const rows = (data.top_matches || []).map(x => {{
+              return `<tr>
+                <td style="padding:8px;border-top:1px solid rgba(255,255,255,.08);">
+                  <b>${{escapeHtml(x.why || '')}}</b>
+                  <div class="muted tiny">${{escapeHtml(x.source || '')}} • age=${{x.age_min}}m • contrib=${{x.contrib}}</div>
+                  <div class="muted tiny">pattern: ${{escapeHtml(x.pattern || '')}}</div>
+                </td>
+                <td style="padding:8px;border-top:1px solid rgba(255,255,255,.08);">
+                  <a href="${{x.link}}" target="_blank" rel="noopener">${{escapeHtml(x.title || '')}}</a>
+                </td>
+              </tr>`;
+            }}).join('');
+            const html = `
+              <div class="muted tiny">rules_count=${{data.rules_count}} • items=${{(data.top_matches||[]).length}}</div>
+              <div style="overflow:auto; -webkit-overflow-scrolling: touch; margin-top:10px;">
+                <table style="width:100%;border-collapse:collapse;">
+                  <tbody>${{rows || '<tr><td class="muted">—</td></tr>'}}</tbody>
+                </table>
+              </div>
+            `;
+            openModal('Explain ' + asset, html);
+          }} catch(e) {{
+            openModal('Explain ' + asset, '<div class="muted">Error: ' + escapeHtml(String(e)) + '</div>');
+          }}
+        }}
+
+        function showEvent() {{
+          const ev = {json.dumps(event, ensure_ascii=False)};
+          openModal('Event JSON', '<pre style="white-space:pre-wrap;">' + escapeHtml(JSON.stringify(ev, null, 2)) + '</pre>');
+        }}
+
+        // Tooltips (tap/hover)
+        function hideAllTips() {{
+          document.querySelectorAll('.tipbubble').forEach(x => x.remove());
+        }}
+        function showTipFor(el) {{
+          hideAllTips();
+          const txt = el.getAttribute('data-tip') || '';
+          const b = document.createElement('div');
+          b.className = 'tipbubble show';
+          b.innerText = txt;
+          el.parentElement.appendChild(b);
+          setTimeout(() => {{
+            try {{ b.remove(); }} catch(e) {{}}
+          }}, 4200);
+        }}
+        document.addEventListener('click', (e) => {{
+          const t = e.target;
+          if (t && t.classList && t.classList.contains('tipicon')) {{
+            e.preventDefault();
+            showTipFor(t);
+          }} else {{
+            hideAllTips();
+          }}
+        }});
+
+        // Close modal by tapping backdrop
+        document.getElementById('modal').addEventListener('click', (e) => {{
+          if(e.target && e.target.id === 'modal') closeModal();
+        }});
       </script>
     </body>
     </html>
     """
-    return html
+    return HTMLResponse(html)

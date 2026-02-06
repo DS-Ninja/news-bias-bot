@@ -27,6 +27,15 @@ RSS_FEEDS = {
 
     # Broad market headlines (noisy, but ok as extra layer)
     "INVESTING": "https://www.investing.com/rss/news_25.rss",
+
+    # Markets / Macro (extra)
+    "FXSTREET_NEWS": "https://www.fxstreet.com/rss/news",
+    "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
+    "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
+
+    # Markets (extra)
+    "MARKETWATCH_RSS": "https://www.marketwatch.com/site/rss",
+
 }
 
 # impact weights by source (MVP heuristic)

@@ -1,15 +1,21 @@
 import os
 import json
 import time
+import re
 from datetime import datetime, timezone
+from typing import Dict, List, Tuple, Any
 
 import feedparser
 import psycopg2
 from fastapi import FastAPI
 
-# -----------------------------
-# RSS Sources (MVP)
-# -----------------------------
+
+# ============================================================
+# CONFIG
+# ============================================================
+
+ASSETS = ["XAU", "US500", "WTI"]
+
 RSS_FEEDS = {
     # Macro / Rates / USD drivers
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -21,27 +27,6 @@ RSS_FEEDS = {
 
     # Broad market headlines (noisy, but ok as extra layer)
     "INVESTING": "https://www.investing.com/rss/news_25.rss",
-}
-
-ASSETS = ["XAU", "US500", "WTI"]
-
-# Simple keywords -> direction per asset
-# direction: +1 bullish, -1 bearish, 0 neutral/unknown
-RULES = {
-    "XAU": [
-        (["hawkish", "rate hike", "higher for longer", "yields rise", "strong dollar", "usd strengthens"], -1),
-        (["dovish", "rate cut", "yields fall", "weaker dollar", "usd weakens", "risk-off", "geopolitical"], +1),
-    ],
-    "US500": [
-        (["hawkish", "rate hike", "higher for longer", "yields rise"], -1),
-        (["dovish", "rate cut", "yields fall", "soft landing"], +1),
-        (["recession", "risk-off", "credit stress"], -1),
-    ],
-    "WTI": [
-        (["opec cuts", "supply disruption", "output cut", "pipeline outage"], +1),
-        (["inventory build", "stocks rise", "demand weak", "oversupply"], -1),
-        (["inventory draw", "stocks fall"], +1),
-    ],
 }
 
 # impact weights by source (MVP heuristic)
@@ -57,6 +42,68 @@ SOURCE_WEIGHT = {
 HALF_LIFE_SEC = 8 * 3600
 LAMBDA = 0.69314718056 / HALF_LIFE_SEC
 
+# Bias thresholds (per-asset)
+BIAS_THRESH = {
+    "US500": 1.2,
+    "XAU":   0.9,
+    "WTI":   0.9,
+}
+
+# ============================================================
+# RULES: regex patterns -> signed weight + explanation
+# Each match adds (weight * source_weight * time_decay)
+# ============================================================
+
+RULES: Dict[str, List[Tuple[str, float, str]]] = {
+    "US500": [
+        # Risk-on / equities positive
+        (r"\b(upgrades?|upgrade|raises? (price )?target|rebound|stabilize|demand lifts|beats?|strong (results|earnings))\b",
+         +1.0, "Equity positive tone"),
+        # Risk-off / equities negative
+        (r"\b(plunges?|rout|slides?|downgrade|downgrades?|cuts? .* to (neutral|sell)|writedowns?|bill for .* pullback|warns?|wary)\b",
+         -1.2, "Equity negative tone"),
+        # Macro / rates-sensitive (direction ambiguous → small negative as risk)
+        (r"\b(unemployment|jobs|payrolls|cpi|inflation|fomc|federal reserve|fed)\b",
+         -0.2, "Macro event headline (direction unknown)"),
+        # Capex risk (AI capex scares equity multiples sometimes)
+        (r"\b(ai capex|capex)\b",
+         -0.1, "Capex / valuation uncertainty"),
+    ],
+
+    "XAU": [
+        # Gold bullish: risk-off, stress
+        (r"\b(rout|plunges?|risk[- ]off|wary|stress test|credit stress|crisis|geopolitic(al)?|war)\b",
+         +0.9, "Risk-off / stress supports gold"),
+        # Gold bearish: risk-on / strong equities
+        (r"\b(rebound|risk[- ]on|stocks to buy|buy after .* drop|strong earnings)\b",
+         -0.7, "Risk-on pressures gold"),
+        # Fed mention (small positive because event risk often adds bid; we'll refine later)
+        (r"\b(fomc statement|fed issues.*statement|federal open market committee|longer[- ]run goals)\b",
+         +0.2, "Fed event risk (watch yields/USD)"),
+        # Strong USD/yields (if present in titles later)
+        (r"\b(strong dollar|usd strengthens|yields rise|real yields)\b",
+         -0.8, "Stronger USD / higher yields weighs on gold"),
+    ],
+
+    "WTI": [
+        # Crude / supply / shipping / disruptions
+        (r"\b(crude oil|tanker rates|winter storm|disruption|outage|pipeline|opec|output cut|sanctions)\b",
+         +0.9, "Supply / flow supports oil"),
+        # Inventories (you'll get better signals once we add weekly EIA petroleum status)
+        (r"\b(inventory draw|stocks fall|draw)\b",
+         +0.8, "Inventories draw supports oil"),
+        (r"\b(inventory build|stocks rise|build)\b",
+         -0.8, "Inventories build pressures oil"),
+        # Gas/power items: neutral for crude
+        (r"\b(natural gas|electricity|nuclear|coal)\b",
+         0.0, "Not crude-direct"),
+    ],
+}
+
+
+# ============================================================
+# DB
+# ============================================================
 
 def db_conn():
     url = os.environ.get("DATABASE_URL")
@@ -93,11 +140,14 @@ def norm_text(s: str) -> str:
 
 
 def fingerprint(title: str, link: str) -> str:
-    # Simple stable key
     t = norm_text(title)[:200]
     l = (link or "").strip()[:200]
     return f"{t}||{l}"
 
+
+# ============================================================
+# INGEST
+# ============================================================
 
 def ingest_once(limit_per_feed: int = 30) -> int:
     inserted = 0
@@ -107,18 +157,17 @@ def ingest_once(limit_per_feed: int = 30) -> int:
         with conn.cursor() as cur:
             for src, url in RSS_FEEDS.items():
                 d = feedparser.parse(url)
+
                 for e in d.entries[:limit_per_feed]:
                     title = (e.get("title") or "").strip()
                     link = (e.get("link") or "").strip()
                     if not title or not link:
                         continue
 
-                    # published time
                     published_parsed = e.get("published_parsed")
                     if published_parsed:
                         published_ts = int(time.mktime(published_parsed))
                     else:
-                        # fallback: treat as "now"
                         published_ts = now
 
                     fp = fingerprint(title, link)
@@ -135,7 +184,6 @@ def ingest_once(limit_per_feed: int = 30) -> int:
                         if cur.rowcount == 1:
                             inserted += 1
                     except Exception:
-                        # keep MVP resilient
                         conn.rollback()
                         continue
 
@@ -144,21 +192,27 @@ def ingest_once(limit_per_feed: int = 30) -> int:
     return inserted
 
 
-def classify_direction(asset: str, text: str) -> int:
-    t = norm_text(text)
-    for kws, direction in RULES.get(asset, []):
-        for kw in kws:
-            if kw in t:
-                return direction
-    return 0
-
+# ============================================================
+# SCORING
+# ============================================================
 
 def decay_weight(age_sec: int) -> float:
     # exp(-lambda * age)
     return float(pow(2.718281828, -LAMBDA * max(0, age_sec)))
 
 
-def compute_bias(lookback_hours: int = 24):
+def match_rules(asset: str, text: str) -> List[Dict[str, Any]]:
+    """Return all matches with their base weight and why."""
+    t = (text or "")
+    tl = t.lower()
+    out = []
+    for pattern, w, why in RULES.get(asset, []):
+        if re.search(pattern, tl, flags=re.IGNORECASE):
+            out.append({"pattern": pattern, "w": float(w), "why": why})
+    return out
+
+
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 800):
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -170,67 +224,75 @@ def compute_bias(lookback_hours: int = 24):
                 FROM news_items
                 WHERE published_ts >= %s
                 ORDER BY published_ts DESC
-                LIMIT 500;
+                LIMIT %s;
                 """,
-                (cutoff,)
+                (cutoff, limit_rows)
             )
             rows = cur.fetchall()
 
-    # Score per asset + keep "why" contributions
-    result = {}
+    assets_out = {}
+
     for asset in ASSETS:
-        score = 0.0
-        why = []
+        total = 0.0
+        why_all = []
 
         for (source, title, link, ts) in rows:
-            dirn = classify_direction(asset, title)
-            if dirn == 0:
-                continue
-
             age = now - int(ts)
             w_src = SOURCE_WEIGHT.get(source, 1.0)
             w_time = decay_weight(age)
-            contrib = dirn * w_src * w_time
 
-            score += contrib
-            why.append({
-                "source": source,
-                "title": title,
-                "link": link,
-                "published_ts": int(ts),
-                "age_min": int(age / 60),
-                "direction": dirn,
-                "contrib": round(contrib, 4),
-            })
+            matches = match_rules(asset, title)
+            if not matches:
+                continue
 
-        # decide bias
-        # threshold tuned for MVP; you will later calibrate
-        T = 2.0
-        if score > T:
+            for m in matches:
+                base_w = m["w"]
+                contrib = base_w * w_src * w_time
+                total += contrib
+
+                why_all.append({
+                    "source": source,
+                    "title": title,
+                    "link": link,
+                    "published_ts": int(ts),
+                    "age_min": int(age / 60),
+                    "base_w": base_w,
+                    "src_w": w_src,
+                    "time_w": round(w_time, 4),
+                    "contrib": round(contrib, 4),
+                    "why": m["why"],
+                })
+
+        th = BIAS_THRESH.get(asset, 1.0)
+        if total >= th:
             bias = "BULLISH"
-        elif score < -T:
+        elif total <= -th:
             bias = "BEARISH"
         else:
             bias = "NEUTRAL"
 
-        why_sorted = sorted(why, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
+        why_top5 = sorted(why_all, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
 
-        result[asset] = {
+        assets_out[asset] = {
             "bias": bias,
-            "score": round(score, 4),
-            "why_top5": why_sorted,
+            "score": round(total, 4),
+            "why_top5": why_top5,
         }
 
     payload = {
         "updated_utc": datetime.now(timezone.utc).isoformat(),
-        "assets": result,
+        "assets": assets_out,
         "meta": {
-            "lookback_hours": 24,
+            "lookback_hours": lookback_hours,
             "feeds": list(RSS_FEEDS.keys()),
         }
     }
     return payload
 
+
+# ============================================================
+# STATE
+# ============================================================
 
 def save_bias(payload: dict):
     now = int(time.time())
@@ -262,39 +324,40 @@ def load_bias():
 def pipeline_run():
     db_init()
     inserted = ingest_once(limit_per_feed=30)
-    payload = compute_bias(lookback_hours=24)
+    payload = compute_bias(lookback_hours=24, limit_rows=800)
     payload["meta"]["inserted_last_run"] = inserted
     save_bias(payload)
     return payload
 
 
-# -----------------------------
-# FastAPI
-# -----------------------------
+# ============================================================
+# API
+# ============================================================
+
 app = FastAPI(title="News Bias Bot (MVP)")
+
 
 @app.get("/health")
 def health():
     return {"ok": True}
+
 
 @app.get("/bias")
 def bias():
     db_init()
     state = load_bias()
     if not state:
-        # First time: compute instantly
-        payload = pipeline_run()
-        return payload
+        return pipeline_run()
     return state["payload"]
+
 
 @app.get("/run")
 def run_now():
-    # Manual trigger from browser
-    payload = pipeline_run()
-    return payload
+    return pipeline_run()
+
 
 @app.get("/latest")
-def latest(limit: int = 20):
+def latest(limit: int = 30):
     db_init()
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -316,3 +379,57 @@ def latest(limit: int = 20):
         ]
     }
 
+
+@app.get("/explain")
+def explain(asset: str = "US500", limit: int = 50):
+    """
+    Debug endpoint:
+    returns top contributing matched headlines for selected asset.
+    """
+    asset = asset.upper().strip()
+    if asset not in ASSETS:
+        return {"error": f"asset must be one of {ASSETS}"}
+
+    now = int(time.time())
+    cutoff = now - 24 * 3600
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source, title, link, published_ts
+                FROM news_items
+                WHERE published_ts >= %s
+                ORDER BY published_ts DESC
+                LIMIT 800;
+                """,
+                (cutoff,)
+            )
+            rows = cur.fetchall()
+
+    out = []
+    for (source, title, link, ts) in rows:
+        matches = match_rules(asset, title)
+        if not matches:
+            continue
+
+        age = now - int(ts)
+        w_src = SOURCE_WEIGHT.get(source, 1.0)
+        w_time = decay_weight(age)
+
+        for m in matches:
+            contrib = m["w"] * w_src * w_time
+            out.append({
+                "source": source,
+                "title": title,
+                "link": link,
+                "age_min": int(age / 60),
+                "base_w": m["w"],
+                "src_w": w_src,
+                "time_w": round(w_time, 4),
+                "contrib": round(contrib, 4),
+                "why": m["why"],
+            })
+
+    out_sorted = sorted(out, key=lambda x: abs(x["contrib"]), reverse=True)[:limit]
+    return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}

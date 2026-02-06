@@ -1,25 +1,19 @@
 # app.py
-# News Bias Bot (MVP++) — RSS + Trade Gate + iPhone-friendly UI + FRED macro drivers + Morning Plan
+# News Bias Bot (MVP++) — FIXED & HARDENED (Railway-ready)
 #
-# Features:
-# - RSS ingestion -> Postgres
-# - Bias scoring per asset (XAU / US500 / WTI) using regex RULES + decay
-# - Signal Quality v1 + v2 (consensus/conflict/freshness + event penalty)
-# - Event mode (ForexFactory calendar via faireconomy mirror) + macro recent (FED/BLS/BEA)
-# - Trade Gate (OK/NO) per asset: Bias + Quality v2 + Conflict + Event Mode + Flip guard
-# - Unified Trump headlines flag (single feed + switch)
-# - FRED macro drivers (real/nominal yields, USD broad, VIX, etc.) injected as evidence
-# - Dashboard: compact mode, sticky mini-header tabs, tooltips, iPhone Safari friendly
+# Key fixes / upgrades:
+# ✅ FIX: Railway crash -> requests dependency handled via requirements.txt (see note below)
+# ✅ FIX: RSS published_ts -> calendar.timegm() (UTC-safe; no local tz skew)
+# ✅ FIX: Prevent runaway multi-match -> per-headline strongest-match-only + optional cap
+# ✅ FIX: Duplicate headline clustering -> title_norm_fp + unique_title_count for quality
+# ✅ FIX: /dashboard no longer triggers pipeline (no surprise heavy work on page view)
+# ✅ FIX: /run protected by Postgres advisory lock (no concurrent runs)
+# ✅ FIX: FRED ingest throttled (default 4h) to avoid slow runs + API rate pain
+# ✅ FIX: DB env sanity checks (Railway: DATABASE_URL must exist)
 #
-# ENV:
-# - DATABASE_URL (postgres) OR PGHOST/PGPORT/PGDATABASE/PGUSER/PGPASSWORD
-# - GATE_PROFILE=STRICT|MODERATE
-# - EVENT_LOOKAHEAD_HOURS=18, EVENT_RECENT_HOURS=6
-# - TRUMP_ENABLED=1|0
-# - FRED_ENABLED=1|0, FRED_API_KEY=..., FRED_WINDOW_DAYS=120
-#
-# Run:
-#   uvicorn app:app --host 0.0.0.0 --port 8000
+# IMPORTANT (Railway):
+# - Add requirements.txt with: fastapi uvicorn[standard] requests feedparser psycopg2-binary
+# - Start command: uvicorn app:app --host 0.0.0.0 --port $PORT
 
 import os
 import json
@@ -27,6 +21,7 @@ import time
 import re
 import hashlib
 import math
+import calendar
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -53,7 +48,7 @@ GATE_THRESHOLDS = {
         "conflict_max": 0.55,
         "min_opp_flip_dist": 0.35,
         "neutral_allow": False,
-        "neutral_flip_dist_max": 0.20,   # unused in strict (kept for UI)
+        "neutral_flip_dist_max": 0.20,
         "event_mode_block": True,
         "event_override_quality": 70,
         "event_override_conflict": 0.45,
@@ -94,6 +89,7 @@ FRED_CFG = {
     "enabled": os.environ.get("FRED_ENABLED", "1").strip() == "1",
     "api_key": os.environ.get("FRED_API_KEY", "").strip(),
     "window_days": int(os.environ.get("FRED_WINDOW_DAYS", "120")),
+    "ingest_interval_sec": int(os.environ.get("FRED_INGEST_INTERVAL_SEC", str(4 * 3600))),  # default 4h
 }
 FRED_SERIES = {
     "DGS10":    {"name": "US 10Y Nominal", "freq": "d"},
@@ -105,27 +101,22 @@ FRED_SERIES = {
 }
 
 # ============================================================
-# RSS FEEDS (deduped keys)
+# RSS FEEDS
 # ============================================================
 
 RSS_FEEDS: Dict[str, str] = {
-    # Macro / policy
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
     "BLS": "https://www.bls.gov/feed/news_release.rss",
     "BEA": "https://apps.bea.gov/rss/rss.xml",
 
-    # Commodities / oil
     "OILPRICE": "https://oilprice.com/rss/main",
 
-    # FX / macro commentary
     "FXSTREET_NEWS": "https://www.fxstreet.com/rss/news",
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
 
-    # MarketWatch
     "MARKETWATCH_TOP": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
     "MARKETWATCH_REALTIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
 
-    # Investing.com (requested) — keep, but no duplicates
     "INV_STOCK_FUND": "https://www.investing.com/rss/stock_Fundamental.rss",
     "INV_COMMOD_TECH": "https://www.investing.com/rss/commodities_Technical.rss",
     "INV_NEWS_11": "https://www.investing.com/rss/news_11.rss",
@@ -136,17 +127,13 @@ RSS_FEEDS: Dict[str, str] = {
     "INV_FX_TECH": "https://www.investing.com/rss/forex_Technical.rss",
     "INV_FX_FUND": "https://www.investing.com/rss/forex_Fundamental.rss",
 
-    # Your extra RSS
     "RSSAPP_1": "https://rss.app/feeds/X1lZYAmHwbEHR8OY.xml",
     "RSSAPP_2": "https://rss.app/feeds/BDVzmd6sW0mF8DJ6.xml",
 
-    # Unified Trump headlines
     "TRUMP_HEADLINES": "https://rss.politico.com/donald-trump.xml",
 
-    # ForexFactory calendar (faireconomy mirror)
     "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
 }
-
 CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR"}  # not ingested into news_items
 
 # ============================================================
@@ -208,13 +195,15 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
         (r"\b(vix spikes|volatility spikes)\b", -0.6, "Volatility spike (risk-off)"),
     ],
     "WTI": [
-        (r"\b(crude|oil|wti|brent)\b", +0.1, "Oil headlines (generic)"),
+        # NOTE: removed "generic oil +0.1" (too noisy). Directional rules only.
         (r"\b(opec|output cut|cuts output|production cut)\b", +0.8, "Supply cuts support oil"),
         (r"\b(output increase|ramp up production|supply increase)\b", -0.6, "Supply increase pressures oil"),
         (r"\b(inventories rise|stockpile build|build in stocks|inventory build)\b", -0.8, "Inventories build pressures oil"),
         (r"\b(inventories fall|draw in stocks|inventory draw)\b", +0.8, "Inventory draw supports oil"),
         (r"\b(disruption|outage|pipeline|attack|sanctions|shipping disruption)\b", +0.7, "Supply disruption supports oil"),
         (r"\b(demand weakens|recession fears|slowdown)\b", -0.6, "Demand concerns pressure oil"),
+        (r"\b(crude|oil|wti|brent)\b.*\b(rises?|jumps?|surges?|gains?)\b", +0.35, "Oil up headline (directional)"),
+        (r"\b(crude|oil|wti|brent)\b.*\b(falls?|drops?|slides?|tumbles?)\b", -0.35, "Oil down headline (directional)"),
     ],
 }
 
@@ -222,7 +211,19 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 # DB
 # ============================================================
 
+def _db_env_sanity():
+    # Railway typically provides DATABASE_URL. If absent, local fallback is allowed.
+    db_url = os.environ.get("DATABASE_URL", "").strip()
+    if db_url:
+        return
+    # if in Railway and DATABASE_URL missing, better fail clearly
+    if os.environ.get("RAILWAY_ENVIRONMENT") or os.environ.get("RAILWAY_PROJECT_ID"):
+        raise RuntimeError("DATABASE_URL is missing in Railway environment. Set DATABASE_URL in Variables.")
+    # local dev fallback: allow PGHOST/...
+    return
+
 def db_conn():
+    _db_env_sanity()
     db_url = os.environ.get("DATABASE_URL", "").strip()
     if db_url:
         return psycopg2.connect(db_url)
@@ -244,10 +245,12 @@ def db_init():
                 title TEXT NOT NULL,
                 link TEXT NOT NULL,
                 published_ts BIGINT NOT NULL,
-                fingerprint TEXT UNIQUE NOT NULL
+                fingerprint TEXT UNIQUE NOT NULL,
+                title_norm_fp TEXT NOT NULL
             );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_news_items_published_ts ON news_items(published_ts DESC);")
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_news_items_title_norm_fp ON news_items(title_norm_fp);")
 
             cur.execute("""
             CREATE TABLE IF NOT EXISTS bias_state (
@@ -257,7 +260,6 @@ def db_init():
             );
             """)
 
-            # FRED cache table
             cur.execute("""
             CREATE TABLE IF NOT EXISTS fred_series (
                 series_id TEXT NOT NULL,
@@ -292,7 +294,7 @@ def load_bias() -> Optional[dict]:
     _updated_ts, payload_json = row
     try:
         return json.loads(payload_json)
-    except:
+    except Exception:
         return None
 
 # ============================================================
@@ -302,6 +304,19 @@ def load_bias() -> Optional[dict]:
 def fingerprint(title: str, link: str) -> str:
     s = (title or "").strip() + "||" + (link or "").strip()
     return hashlib.sha1(s.encode("utf-8", errors="ignore")).hexdigest()
+
+_norm_re = re.compile(r"[^a-z0-9]+", re.I)
+
+def normalize_title(title: str) -> str:
+    t = (title or "").lower().strip()
+    # remove common noise tokens (optional)
+    t = re.sub(r"\b(live|update|updates|breaking|analysis)\b", " ", t)
+    t = _norm_re.sub(" ", t)
+    t = re.sub(r"\s+", " ", t).strip()
+    return t[:240]
+
+def title_norm_fp(title: str) -> str:
+    return hashlib.sha1(normalize_title(title).encode("utf-8", errors="ignore")).hexdigest()
 
 def decay_weight(age_sec: int) -> float:
     if age_sec < 0:
@@ -315,13 +330,26 @@ def _fresh_bucket(age_sec: int) -> str:
         return "2-8h"
     return "8-24h"
 
-def match_rules(asset: str, title: str) -> List[Dict[str, Any]]:
-    out = []
-    t = (title or "").lower()
+def match_rules_strongest(asset: str, title: str, max_abs_per_headline: float = 1.0) -> List[Dict[str, Any]]:
+    """
+    Strongest-match-only per headline (stability).
+    If multiple rules match, keep the one with max |w| (ties: first).
+    Optionally cap absolute base_w.
+    """
+    t = (title or "")
+    best = None
     for (pat, w, why) in RULES.get(asset, []):
         if re.search(pat, t, flags=re.I):
-            out.append({"pattern": pat, "w": float(w), "why": why})
-    return out
+            cand = {"pattern": pat, "w": float(w), "why": why}
+            if (best is None) or (abs(cand["w"]) > abs(best["w"])):
+                best = cand
+    if not best:
+        return []
+    # cap base weight for safety
+    w = float(best["w"])
+    if abs(w) > max_abs_per_headline:
+        best["w"] = max_abs_per_headline if w > 0 else -max_abs_per_headline
+    return [best]
 
 def feeds_health_live() -> Dict[str, Any]:
     res = {}
@@ -332,11 +360,7 @@ def feeds_health_live() -> Dict[str, Any]:
                 continue
             d = feedparser.parse(url)
             entries = getattr(d, "entries", []) or []
-            res[src] = {
-                "ok": True,
-                "bozo": int(getattr(d, "bozo", 0)),
-                "entries": int(len(entries)),
-            }
+            res[src] = {"ok": True, "bozo": int(getattr(d, "bozo", 0)), "entries": int(len(entries))}
         except Exception as e:
             res[src] = {"ok": False, "error": str(e), "entries": 0}
     return res
@@ -344,6 +368,16 @@ def feeds_health_live() -> Dict[str, Any]:
 # ============================================================
 # INGEST
 # ============================================================
+
+def _published_ts(entry: dict, now_ts: int) -> int:
+    pp = entry.get("published_parsed")
+    if pp:
+        # UTC-safe (feedparser struct_time is effectively UTC-ish; timegm avoids local tz skew)
+        try:
+            return int(calendar.timegm(pp))
+        except Exception:
+            return now_ts
+    return now_ts
 
 def ingest_once(limit_per_feed: int = 40) -> int:
     inserted = 0
@@ -372,23 +406,20 @@ def ingest_once(limit_per_feed: int = 40) -> int:
                     if not title or not link:
                         continue
 
-                    published_parsed = e.get("published_parsed")
-                    if published_parsed:
-                        published_ts = int(time.mktime(published_parsed))
-                    else:
-                        published_ts = now
-
+                    published_ts = _published_ts(e, now)
                     fp = fingerprint(title, link)
+                    tnf = title_norm_fp(title)
 
                     try:
                         cur.execute("""
-                            INSERT INTO news_items(source, title, link, published_ts, fingerprint)
-                            VALUES (%s, %s, %s, %s, %s)
+                            INSERT INTO news_items(source, title, link, published_ts, fingerprint, title_norm_fp)
+                            VALUES (%s, %s, %s, %s, %s, %s)
                             ON CONFLICT (fingerprint) DO NOTHING;
-                        """, (src, title, link, int(published_ts), fp))
+                        """, (src, title, link, int(published_ts), fp, tnf))
                         if cur.rowcount == 1:
                             inserted += 1
                     except Exception:
+                        # keep ingest robust
                         pass
 
         conn.commit()
@@ -396,7 +427,7 @@ def ingest_once(limit_per_feed: int = 40) -> int:
     return inserted
 
 # ============================================================
-# EVENT MODE (Calendar + recent macro)
+# EVENT MODE
 # ============================================================
 
 def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
@@ -418,26 +449,19 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
         link = (e.get("link") or "").strip()
 
         ts = None
-        published_parsed = e.get("published_parsed")
-        if published_parsed:
-            ts = int(time.mktime(published_parsed))
+        pp = e.get("published_parsed")
+        if pp:
+            try:
+                ts = int(calendar.timegm(pp))
+            except Exception:
+                ts = None
 
         if ts is not None:
             if now_ts <= ts <= horizon:
-                out.append({
-                    "title": title,
-                    "link": link,
-                    "ts": int(ts),
-                    "in_hours": round((ts - now_ts) / 3600.0, 2),
-                })
+                out.append({"title": title, "link": link, "ts": int(ts), "in_hours": round((ts - now_ts) / 3600.0, 2)})
         else:
             if len([x for x in out if x.get("ts") is None]) < 2:
-                out.append({
-                    "title": title,
-                    "link": link,
-                    "ts": None,
-                    "in_hours": None,
-                })
+                out.append({"title": title, "link": link, "ts": None, "in_hours": None})
 
         if len(out) >= EVENT_CFG["max_upcoming"]:
             break
@@ -469,6 +493,8 @@ def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours:
 # FRED
 # ============================================================
 
+_REQ_SESSION = requests.Session()
+
 def fred_fetch_observations(series_id: str, days: int = 120) -> List[Tuple[str, Optional[float]]]:
     if not (FRED_CFG["enabled"] and FRED_CFG["api_key"]):
         return []
@@ -480,21 +506,30 @@ def fred_fetch_observations(series_id: str, days: int = 120) -> List[Tuple[str, 
         "sort_order": "desc",
         "limit": max(60, min(5000, days * 2)),
     }
-    r = requests.get(url, params=params, timeout=12)
-    r.raise_for_status()
-    js = r.json()
-    out = []
-    for o in js.get("observations", []):
-        d = o.get("date")
-        v = o.get("value")
-        if v in (None, ".", ""):
-            out.append((d, None))
-        else:
-            try:
-                out.append((d, float(v)))
-            except Exception:
-                out.append((d, None))
-    return out
+    # light retry
+    last_err = None
+    for _ in range(2):
+        try:
+            r = _REQ_SESSION.get(url, params=params, timeout=12)
+            r.raise_for_status()
+            js = r.json()
+            out = []
+            for o in js.get("observations", []):
+                d = o.get("date")
+                v = o.get("value")
+                if v in (None, ".", ""):
+                    out.append((d, None))
+                else:
+                    try:
+                        out.append((d, float(v)))
+                    except Exception:
+                        out.append((d, None))
+            return out
+        except Exception as e:
+            last_err = e
+            time.sleep(0.5)
+    # on failure return empty
+    return []
 
 def fred_ingest_series(series_id: str, days: int = 120) -> int:
     obs = fred_fetch_observations(series_id, days=days)
@@ -649,6 +684,18 @@ def _consensus_by_source(contribs: List[Dict[str, Any]]) -> List[Dict[str, Any]]
 # BIAS COMPUTE
 # ============================================================
 
+def _should_ingest_fred(prev_state: Optional[dict], now_ts: int) -> bool:
+    if not (FRED_CFG["enabled"] and FRED_CFG["api_key"]):
+        return False
+    try:
+        meta = (prev_state or {}).get("meta", {}) or {}
+        fred = meta.get("fred", {}) or {}
+        last_ts = int(fred.get("last_ingest_ts", 0))
+    except Exception:
+        last_ts = 0
+    interval = int(FRED_CFG.get("ingest_interval_sec", 4 * 3600))
+    return (now_ts - last_ts) >= max(600, interval)  # at least 10 minutes
+
 def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, Any]:
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
@@ -664,15 +711,21 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             """, (cutoff, limit_rows))
             rows: List[Tuple[str, str, str, int]] = cur.fetchall()
 
-    # --- FRED ingest + drivers
+    prev = load_bias()
+
+    # --- FRED ingest + drivers (throttled)
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
-    if FRED_CFG["enabled"] and FRED_CFG["api_key"]:
+    did_fred_ingest = False
+    if _should_ingest_fred(prev, now):
+        did_fred_ingest = True
         for sid in FRED_SERIES.keys():
             try:
                 fred_inserted += fred_ingest_series(sid, days=FRED_CFG["window_days"])
             except Exception:
                 pass
+    # compute drivers even if no ingest (uses cached DB)
+    if FRED_CFG["enabled"] and FRED_CFG["api_key"]:
         try:
             fred_drivers = compute_fred_drivers()
         except Exception:
@@ -694,18 +747,23 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         contribs: List[Dict[str, Any]] = []
         freshness = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
 
+        # For unique headline estimation
+        uniq_titles = set()
+
         for (source, title, link, ts) in rows:
             age_sec = now - int(ts)
             if age_sec < 0:
                 age_sec = 0
+
             w_src = float(SOURCE_WEIGHT.get(source, 1.0))
             w_time = decay_weight(age_sec)
 
-            matches = match_rules(asset, title)
+            matches = match_rules_strongest(asset, title, max_abs_per_headline=1.0)
             if not matches:
                 continue
 
             freshness[_fresh_bucket(age_sec)] += 1
+            uniq_titles.add(title_norm_fp(title))
 
             for m in matches:
                 base_w = float(m["w"])
@@ -725,19 +783,23 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
                     "pattern": m["pattern"],
                 })
 
-        # Inject FRED drivers as evidence (fresh, deterministic)
+        # Inject FRED drivers as evidence (scaled by news density so it doesn't dominate)
+        evidence_count_news = len(contribs)
+        fred_scale = 1.0 / math.sqrt(1.0 + (evidence_count_news / 8.0))  # more news => weaker FRED weight
+
         for d in (fred_drivers.get(asset) or []):
-            c = float(d.get("w", 0.0))
-            if abs(c) < 1e-12:
+            c0 = float(d.get("w", 0.0))
+            if abs(c0) < 1e-12:
                 continue
+            c = c0 * fred_scale
             score += c
             contribs.append({
                 "source": "FRED",
-                "title": f'{d.get("driver","")} value={d.get("value","")} delta={d.get("delta","")}',
+                "title": f'{d.get("driver","")} value={d.get("value","")} delta={d.get("delta","")} (scale={round(fred_scale,3)})',
                 "link": "https://fred.stlouisfed.org/",
                 "published_ts": now,
                 "age_min": 0,
-                "base_w": float(d.get("w", 0.0)),
+                "base_w": float(c0),
                 "src_w": 1.0,
                 "time_w": 1.0,
                 "contrib": round(c, 4),
@@ -756,17 +818,18 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
         evidence_count = len(contribs)
         src_div = len(set([w["source"] for w in contribs])) if contribs else 0
+        unique_title_count = int(len(uniq_titles))
 
         # Quality v1 (simple)
         strength = min(1.0, abs(score) / max(th, 1e-9))
-        quality_v1 = int(min(100, (strength * 60.0) + min(30, evidence_count * 2.0) + min(10, src_div * 2.0)))
+        quality_v1 = int(min(100, (strength * 60.0) + min(30, unique_title_count * 2.0) + min(10, src_div * 2.0)))
 
         # Consensus/conflict
         consensus_ratio, conflict_index, _abs_sum = _consensus_stats(contribs)
 
-        # Quality v2 (strict)
+        # Quality v2
         strength_2 = min(1.2, abs(score) / max(th, 1e-9))
-        ev_term = min(1.0, evidence_count / 18.0)
+        ev_term = min(1.0, unique_title_count / 18.0)
         div_term = min(1.0, src_div / 7.0)
 
         fresh_total = sum(int(v) for v in freshness.values())
@@ -802,6 +865,8 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             "quality_v2": int(quality_v2),
 
             "evidence_count": int(evidence_count),
+            "evidence_count_news": int(evidence_count_news),
+            "unique_title_count": int(unique_title_count),
             "source_diversity": int(src_div),
 
             "consensus_ratio": float(consensus_ratio),
@@ -824,8 +889,10 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             "gate_profile": GATE_PROFILE,
             "fred": {
                 "enabled": bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"])),
-                "inserted_points_last_run": int(fred_inserted),
                 "series": list(FRED_SERIES.keys()),
+                "inserted_points_last_run": int(fred_inserted),
+                "did_ingest_this_run": bool(did_fred_ingest),
+                "last_ingest_ts": int(now if did_fred_ingest else int(((prev or {}).get("meta", {}) or {}).get("fred", {}) or {}).get("last_ingest_ts", 0) or 0),
             },
             "trump": trump,
         },
@@ -841,14 +908,43 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
     }
     return payload
 
+# ============================================================
+# PIPELINE RUN + LOCK
+# ============================================================
+
+RUN_LOCK_KEY = int(os.environ.get("RUN_LOCK_KEY", "72601234"))  # stable int
+
+def _try_lock(cur) -> bool:
+    cur.execute("SELECT pg_try_advisory_lock(%s);", (RUN_LOCK_KEY,))
+    row = cur.fetchone()
+    return bool(row and row[0] is True)
+
+def _unlock(cur):
+    try:
+        cur.execute("SELECT pg_advisory_unlock(%s);", (RUN_LOCK_KEY,))
+    except Exception:
+        pass
+
 def pipeline_run():
     db_init()
-    inserted = ingest_once(limit_per_feed=40)
-    payload = compute_bias(lookback_hours=24, limit_rows=1200)
-    payload["meta"]["inserted_last_run"] = int(inserted)
-    payload["meta"]["feeds_status"] = feeds_health_live()
-    save_bias(payload)
-    return payload
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            if not _try_lock(cur):
+                # already running somewhere else
+                state = load_bias()
+                return {"ok": False, "error": "RUN_IN_PROGRESS", "state": state}
+
+            try:
+                inserted = ingest_once(limit_per_feed=40)
+                payload = compute_bias(lookback_hours=24, limit_rows=1200)
+                payload["meta"]["inserted_last_run"] = int(inserted)
+                payload["meta"]["feeds_status"] = feeds_health_live()
+                save_bias(payload)
+                return payload
+            finally:
+                _unlock(cur)
+                conn.commit()
 
 # ============================================================
 # TRADE GATE
@@ -909,17 +1005,17 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
             must_change.append(f"{opp_label} must be ≥ {mind}")
 
     # Event mode gate
-    if event_mode:
-        if cfg.get("event_mode_block", True):
-            oq = int(cfg.get("event_override_quality", 70))
-            oc = float(cfg.get("event_override_conflict", 0.45))
-            if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
-                fail_reasons.append("Event mode ON (macro risk window)")
-                must_change.append(f"Either wait until event_mode=OFF, or require quality_v2 ≥ {oq} and conflict_index ≤ {oc} (and bias != NEUTRAL).")
+    if event_mode and cfg.get("event_mode_block", True):
+        oq = int(cfg.get("event_override_quality", 70))
+        oc = float(cfg.get("event_override_conflict", 0.45))
+        if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
+            fail_reasons.append("Event mode ON (macro risk window)")
+            must_change.append(
+                f"Either wait until event_mode=OFF, or require quality_v2 ≥ {oq} and conflict_index ≤ {oc} (and bias != NEUTRAL)."
+            )
 
     ok = (len(fail_reasons) == 0)
 
-    # WHY from top drivers
     td = asset_obj.get("top3_drivers", []) or []
     why_short = [x.get("why", "") for x in td[:3] if x.get("why")]
     if not why_short:
@@ -945,7 +1041,7 @@ def root():
 
 @app.get("/health")
 def health():
-    return {"ok": True, "gate_profile": GATE_PROFILE}
+    return {"ok": True, "gate_profile": GATE_PROFILE, "trump_enabled": TRUMP_ENABLED, "fred_enabled": bool(FRED_CFG["enabled"] and FRED_CFG["api_key"])}
 
 @app.get("/rules")
 def rules():
@@ -955,8 +1051,9 @@ def rules():
 def bias(pretty: int = 0):
     db_init()
     state = load_bias()
+    # don't auto-run heavy pipeline on read; if empty, return empty + hint
     if not state:
-        state = pipeline_run()
+        state = {"ok": False, "error": "NO_STATE_YET", "hint": "POST /run to generate state"}
     if pretty:
         return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
     return JSONResponse(state)
@@ -977,9 +1074,7 @@ def latest(limit: int = 40):
                 LIMIT %s;
             """, (limit,))
             rows = cur.fetchall()
-    return {
-        "items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]
-    }
+    return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
 @app.get("/explain")
 def explain(asset: str = "US500", limit: int = 60):
@@ -1004,7 +1099,7 @@ def explain(asset: str = "US500", limit: int = 60):
 
     out = []
     for (source, title, link, ts) in rows:
-        matches = match_rules(asset, title)
+        matches = match_rules_strongest(asset, title)
         if not matches:
             continue
         age = now - int(ts)
@@ -1039,7 +1134,7 @@ def morning_plan():
     db_init()
     payload = load_bias()
     if not payload:
-        payload = pipeline_run()
+        return JSONResponse({"ok": False, "error": "NO_STATE_YET", "hint": "POST /run first"})
 
     assets = payload.get("assets", {}) or {}
     meta = payload.get("meta", {}) or {}
@@ -1070,11 +1165,7 @@ def morning_plan():
         "event_mode": event_mode,
         "upcoming_events": (event.get("upcoming_events", []) or [])[:6],
         "trump": trump,
-        "plan": {
-            "XAU": pack("XAU"),
-            "US500": pack("US500"),
-            "WTI": pack("WTI"),
-        }
+        "plan": {"XAU": pack("XAU"), "US500": pack("US500"), "WTI": pack("WTI")},
     }
     return JSONResponse(out)
 
@@ -1112,8 +1203,19 @@ def _tooltip(label: str, text: str) -> str:
 def dashboard(compact: int = 0):
     db_init()
     payload = load_bias()
+
+    # IMPORTANT: dashboard never runs pipeline
     if not payload:
-        payload = pipeline_run()
+        return HTMLResponse("""
+        <html><head><meta name="viewport" content="width=device-width, initial-scale=1">
+        <title>News Bias Dashboard</title></head>
+        <body style="font-family: -apple-system, Segoe UI, Arial; padding:16px;">
+          <h2>No state yet</h2>
+          <p>Run the pipeline first:</p>
+          <pre>POST /run</pre>
+          <p>Then open <b>/dashboard</b> again.</p>
+        </body></html>
+        """)
 
     assets = payload.get("assets", {}) or {}
     updated = payload.get("updated_utc", "")
@@ -1141,11 +1243,7 @@ def dashboard(compact: int = 0):
             rows = cur.fetchall()
 
     # Event panel
-    ev_html = ""
-    if event_mode:
-        ev_html += '<div class="pill pill-warn">⚠️ EVENT MODE: ON</div>'
-    else:
-        ev_html += '<div class="pill pill-ok">✅ EVENT MODE: OFF</div>'
+    ev_html = '<div class="pill pill-warn">⚠️ EVENT MODE: ON</div>' if event_mode else '<div class="pill pill-ok">✅ EVENT MODE: OFF</div>'
 
     tr_badge = ""
     if trump_enabled:
@@ -1186,6 +1284,7 @@ def dashboard(compact: int = 0):
         q2 = int(a.get("quality_v2", 0))
 
         evc = int(a.get("evidence_count", 0))
+        uniq = int(a.get("unique_title_count", 0))
         div = int(a.get("source_diversity", 0))
 
         consensus_ratio = float(a.get("consensus_ratio", 0.0))
@@ -1200,18 +1299,17 @@ def dashboard(compact: int = 0):
         gate = eval_trade_gate(a, event_mode, gate_profile)
 
         # Tooltips
-        tip_q1 = _tooltip("Quality v1", "v1 = strength vs threshold + evidence count + source diversity.")
-        tip_q2 = _tooltip("Quality v2", "v2 = strength + evidence + diversity + freshness + consensus − conflict − (event penalty).")
+        tip_q1 = _tooltip("Quality v1", "v1 = strength vs threshold + UNIQUE headline count + source diversity.")
+        tip_q2 = _tooltip("Quality v2", "v2 = strength + unique headlines + diversity + freshness + consensus − conflict − (event penalty).")
         tip_conf = _tooltip("Conflict", "conflict_index = 1 - consensus_ratio. High conflict = unstable bias.")
         tip_cons = _tooltip("Consensus", "consensus_ratio = |net| / sum_abs. Higher = agreement in direction.")
         tip_flip = _tooltip("Flip", "Δ needed for score to reach bullish (+th) or bearish (-th) threshold.")
         tip_gate = _tooltip("Trade Gate", f"Gate = Bias + Quality v2 + Conflict + Event Mode + Flip guard. Profile: {gate_profile}.")
+        tip_uniq = _tooltip("Unique headlines", "Approx. dedup count using normalized title hashing (reduces copy-paste duplicates).")
 
-        # Gate lists
         gate_why = "".join([f"<li>{x}</li>" for x in (gate.get("why", []) or [])[:3]]) or "<li>—</li>"
         gate_need = "".join([f"<li>{x}</li>" for x in (gate.get('must_change', []) or [])[:3]]) or "<li>—</li>"
 
-        # Top drivers (simple list)
         td_html = ""
         for i, x in enumerate(top3[:3], start=1):
             td_html += f"""
@@ -1223,7 +1321,6 @@ def dashboard(compact: int = 0):
         if not td_html:
             td_html = '<div class="muted">—</div>'
 
-        # consensus by source table
         cs_rows = ""
         for x in cons_by_src[:8]:
             net = float(x.get("net", 0.0))
@@ -1239,7 +1336,6 @@ def dashboard(compact: int = 0):
         if not cs_rows:
             cs_rows = '<tr><td class="muted">—</td><td></td><td></td><td></td></tr>'
 
-        # WHY top 5 list
         why_html = ""
         for w in why_top5[:5]:
             why_html += f"""
@@ -1252,7 +1348,6 @@ def dashboard(compact: int = 0):
             </li>
             """
 
-        # Latest relevant headlines
         kw = {
             "XAU": ["gold", "xau", "fed", "fomc", "cpi", "inflation", "yields", "usd", "treasury", "safe-haven", "real"],
             "US500": ["stocks", "futures", "earnings", "downgrade", "upgrade", "s&p", "nasdaq", "equities", "vix", "rates", "yields"],
@@ -1283,7 +1378,7 @@ def dashboard(compact: int = 0):
                 {_pill_gate(bool(gate.get("ok")))} {tip_gate}
               </div>
               <div class="sub muted tiny">
-                evidence={evc} • source_diversity={div} • {tip_cons} consensus={consensus_ratio} • {tip_conf} conflict={conflict_index}
+                evidence={evc} • {tip_uniq} unique={uniq} • source_diversity={div} • {tip_cons} consensus={consensus_ratio} • {tip_conf} conflict={conflict_index}
               </div>
             </div>
             <div class="actions">
@@ -1429,7 +1524,6 @@ def dashboard(compact: int = 0):
         .tiny {{ font-size:12px; }}
         .spacer {{ display:inline-block; width: 10px; }}
 
-        /* Sticky mini header */
         .mini {{
           position: sticky; top: 62px; z-index: 40;
           margin: 10px 0 14px 0;
@@ -1488,7 +1582,7 @@ def dashboard(compact: int = 0):
           font-weight:900;
           min-height: 40px;
         }}
-        .btn:hover {{ background:var(--btn2); }}
+        .btn:hover {{ background: var(--btn2); }}
 
         .grid3 {{ display:grid; grid-template-columns: 1fr 1fr 1fr; gap:14px; margin-top: 14px; }}
         .grid2 {{ display:grid; grid-template-columns: 1.1fr 1.1fr 1.2fr; gap:12px; margin-top: 12px; }}
@@ -1518,7 +1612,6 @@ def dashboard(compact: int = 0):
         .why-row {{ display:flex; justify-content:space-between; gap:10px; }}
         .why-meta {{ color:var(--muted); font-size:12px; }}
 
-        /* Tooltips */
         .tipwrap {{ position: relative; display:inline-block; }}
         .tipicon {{
           display:inline-flex; align-items:center; justify-content:center;
@@ -1543,7 +1636,6 @@ def dashboard(compact: int = 0):
         }}
         .tipbubble.show {{ display:block; }}
 
-        /* Compact mode */
         html[data-compact="1"] .compact-hide {{ display:none !important; }}
         html[data-compact="1"] .grid2 {{ grid-template-columns: 1fr; }}
         html[data-compact="1"] .grid3 {{ grid-template-columns: 1fr; }}
@@ -1625,7 +1717,6 @@ def dashboard(compact: int = 0):
 
       </div>
 
-      <!-- MODAL -->
       <div class="modal" id="modal" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); align-items:center; justify-content:center;
            padding: calc(16px + env(safe-area-inset-top)) 16px calc(16px + env(safe-area-inset-bottom));">
         <div class="modal-box" style="width:min(1020px, 100%); max-height: 82vh; overflow:auto; -webkit-overflow-scrolling: touch;
@@ -1642,7 +1733,6 @@ def dashboard(compact: int = 0):
       <script>
         const payloadMini = {json.dumps(assets, ensure_ascii=False)};
 
-        // Theme init
         (function initTheme(){{
           const saved = localStorage.getItem('theme');
           if(saved === 'light' || saved === 'dark') {{
@@ -1652,13 +1742,11 @@ def dashboard(compact: int = 0):
           }}
         }})();
 
-        // Compact init
         (function initCompact(){{
           const c = localStorage.getItem('compact') || '{compact_on}';
           document.documentElement.setAttribute('data-compact', c);
         }})();
 
-        // Mini status init
         (function initMini(){{
           function fmt(a) {{
             if(!a) return '—';
@@ -1731,6 +1819,13 @@ def dashboard(compact: int = 0):
           try {{
             const resp = await fetch('/run', {{ method:'POST' }});
             const data = await resp.json();
+            if(data && data.error === 'RUN_IN_PROGRESS') {{
+              ids.forEach(a => {{
+                const el = document.getElementById('status-' + a);
+                if(el) el.innerText = 'Already running...';
+              }});
+              return;
+            }}
             const upd = data.updated_utc || '';
             ids.forEach(a => {{
               const el = document.getElementById('status-' + a);
@@ -1814,7 +1909,6 @@ def dashboard(compact: int = 0):
           openModal('Event JSON', '<pre style="white-space:pre-wrap;">' + escapeHtml(JSON.stringify(ev, null, 2)) + '</pre>');
         }}
 
-        // Tooltips (tap/hover)
         function hideAllTips() {{
           document.querySelectorAll('.tipbubble').forEach(x => x.remove());
         }}
@@ -1839,7 +1933,6 @@ def dashboard(compact: int = 0):
           }}
         }});
 
-        // Close modal by tapping backdrop
         document.getElementById('modal').addEventListener('click', (e) => {{
           if(e.target && e.target.id === 'modal') closeModal();
         }});

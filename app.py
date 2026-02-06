@@ -24,18 +24,29 @@ RSS_FEEDS = {
 
     # Energy / WTI
     "EIA": "https://www.eia.gov/rss/todayinenergy.xml",
+    "OILPRICE": "https://oilprice.com/rss/main",
 
-    # Broad market headlines (noisy, but ok as extra layer)
+    # Broad market headlines
     "INVESTING": "https://www.investing.com/rss/news_25.rss",
 
-    # Markets / Macro (extra)
+    # FXStreet
     "FXSTREET_NEWS": "https://www.fxstreet.com/rss/news",
     "FXSTREET_ANALYSIS": "https://www.fxstreet.com/rss/analysis",
     "FXSTREET_STOCKS": "https://www.fxstreet.com/rss/stocks",
 
-    # Markets (extra)
-    "MARKETWATCH_RSS": "https://www.marketwatch.com/site/rss",
+    # MarketWatch (valid RSS feeds)
+    "MARKETWATCH_TOP_STORIES": "https://feeds.content.dowjones.io/public/rss/mw_topstories",
+    "MARKETWATCH_REAL_TIME": "https://feeds.content.dowjones.io/public/rss/mw_realtimeheadlines",
+    "MARKETWATCH_BREAKING": "https://feeds.content.dowjones.io/public/rss/mw_bulletins",
+    "MARKETWATCH_MARKETPULSE": "https://feeds.content.dowjones.io/public/rss/mw_marketpulse",
 
+    # Financial Times (may be restricted; ok to try)
+    "FT_PRECIOUS_METALS": "https://www.ft.com/precious-metals?format=rss",
+
+    # DailyForex (RSS)
+    "DAILYFOREX_NEWS": "https://www.dailyforex.com/rss/forexnews.xml",
+    "DAILYFOREX_TECH": "https://www.dailyforex.com/rss/technicalanalysis.xml",
+    "DAILYFOREX_FUND": "https://www.dailyforex.com/rss/fundamentalanalysis.xml",
 }
 
 # impact weights by source (MVP heuristic)
@@ -44,7 +55,24 @@ SOURCE_WEIGHT = {
     "BLS": 3.0,
     "BEA": 2.5,
     "EIA": 3.0,
+
     "INVESTING": 1.0,
+    "OILPRICE": 1.2,
+
+    "FXSTREET_NEWS": 1.4,
+    "FXSTREET_ANALYSIS": 1.2,
+    "FXSTREET_STOCKS": 1.2,
+
+    "MARKETWATCH_TOP_STORIES": 1.6,
+    "MARKETWATCH_REAL_TIME": 1.6,
+    "MARKETWATCH_BREAKING": 1.8,
+    "MARKETWATCH_MARKETPULSE": 1.5,
+
+    "FT_PRECIOUS_METALS": 1.6,
+
+    "DAILYFOREX_NEWS": 1.2,
+    "DAILYFOREX_TECH": 1.0,
+    "DAILYFOREX_FUND": 1.2,
 }
 
 # Exponential decay (half-life ~ 8 hours)
@@ -81,8 +109,10 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 
     "XAU": [
         # Gold bullish: risk-off, stress
-        (r"\b(rout|plunges?|risk[- ]off|wary|stress test|credit stress|crisis|geopolitic(al)?|war)\b",
-         +0.9, "Risk-off / stress supports gold"),
+        (r"\b(wall st|wall street|futures|s&p|spx|nasdaq|dow|treasur(y|ies)|yields?|vix|risk[- ]off)\b.*\b(rout|plunges?|slides?|sell[- ]off|wary)\b"
+        r"|\b(rout|plunges?|slides?|sell[- ]off)\b.*\b(wall st|futures|s&p|nasdaq|treasur(y|ies)|yields?|vix|risk[- ]off)\b",
+        +0.9, "Market-wide risk-off supports gold"),
+
         # Gold bearish: risk-on / strong equities
         (r"\b(rebound|risk[- ]on|stocks to buy|buy after .* drop|strong earnings)\b",
          -0.7, "Risk-on pressures gold"),
@@ -167,6 +197,12 @@ def ingest_once(limit_per_feed: int = 30) -> int:
             for src, url in RSS_FEEDS.items():
                 d = feedparser.parse(url)
 
+                # If feedparser flags issues, skip feed (FT can be restricted)
+                if getattr(d, "bozo", 0):
+                    # Uncomment for debugging:
+                    # print(f"[WARN] bad feed {src}: {getattr(d, 'bozo_exception', None)}")
+                    continue
+
                 for e in d.entries[:limit_per_feed]:
                     title = (e.get("title") or "").strip()
                     link = (e.get("link") or "").strip()
@@ -199,7 +235,6 @@ def ingest_once(limit_per_feed: int = 30) -> int:
         conn.commit()
 
     return inserted
-
 
 # ============================================================
 # SCORING
@@ -537,3 +572,16 @@ def dashboard():
     """
     return html
 
+@app.get("/feeds_health")
+def feeds_health():
+    out = {}
+    for src, url in RSS_FEEDS.items():
+        try:
+            d = feedparser.parse(url)
+            out[src] = {
+                "bozo": int(getattr(d, "bozo", 0)),
+                "entries": len(getattr(d, "entries", []) or []),
+            }
+        except Exception as e:
+            out[src] = {"error": str(e)}
+    return out

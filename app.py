@@ -292,3 +292,27 @@ def run_now():
     # Manual trigger from browser
     payload = pipeline_run()
     return payload
+
+@app.get("/latest")
+def latest(limit: int = 20):
+    db_init()
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute(
+                """
+                SELECT source, title, link, published_ts
+                FROM news_items
+                ORDER BY published_ts DESC
+                LIMIT %s;
+                """,
+                (limit,)
+            )
+            rows = cur.fetchall()
+
+    return {
+        "items": [
+            {"source": s, "title": t, "link": l, "published_ts": int(ts)}
+            for (s, t, l, ts) in rows
+        ]
+    }
+

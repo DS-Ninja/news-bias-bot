@@ -442,3 +442,98 @@ def explain(asset: str = "US500", limit: int = 50):
 
     out_sorted = sorted(out, key=lambda x: abs(x["contrib"]), reverse=True)[:limit]
     return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
+
+from fastapi.responses import HTMLResponse
+
+def _badge(bias: str) -> str:
+    if bias == "BULLISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#0b6; color:#fff;">BULLISH</span>'
+    if bias == "BEARISH":
+        return '<span style="padding:4px 10px;border-radius:10px;background:#d33; color:#fff;">BEARISH</span>'
+    return '<span style="padding:4px 10px;border-radius:10px;background:#666; color:#fff;">NEUTRAL</span>'
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard():
+    st = load_bias()
+    if not st:
+        payload = pipeline_run()
+    else:
+        payload = st["payload"]
+
+    assets = payload.get("assets", {})
+    updated = payload.get("updated_utc", "")
+
+    # Pull last headlines (raw) and show limited
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source, title, link, published_ts
+                FROM news_items
+                ORDER BY published_ts DESC
+                LIMIT 40;
+            """)
+            rows = cur.fetchall()
+
+    def render_asset(asset: str) -> str:
+        a = assets.get(asset, {"bias":"NEUTRAL","score":0.0,"why_top5":[]})
+        bias = a.get("bias", "NEUTRAL")
+        score = a.get("score", 0.0)
+        why = a.get("why_top5", [])
+
+        why_html = ""
+        for w in why:
+            why_html += f"""
+            <li>
+              <b>{w.get('why','')}</b>
+              <span style="color:#999;">(contrib={w.get('contrib','')}, src={w.get('source','')}, age={w.get('age_min','')}m)</span><br/>
+              <span style="color:#333;">{w.get('title','')}</span>
+            </li>
+            """
+
+        # simple relevance filter for headlines list
+        kw = {
+            "XAU": ["fed","fomc","cpi","inflation","yields","usd","risk","gold"],
+            "US500": ["stocks","futures","earnings","downgrade","upgrade","rout","slides","rebound","sp","s&p"],
+            "WTI": ["oil","crude","opec","inventory","stocks","tanker","pipeline","storm","spr"],
+        }[asset]
+
+        news_html = ""
+        shown = 0
+        for (source, title, link, ts) in rows:
+            t = (title or "").lower()
+            if not any(k in t for k in kw):
+                continue
+            shown += 1
+            if shown > 10:
+                break
+            news_html += f'<li><a href="{link}" target="_blank">{title}</a> <span style="color:#999;">[{source}]</span></li>'
+
+        return f"""
+        <div style="border:1px solid #ddd;border-radius:14px;padding:14px;margin:10px 0;">
+          <h2 style="margin:0 0 6px 0;">{asset} {_badge(bias)} <span style="color:#666;font-size:14px;">score={score}</span></h2>
+          <div style="margin:10px 0;">
+            <h3 style="margin:0 0 6px 0;">WHY (top 5)</h3>
+            <ol style="margin:0;padding-left:18px;">{why_html or "<li>—</li>"}</ol>
+          </div>
+          <div style="margin:10px 0;">
+            <h3 style="margin:0 0 6px 0;">Latest relevant headlines</h3>
+            <ul style="margin:0;padding-left:18px;">{news_html or "<li>—</li>"}</ul>
+          </div>
+        </div>
+        """
+
+    html = f"""
+    <html>
+    <head><meta charset="utf-8"><title>News Bias Dashboard</title></head>
+    <body style="font-family:Arial, sans-serif; max-width:980px; margin:24px auto; padding:0 12px;">
+      <h1 style="margin:0 0 6px 0;">News Bias Dashboard</h1>
+      <div style="color:#666;margin-bottom:14px;">updated_utc: {updated}</div>
+      {render_asset("XAU")}
+      {render_asset("US500")}
+      {render_asset("WTI")}
+      <div style="color:#999;margin-top:16px;font-size:12px;">Tip: open /explain?asset=XAU for deeper debug.</div>
+    </body>
+    </html>
+    """
+    return html
+

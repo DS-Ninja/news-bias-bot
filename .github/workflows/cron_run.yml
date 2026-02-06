@@ -1,0 +1,14 @@
+name: Run pipeline every 5 minutes
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"
+  workflow_dispatch:
+
+jobs:
+  run:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Call /run endpoint
+        run: |
+          curl -fsS "https://web-production-9bcf3.up.railway.app/run" > /dev/null

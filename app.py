@@ -394,7 +394,6 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
         if ts is not None and (now_ts <= ts <= horizon):
             out.append({"title": title, "link": link, "ts": int(ts), "in_hours": round((ts - now_ts) / 3600.0, 2)})
         else:
-            # keep a couple unknowns for UI
             if len(unknown) < 2:
                 unknown.append({"title": title, "link": link, "ts": None, "in_hours": None})
 
@@ -611,10 +610,10 @@ def flip_metrics(score: float, th: float, bias: str, median_abs: float) -> Dict[
 
     if bias == "BULLISH":
         to_neutral = max(0.0, score - th)
-        to_opposite = score + th  # need to go down by this amount to reach -th
+        to_opposite = score + th
     elif bias == "BEARISH":
-        to_neutral = max(0.0, -th - score)  # score is negative
-        to_opposite = th - score            # need to go up by this amount to reach +th
+        to_neutral = max(0.0, -th - score)
+        to_opposite = th - score
     else:
         to_neutral = 0.0
         to_opposite = min(to_bull, to_bear)
@@ -674,7 +673,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
     has_timed_event = any(x.get("ts") is not None for x in upcoming_events)
     event_mode = bool(EVENT_CFG["enabled"] and (recent_macro or has_timed_event))
 
-    event_reason = []
+    event_reason: List[str] = []
     if not EVENT_CFG["enabled"]:
         event_reason.append("disabled")
     else:
@@ -683,7 +682,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         if has_timed_event:
             event_reason.append(f"upcoming<= {EVENT_CFG['lookahead_hours']}h")
         if not event_reason:
-            # Most common real situation: calendar has unknown timestamps
             if upcoming_events and not has_timed_event:
                 event_reason.append("calendar_time_unknown")
             else:
@@ -991,13 +989,11 @@ def bias(pretty: int = 0):
 
 def _auth_run(token: str) -> bool:
     if not RUN_TOKEN:
-        # If token not configured, allow (dev). In prod лучше поставить RUN_TOKEN.
         return True
     return bool(token and token == RUN_TOKEN)
 
 @app.get("/run")
 def run_get(token: str = ""):
-    # For GitHub cron (GET). Use token.
     if not _auth_run(token):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
@@ -1008,7 +1004,6 @@ def run_get(token: str = ""):
 
 @app.post("/run")
 def run_post(token: str = ""):
-    # For manual "Run now" from UI. Also can use token if you want to lock it.
     if RUN_TOKEN and token and not _auth_run(token):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
@@ -1152,16 +1147,36 @@ def dashboard():
     updated = payload.get("updated_utc", "")
     gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
     event_mode = bool(event.get("event_mode", False))
-    event_reason = event.get("reason", []) or []
     upcoming = (event.get("upcoming_events", []) or [])[:6]
+
+    # event reason text (SAFE)
     event_reason = event.get("reason", []) or []
+    event_reason = [str(x) for x in (event_reason or [])]
+    reason_txt = ", ".join(event_reason) if event_reason else "—"
 
     trump = meta.get("trump", {}) or {}
     trump_flag = bool(trump.get("flag", False))
     trump_enabled = bool(trump.get("enabled", False))
 
     fred_on = bool(meta.get("fred", {}).get("enabled", False))
-    feeds_ok = all(bool((feeds_status.get(k, {}) or {}).get("ok", False)) or bool((feeds_status.get(k, {}) or {}).get("skipped", False)) for k in RSS_FEEDS.keys())
+
+    feeds_ok = all(
+        bool((feeds_status.get(k, {}) or {}).get("ok", False)) or bool((feeds_status.get(k, {}) or {}).get("skipped", False))
+        for k in RSS_FEEDS.keys()
+    )
+
+    # Pills (WERE MISSING BEFORE)
+    ev_pill = '<span class="pill warn">EVENT MODE</span>' if event_mode else '<span class="pill neu">EVENT: off</span>'
+
+    if trump_enabled and trump_flag:
+        tr_pill = '<span class="pill warn">TRUMP: flag</span>'
+    elif trump_enabled:
+        tr_pill = '<span class="pill neu">TRUMP: on</span>'
+    else:
+        tr_pill = '<span class="pill neu">TRUMP: off</span>'
+
+    feeds_pill = '<span class="pill ok">FEEDS: ok</span>' if feeds_ok else '<span class="pill no">FEEDS: bad</span>'
+    fred_pill = '<span class="pill neu">FRED: on</span>' if fred_on else '<span class="pill neu">FRED: off</span>'
 
     # next event line
     next_event = "—"
@@ -1173,7 +1188,6 @@ def dashboard():
         else:
             next_event = f"(time unknown) • {u.get('title','')}"
 
-    # Build table rows
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
@@ -1210,7 +1224,7 @@ def dashboard():
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
         """
-    # payload for JS
+
     js_payload = json.dumps(payload, ensure_ascii=False)
 
     TEMPLATE = """<!doctype html>
@@ -1493,5 +1507,3 @@ def dashboard():
     )
 
     return HTMLResponse(html)
-
-    

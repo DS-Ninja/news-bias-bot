@@ -1,10 +1,11 @@
 # app.py
 # NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# - FIX: UI buttons open MODALS (no raw code tabs)
-# - ADD: Myfxbook Economic Calendar iframe in modal + /myfx_calendar route
-# - ADD: TradingView Markets Ticker Tape (live prices) + keep Alerts/Bias marquee
-# - FIX: RUN with RUN_TOKEN prompts once and stores token in localStorage (UI-safe)
-# - KEEP: RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
+# - UI: 3-level layout: (1) Live prices, (2) Alerts panel, (3) Top News panel
+# - MyFX calendar: forced dark mode via iframe CSS filter (cross-origin safe)
+# - Assets: IC Markets set: US500 / XAUUSD / EURUSD / XTIUSD / BTCUSD
+# - Keeps: RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
+# - Adds: /top_news endpoint + embedded Top News panel
+# - Keeps: modals, RUN token localStorage, /myfx_calendar route
 
 import os
 import json
@@ -32,7 +33,8 @@ from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, Plai
 # CONFIG
 # ============================================================
 
-ASSETS = ["XAU", "US500", "WTI"]
+# Your IC Markets instruments (engine symbols are internal labels; UI shows IC tickers)
+ASSETS = ["US500", "XAU", "EURUSD", "XTI", "BTC"]
 
 GATE_PROFILE = os.environ.get("GATE_PROFILE", "STRICT").strip().upper()
 if GATE_PROFILE not in ("STRICT", "MODERATE"):
@@ -66,7 +68,13 @@ HALF_LIFE_SEC = 8 * 3600
 LAMBDA = 0.69314718056 / HALF_LIFE_SEC
 
 # Bias thresholds (per-asset)
-BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9}
+BIAS_THRESH = {
+    "US500": 1.20,
+    "XAU": 0.90,
+    "EURUSD": 0.80,
+    "XTI": 0.90,
+    "BTC": 1.10,
+}
 
 TRUMP_ENABLED = os.environ.get("TRUMP_ENABLED", "1").strip() == "1"
 TRUMP_PAT = re.compile(r"\b(trump|donald trump|white house)\b", re.I)
@@ -104,17 +112,17 @@ FRED_SERIES = {
 # Token for /run GET/POST (cron)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 
-# MyFXBook widget iframe (as requested)
-MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
+# MyFXBook widget iframe
+# NOTE: "symbols" here is MyFX widget param, not tradingview. It typically accepts currencies.
+MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD,EUR"
 
-# TradingView ticker tape symbols (edit as you like)
-# Note: symbols are TradingView ids. Your broker CFDs can differ; these are common proxies.
+# TradingView ticker tape symbols — using IC Markets where possible (as you requested)
 TV_TICKER_SYMBOLS = [
-    {"proName": "OANDA:XAUUSD", "title": "XAUUSD"},
-    {"proName": "OANDA:EURUSD", "title": "EURUSD"},
-    {"proName": "SP:SPX", "title": "US500"},
-    {"proName": "TVC:USOIL", "title": "WTI"},
-    {"proName": "OANDA:USDJPY", "title": "USDJPY"},
+    {"proName": "ICMARKETS:XAUUSD", "title": "XAUUSD"},
+    {"proName": "ICMARKETS:EURUSD", "title": "EURUSD"},
+    {"proName": "ICMARKETS:US500",  "title": "US500"},
+    {"proName": "ICMARKETS:XTIUSD", "title": "XTIUSD"},
+    {"proName": "ICMARKETS:BTCUSD", "title": "BTCUSD"},
 ]
 
 # RSS feeds
@@ -188,6 +196,10 @@ SOURCE_WEIGHT: Dict[str, float] = {
     "FRED": 1.0,
 }
 
+# ============================================================
+# RULES (regex -> weight -> why)
+# ============================================================
+
 RULES: Dict[str, List[Tuple[str, float, str]]] = {
     "XAU": [
         (r"\b(fed|fomc|powell|rate hike|rates higher|hawkish)\b", -0.7, "Hawkish Fed / higher rates weighs on gold"),
@@ -206,7 +218,7 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
         (r"\b(rally|rebound|risk-on)\b", +0.3, "Risk-on tape"),
         (r"\b(vix spikes|volatility spikes)\b", -0.6, "Volatility spike (risk-off)"),
     ],
-    "WTI": [
+    "XTI": [
         (r"\b(crude|oil|wti|brent)\b", +0.1, "Oil headlines (generic)"),
         (r"\b(opec|output cut|cuts output|production cut)\b", +0.8, "Supply cuts support oil"),
         (r"\b(output increase|ramp up production|supply increase)\b", -0.6, "Supply increase pressures oil"),
@@ -214,6 +226,26 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
         (r"\b(inventories fall|draw in stocks|inventory draw)\b", +0.8, "Inventory draw supports oil"),
         (r"\b(disruption|outage|pipeline|attack|sanctions|shipping disruption)\b", +0.7, "Supply disruption supports oil"),
         (r"\b(demand weakens|recession fears|slowdown)\b", -0.6, "Demand concerns pressure oil"),
+        (r"\b(us dollar strengthens|dollar rises)\b", -0.2, "Stronger USD can pressure oil (macro headwind)"),
+    ],
+    "EURUSD": [
+        (r"\b(ecb|lagarde)\b", +0.25, "ECB headline (direction depends on tone)"),
+        (r"\b(dovish ecb|ecb cut|rate cuts in europe)\b", -0.55, "Dovish ECB pressures EUR"),
+        (r"\b(hawkish ecb|ecb hike|rates higher in europe)\b", +0.55, "Hawkish ECB supports EUR"),
+        (r"\b(hawkish fed|fed hike|rates higher)\b", -0.55, "Hawkish Fed supports USD (bear EURUSD)"),
+        (r"\b(dovish fed|fed cut|easing)\b", +0.50, "Dovish Fed pressures USD (bull EURUSD)"),
+        (r"\b(us cpi|us inflation|nfp|jobs report)\b", -0.20, "US macro print (often USD-vol driver)"),
+        (r"\b(risk-off|flight to safety)\b", -0.15, "Risk-off can support USD (bear EURUSD)"),
+        (r"\b(risk-on)\b", +0.10, "Risk-on can weigh USD (mild bull EURUSD)"),
+    ],
+    "BTC": [
+        (r"\b(bitcoin|btc|crypto)\b", +0.15, "Crypto headline (generic)"),
+        (r"\b(etf inflow|spot etf inflow|institutional demand)\b", +0.75, "ETF/institutional demand supports BTC"),
+        (r"\b(etf outflow|spot etf outflow)\b", -0.65, "ETF outflows pressure BTC"),
+        (r"\b(regulation crackdown|sec lawsuit|ban|illegal)\b", -0.70, "Regulatory risk pressures BTC"),
+        (r"\b(rate cuts|liquidity|easing)\b", +0.35, "Easing/liquidity supports risk assets incl. BTC"),
+        (r"\b(hawkish|rates higher|yields rise)\b", -0.35, "Higher rates/yields pressure risk assets incl. BTC"),
+        (r"\b(risk-off|equities selloff|panic)\b", -0.25, "Risk-off tends to pressure BTC (not always)"),
     ],
 }
 
@@ -266,7 +298,6 @@ def db_init():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
 
-            # Econ calendar store
             cur.execute("""
             CREATE TABLE IF NOT EXISTS econ_events (
                 id BIGSERIAL PRIMARY KEY,
@@ -286,7 +317,6 @@ def db_init():
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_events_ts ON econ_events(event_ts DESC);")
 
-            # Optional alerts log
             cur.execute("""
             CREATE TABLE IF NOT EXISTS alerts_log (
                 id BIGSERIAL PRIMARY KEY,
@@ -365,9 +395,6 @@ def match_rules(asset: str, title: str) -> List[Dict[str, Any]]:
     return out
 
 def _ts_from_entry(e: dict, now_ts: int) -> int:
-    """
-    RSS published_parsed is usually UTC-ish; use calendar.timegm() to avoid local-time mktime() shifts.
-    """
     pp = e.get("published_parsed")
     if pp:
         try:
@@ -467,10 +494,6 @@ _CC_PAT = re.compile(r"\b(US|EU|DE|FR|ES|UK|GB|JP|CN|AU|CA|CH|NZ)\b")
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
 
 def _parse_calendar_fields(title: str, summary: str) -> Dict[str, Optional[str]]:
-    """
-    Best-effort parsing from RSS title/summary.
-    Different calendars format differently; we keep it robust and allow Nones.
-    """
     t = (title or "").strip()
     s = (summary or "").strip()
     blob = (t + " " + s).strip()
@@ -705,7 +728,8 @@ def _pct_change(latest: float, past: float) -> float:
     return (latest - past) / den
 
 def compute_fred_drivers() -> Dict[str, Any]:
-    out = {"XAU": [], "US500": [], "WTI": []}
+    # FRED drivers are macro — we keep for XAU/US500/XTI and allow light touch for EURUSD/BTC
+    out = {a: [] for a in ASSETS}
 
     def add(asset: str, key: str, w: float, note: str, value: float, delta: float):
         out[asset].append({
@@ -761,7 +785,19 @@ def compute_fred_drivers() -> Dict[str, Any]:
     if len(usd) >= 6:
         latest, past = usd[0], usd[5]
         d = _pct_change(latest, past)
-        add("WTI", "DTWEXBGS", w=(-0.4 if d > 0 else +0.2), note="USD headwind/tailwind", value=latest, delta=d)
+        add("XTI", "DTWEXBGS", w=(-0.4 if d > 0 else +0.2), note="USD headwind/tailwind", value=latest, delta=d)
+
+    # EURUSD: broad USD index as light macro tilt
+    if len(usd) >= 6:
+        latest, past = usd[0], usd[5]
+        d = _pct_change(latest, past)
+        add("EURUSD", "DTWEXBGS", w=(-0.35 if d > 0 else +0.25), note="USD broad index tilt (EURUSD inverse)", value=latest, delta=d)
+
+    # BTC: VIX as weak regime proxy
+    if len(vix) >= 6:
+        latest, past = vix[0], vix[5]
+        d = _pct_change(latest, past)
+        add("BTC", "VIXCLS", w=(-0.25 if d > 0 else +0.15), note="VIX risk regime proxy (weak)", value=latest, delta=d)
 
     return out
 
@@ -850,7 +886,7 @@ def flip_metrics(score: float, th: float, bias: str, median_abs: float) -> Dict[
 # BIAS COMPUTE
 # ============================================================
 
-def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, Any]:
+def compute_bias(lookback_hours: int = 24, limit_rows: int = 1400) -> Dict[str, Any]:
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -867,7 +903,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
 
     # FRED ingest + drivers
     fred_inserted = 0
-    fred_drivers = {"XAU": [], "US500": [], "WTI": []}
+    fred_drivers = {a: [] for a in ASSETS}
     fred_on = bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None)
     if fred_on:
         for sid in FRED_SERIES.keys():
@@ -878,7 +914,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         try:
             fred_drivers = compute_fred_drivers()
         except Exception:
-            fred_drivers = {"XAU": [], "US500": [], "WTI": []}
+            fred_drivers = {a: [] for a in ASSETS}
 
     # Event mode
     upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
@@ -968,10 +1004,8 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         evidence_count = len(contribs)
         src_div = len(set([w["source"] for w in contribs])) if contribs else 0
 
-        # Consensus/conflict
         consensus_ratio, conflict_index, _abs_sum = _consensus_stats(contribs)
 
-        # Quality v2
         strength_2 = min(1.2, abs(score) / max(th, 1e-9))
         ev_term = min(1.0, evidence_count / 18.0)
         div_term = min(1.0, src_div / 7.0)
@@ -983,7 +1017,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         if fresh_total > 0:
             fresh_score = min(1.0, (fresh02 * 1.0 + fresh28 * 0.6) / max(1.0, fresh_total))
 
-        # Event penalty (slight)
         event_penalty = 0.15 if event_mode else 0.0
 
         raw_v2 = (
@@ -1081,14 +1114,12 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     p_assets = (prev.get("assets", {}) or {})
     c_assets = (cur.get("assets", {}) or {})
 
-    # Event mode flip
     p_ev = bool((prev.get("event", {}) or {}).get("event_mode", False))
     c_ev = bool((cur.get("event", {}) or {}).get("event_mode", False))
     if p_ev != c_ev:
         push("event_mode_flip", f"EVENT MODE {'ON' if c_ev else 'OFF'}", asset=None, severity="WARN",
              extra={"prev": p_ev, "cur": c_ev, "reason": (cur.get("event", {}) or {}).get("reason", [])})
 
-    # Per-asset diffs
     q2_drop_th = int(ALERT_CFG.get("q2_drop", 12))
     conflict_spike_th = float(ALERT_CFG.get("conflict_spike", 0.18))
 
@@ -1114,7 +1145,6 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
             push("conflict_spike", f"{a} conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})", asset=a, severity="WARN",
                  extra={"prev": pc, "cur": cc})
 
-    # Feeds degraded flip based on ratio
     p_meta = (prev.get("meta", {}) or {})
     c_meta = (cur.get("meta", {}) or {})
     p_fs = (p_meta.get("feeds_status", {}) or {})
@@ -1141,7 +1171,7 @@ def pipeline_run():
     inserted_news = ingest_news_once(limit_per_feed=40)
     inserted_cal = ingest_calendar_once(limit_per_feed=250)
 
-    payload = compute_bias(lookback_hours=24, limit_rows=1200)
+    payload = compute_bias(lookback_hours=24, limit_rows=1400)
 
     feeds_status = feeds_health_live()
 
@@ -1225,6 +1255,57 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
     }
 
 # ============================================================
+# TOP NEWS (strong headlines)
+# ============================================================
+
+def get_top_news(limit: int = 18, lookback_hours: int = 24) -> List[Dict[str, Any]]:
+    """
+    "Главные новости" = самые свежие + с высоким source_weight.
+    Плюс: приоритет макро источникам и тем, что матчится хотя бы к одному активу (чтобы не был мусор).
+    """
+    now = int(time.time())
+    cutoff = now - int(lookback_hours * 3600)
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source, title, link, published_ts
+                FROM news_items
+                WHERE published_ts >= %s
+                ORDER BY published_ts DESC
+                LIMIT %s;
+            """, (cutoff, max(300, limit * 20)))
+            rows = cur.fetchall()
+
+    out: List[Dict[str, Any]] = []
+    for (source, title, link, ts) in rows:
+        sw = float(SOURCE_WEIGHT.get(source, 1.0))
+        age_min = int(max(0, now - int(ts)) / 60)
+        # keep if it matches any asset rules OR it is macro top-tier
+        matched_assets = []
+        for a in ASSETS:
+            if match_rules(a, title):
+                matched_assets.append(a)
+        if (not matched_assets) and source not in ("FED", "BLS", "BEA", "MARKETWATCH_REALTIME", "MARKETWATCH_TOP"):
+            continue
+
+        score = sw * decay_weight(max(0, now - int(ts)))
+        out.append({
+            "source": source,
+            "title": title,
+            "link": link,
+            "published_ts": int(ts),
+            "age_min": age_min,
+            "src_w": round(sw, 2),
+            "rank": round(score, 6),
+            "matches": matched_assets[:4],
+        })
+        if len(out) >= limit:
+            break
+
+    return out
+
+# ============================================================
 # API
 # ============================================================
 
@@ -1239,6 +1320,7 @@ def health(pretty: int = 0):
     out = {
         "ok": True,
         "gate_profile": GATE_PROFILE,
+        "assets": ASSETS,
         "trump_enabled": bool(TRUMP_ENABLED),
         "fred_enabled": bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None),
         "calendar_sources": list(CALENDAR_FEEDS),
@@ -1284,7 +1366,7 @@ def diag():
 
 @app.get("/rules")
 def rules():
-    return {"assets": ASSETS, "rules": RULES}
+    return {"assets": ASSETS, "rules": RULES, "bias_thresholds": BIAS_THRESH}
 
 @app.get("/bias")
 def bias(pretty: int = 0):
@@ -1334,6 +1416,12 @@ def latest(limit: int = 40):
             """, (limit,))
             rows = cur.fetchall()
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
+
+@app.get("/top_news")
+def top_news(limit: int = 18):
+    db_init()
+    items = get_top_news(limit=int(max(6, min(60, limit))), lookback_hours=24)
+    return {"updated_utc": datetime.now(timezone.utc).isoformat(), "items": items}
 
 @app.get("/calendar_data")
 def calendar_data(limit: int = 120, hours_back: int = 12, hours_fwd: int = 48):
@@ -1406,13 +1494,15 @@ def morning_plan():
         "event_reason": event.get("reason", []),
         "upcoming_events": (event.get("upcoming_events", []) or [])[:6],
         "alerts": (meta.get("alerts", []) or [])[:25],
-        "plan": {"XAU": pack("XAU"), "US500": pack("US500"), "WTI": pack("WTI")}
+        "plan": {a: pack(a) for a in ASSETS}
     }
     return JSONResponse(out)
 
-# MyFXBook calendar page (standalone)
+# MyFXBook calendar page (standalone) — dark via iframe filter (cross-origin safe)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
-def myfx_calendar():
+def myfx_calendar(dark: int = 1):
+    # dark=1 applies invert/hue-rotate filter to flip white widget to dark look
+    filt = "filter: invert(1) hue-rotate(180deg) saturate(1.2) contrast(1.05);" if int(dark) == 1 else ""
     html = f"""<!doctype html>
 <html><head>
 <meta charset="utf-8">
@@ -1421,12 +1511,26 @@ def myfx_calendar():
 <style>
 html,body{{height:100%;margin:0;background:#070a0f;color:#d7e2ff;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial}}
 .wrap{{height:100%;}}
-iframe{{border:0;width:100%;height:100%;}}
+iframe{{border:0;width:100%;height:100%; {filt} }}
+.top{{position:fixed; top:10px; right:10px; z-index:10;}}
+.btn{{background:#0f1724;border:1px solid rgba(255,255,255,.08);color:#d7e2ff;padding:8px 10px;border-radius:10px;font-family:ui-monospace,Menlo,Consolas; font-weight:900; cursor:pointer;}}
+.btn:hover{{background:#162238;}}
 </style>
 </head><body>
-<div class="wrap">
-<iframe src="{MYFXBOOK_IFRAME_SRC}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+<div class="top">
+  <button class="btn" onclick="toggleDark()">{'DARK: on' if int(dark)==1 else 'DARK: off'}</button>
 </div>
+<div class="wrap">
+<iframe id="f" src="{MYFXBOOK_IFRAME_SRC}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+</div>
+<script>
+function toggleDark(){{
+  const u = new URL(location.href);
+  const cur = (u.searchParams.get('dark')||'1');
+  u.searchParams.set('dark', cur==='1' ? '0' : '1');
+  location.href = u.toString();
+}}
+</script>
 </body></html>"""
     return HTMLResponse(html)
 
@@ -1582,7 +1686,6 @@ def dashboard():
     .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .no{color:var(--no); border-color: rgba(255,59,59,.25);}
     .warn{color:var(--warn); border-color: rgba(255,176,0,.25);}
-    .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:8px;}
     .hotkeys{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px;}
     .btn{background:var(--btn); border:1px solid var(--line); color:var(--text); padding:9px 12px; border-radius:12px; cursor:pointer; font-family:var(--mono); font-weight:900;}
     .btn:hover{background:var(--btn2);}
@@ -1613,17 +1716,18 @@ def dashboard():
     .toast .k{color:var(--cyan); font-weight:900;}
     .toast.warn{border-color: rgba(255,176,0,.25);}
     .toast.bad{border-color: rgba(255,59,59,.25);}
-    .tickerline{margin-top:8px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); padding:8px 0; overflow:hidden;}
-    .marquee{display:flex; gap:40px; align-items:center; white-space:nowrap; will-change:transform; animation: scroll 28s linear infinite;}
-    .marquee:hover{animation-play-state:paused;}
-    @keyframes scroll{
-      0%{transform: translateX(0);}
-      100%{transform: translateX(-50%);}
-    }
-    .tick{font-family:var(--mono); font-size:12px; color:var(--muted);}
-    .tick b{color:var(--amber);}
-    .tick .tag{color:var(--cyan); font-weight:900;}
-    .tvwrap{margin-top:10px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+
+    /* 3-level blocks */
+    .lvl{margin-top:10px;}
+    .tvwrap{border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+    .alertsPanel .item{display:flex; gap:10px; align-items:flex-start;}
+    .tag{color:var(--cyan); font-weight:900;}
+    .sev{min-width:72px; text-align:center; padding:4px 8px; border:1px solid var(--line); border-radius:999px; font-weight:900;}
+    .sev.warn{color:var(--warn); border-color: rgba(255,176,0,.25);}
+    .sev.info{color:#b8c3da;}
+    .sev.bad{color:var(--no); border-color: rgba(255,59,59,.25);}
+
+    .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:8px;}
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
@@ -1631,6 +1735,7 @@ def dashboard():
     .modal .body{padding:12px;}
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
+
     @media(max-width: 780px){
       .why{max-width:none;}
       th:nth-child(11), td:nth-child(11) {display:none;}
@@ -1646,31 +1751,10 @@ def dashboard():
     <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
     <div class="sub">updated_utc=__UPDATED__ • gate_profile=__GATE_PROFILE__ • event_mode=__EVENT_MODE__ • trump=__TRUMP__</div>
 
-    <div class="tick">
-      <span class="tag">Next event:</span> __NEXT_EVENT__
-      <span class="muted">• event_reason: __EVENT_REASON__</span>
-    </div>
-
-    <!-- LIVE markets tape -->
-    <div class="tvwrap">
-      <div class="tradingview-widget-container">
-        <div class="tradingview-widget-container__widget"></div>
-        <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
-        {
-          "symbols": __TV_SYMBOLS__,
-          "showSymbolLogo": true,
-          "isTransparent": true,
-          "displayMode": "adaptive",
-          "colorTheme": "dark",
-          "locale": "en"
-        }
-        </script>
+    <div class="list" style="margin-top:6px;">
+      <div class="item" style="border-top:none; padding-top:6px;">
+        <div class="m"><span class="tag">Next event:</span> __NEXT_EVENT__ • <span class="muted">event_reason: __EVENT_REASON__</span></div>
       </div>
-    </div>
-
-    <!-- Your internal marquee (alerts + bias snapshots) -->
-    <div class="tickerline">
-      <div class="marquee" id="marquee"></div>
     </div>
 
     <div class="bar">
@@ -1689,10 +1773,52 @@ def dashboard():
       <button class="btn" onclick="openJson()">J JSON</button>
       <button class="btn" onclick="openAnalyst()">A ANALYST</button>
     </div>
-    <div class="hotkeys">Hotkeys: 1/2/3 view • R run • M morning • C calendar • E myfx • J json • A analyst • Esc close</div>
+    <div class="hotkeys">Hotkeys: R run • M morning • C calendar • E myfx • J json • A analyst • 1..5 view • Esc close</div>
+
+    <!-- LEVEL 1: LIVE prices -->
+    <div class="lvl">
+      <div class="panel">
+        <div class="h2">LIVE PRICES (TradingView tape, IC Markets)</div>
+        <div class="tvwrap">
+          <div class="tradingview-widget-container">
+            <div class="tradingview-widget-container__widget"></div>
+            <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+            {
+              "symbols": __TV_SYMBOLS__,
+              "showSymbolLogo": true,
+              "isTransparent": true,
+              "displayMode": "adaptive",
+              "colorTheme": "dark",
+              "locale": "en"
+            }
+            </script>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- LEVEL 2: ALERTS -->
+    <div class="lvl">
+      <div class="panel alertsPanel" id="alertsPanel">
+        <div class="h2">ALERTS (server diff)</div>
+        <div class="list" id="alertsList"></div>
+        <div class="kz">This block is intentionally separated from prices and news to reduce “noise mixing”.</div>
+      </div>
+    </div>
+
+    <!-- LEVEL 3: TOP NEWS -->
+    <div class="lvl">
+      <div class="panel" id="newsPanel">
+        <div class="h2">TOP NEWS (strong + relevant)</div>
+        <div class="list" id="topNewsList"></div>
+        <div class="kz">Ranking: source_weight × freshness (and must match at least one asset rule, unless macro source).</div>
+      </div>
+    </div>
+
   </div>
 
   <div class="panel">
+    <div class="h2">BIAS + GATE (snapshot)</div>
     <table>
       <thead>
         <tr>
@@ -1711,9 +1837,7 @@ def dashboard():
         </tr>
       </thead>
       <tbody>
-        __ROW_XAU__
-        __ROW_US500__
-        __ROW_WTI__
+        __ROWS__
       </tbody>
     </table>
 
@@ -1781,31 +1905,59 @@ def dashboard():
   function toast(kind, msg, sev){
     const w = $('toasts');
     const div = document.createElement('div');
-    div.className = 'toast ' + ((sev||'').toLowerCase()==='warn' ? 'warn' : '');
+    const s = (sev||'').toLowerCase();
+    div.className = 'toast ' + (s==='warn' ? 'warn' : '');
     div.innerHTML = '<div class="k">' + escapeHtml(kind) + '</div><div>' + escapeHtml(msg) + '</div>';
     w.appendChild(div);
     setTimeout(()=>{ try{ div.remove(); }catch(e){} }, 9000);
   }
 
-  function buildTicker(){
-    const parts = [];
+  function renderAlerts(){
+    const box = $('alertsList');
+    if(!box) return;
+    if(!ALERTS || !ALERTS.length){
+      box.innerHTML = '<div class="item"><div class="m muted">No alerts (diff engine quiet).</div></div>';
+      return;
+    }
+    box.innerHTML = ALERTS.slice(0, 10).map(a=>{
+      const sev = (a.severity||'WARN').toLowerCase();
+      const cls = (sev==='warn') ? 'warn' : (sev==='bad' ? 'bad' : 'info');
+      return `
+        <div class="item">
+          <div class="sev ${cls}">${escapeHtml((a.severity||'WARN'))}</div>
+          <div style="flex:1;">
+            <div class="t"><span class="tag">${escapeHtml(a.kind||'ALERT')}</span> ${a.asset ? ('• <b>'+escapeHtml(a.asset)+'</b>') : ''}</div>
+            <div class="m">${escapeHtml(a.message||'')}</div>
+          </div>
+        </div>
+      `;
+    }).join('');
+  }
 
-    (ALERTS || []).slice(0, 6).forEach(a=>{
-      parts.push('<span class="tick"><span class="tag">ALERT</span> <b>' + escapeHtml(a.kind) + '</b> • ' + escapeHtml(a.message) + '</span>');
-    });
-
-    const a = PAYLOAD.assets || {};
-    ['XAU','US500','WTI'].forEach(sym=>{
-      const x = a[sym] || {};
-      const b = x.bias || '—';
-      const q2 = x.quality_v2 ?? '—';
-      const c = x.conflict_index ?? '—';
-      const cTxt = (typeof c === 'number') ? c.toFixed(3) : (Number(c).toFixed ? Number(c).toFixed(3) : c);
-      parts.push('<span class="tick"><span class="tag">' + sym + '</span> bias=<b>' + escapeHtml(b) + '</b> q2=<b>' + escapeHtml(q2) + '</b> conflict=' + escapeHtml(cTxt) + '</span>');
-    });
-
-    const line = parts.join(' <span class="tick muted">•</span> ');
-    $('marquee').innerHTML = line + ' <span class="tick muted">•</span> ' + line;
+  async function renderTopNews(){
+    const box = $('topNewsList');
+    if(!box) return;
+    try{
+      const resp = await fetch('/top_news?limit=18');
+      const js = await resp.json();
+      const items = js.items || [];
+      if(!items.length){
+        box.innerHTML = '<div class="item"><div class="m muted">No top news (yet). Run ingest or widen lookback.</div></div>';
+        return;
+      }
+      box.innerHTML = items.map((x,i)=>{
+        const m = (x.matches||[]).join(',');
+        return `
+          <div class="item">
+            <div class="t">${i+1}. ${escapeHtml(x.title||'')}</div>
+            <div class="m">src=${escapeHtml(x.source||'')} • age=${escapeHtml(x.age_min||0)}m • src_w=${escapeHtml(x.src_w)} • matches=${escapeHtml(m||'—')}</div>
+            <div class="lnk"><a href="${escapeHtml(x.link||'#')}" target="_blank" rel="noopener">Open source</a></div>
+          </div>
+        `;
+      }).join('');
+    }catch(e){
+      box.innerHTML = '<div class="item"><div class="m">Error loading top news: ' + escapeHtml(String(e)) + '</div></div>';
+    }
   }
 
   function openView(asset){
@@ -1864,13 +2016,10 @@ def dashboard():
     `;
 
     const headHtml = `
-      <div class="tick" style="margin-bottom:10px;">
-        <span class="tag">${asset}</span>
-        bias=<b>${escapeHtml(a.bias||'')}</b>
-        score=<b>${escapeHtml(a.score)}</b>
-        th=${escapeHtml(a.threshold)}
-        q2=<b>${escapeHtml(a.quality_v2)}</b>
-        conflict=${escapeHtml(a.conflict_index)}
+      <div class="list" style="margin-bottom:10px;">
+        <div class="item" style="border-top:none;">
+          <div class="t"><span class="tag">${asset}</span> bias=<b>${escapeHtml(a.bias||'')}</b> score=<b>${escapeHtml(a.score)}</b> th=${escapeHtml(a.threshold)} q2=<b>${escapeHtml(a.quality_v2)}</b> conflict=${escapeHtml(a.conflict_index)}</div>
+        </div>
       </div>
     `;
 
@@ -1914,7 +2063,7 @@ def dashboard():
 
   async function openCalendar(){
     try{
-      const resp = await fetch('/calendar_data?limit=160&hours_back=12&hours_fwd=48');
+      const resp = await fetch('/calendar_data?limit=180&hours_back=12&hours_fwd=48');
       const js = await resp.json();
       const items = js.items || [];
 
@@ -1962,7 +2111,7 @@ def dashboard():
               `).join('')}
             </tbody>
           </table>
-          <div class="kz">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>
+          <div class="kz">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently.</div>
         </div>
       `;
       showModal('CALENDAR (DB)', table);
@@ -1974,11 +2123,11 @@ def dashboard():
   function openMyfx(){
     const html = `
       <div class="panel">
-        <div class="h2">MyFXBook Economic Calendar</div>
+        <div class="h2">MyFXBook Economic Calendar (dark forced)</div>
         <div class="iframebox">
-          <iframe src="/myfx_calendar" loading="lazy"></iframe>
+          <iframe src="/myfx_calendar?dark=1" loading="lazy"></iframe>
         </div>
-        <div class="kz">Tip: if the widget is blocked by browser policy, open /myfx_calendar in a new tab.</div>
+        <div class="kz">If your browser blocks widgets, open /myfx_calendar in a new tab.</div>
       </div>
     `;
     showModal('MYFX CAL', html);
@@ -2004,9 +2153,7 @@ def dashboard():
       event_mode: ev.event_mode,
       event_reason: ev.reason,
       alerts: (PAYLOAD.meta && PAYLOAD.meta.alerts) ? PAYLOAD.meta.alerts.slice(0,10) : [],
-      xau: {bias:a.XAU?.bias, score:a.XAU?.score, q2:a.XAU?.quality_v2, conflict:a.XAU?.conflict_index, flip:a.XAU?.flip},
-      us500: {bias:a.US500?.bias, score:a.US500?.score, q2:a.US500?.quality_v2, conflict:a.US500?.conflict_index, flip:a.US500?.flip},
-      wti: {bias:a.WTI?.bias, score:a.WTI?.score, q2:a.WTI?.quality_v2, conflict:a.WTI?.conflict_index, flip:a.WTI?.flip},
+      assets: a
     };
     showModal('ANALYST SNAPSHOT', '<div class="panel"><div class="h2">JSON</div><div class="list"><div class="item"><pre style="margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px;">' + escapeHtml(JSON.stringify(s,null,2)) + '</pre></div></div></div>');
   }
@@ -2020,14 +2167,18 @@ def dashboard():
     if(k === 'e') openMyfx();
     if(k === 'j') openJson();
     if(k === 'a') openAnalyst();
-    if(k === '1') openView('XAU');
-    if(k === '2') openView('US500');
-    if(k === '3') openView('WTI');
+    if(k === '1') openView('US500');
+    if(k === '2') openView('XAU');
+    if(k === '3') openView('EURUSD');
+    if(k === '4') openView('XTI');
+    if(k === '5') openView('BTC');
   });
 
   $('modal').addEventListener('click', (e)=>{ if(e.target && e.target.id === 'modal') closeModal(); });
 
-  buildTicker();
+  renderAlerts();
+  renderTopNews();
+
   (ALERTS||[]).slice(0,6).forEach(a=>{
     toast(a.kind, a.message, a.severity || 'WARN');
   });
@@ -2035,6 +2186,8 @@ def dashboard():
 </body>
 </html>
 """
+
+    rows_html = "\n".join([row(a) for a in ASSETS])
 
     html = (TEMPLATE
         .replace("__UPDATED__", str(updated))
@@ -2047,9 +2200,7 @@ def dashboard():
         .replace("__TR_PILL__", tr_pill)
         .replace("__FEEDS_PILL__", feeds_pill)
         .replace("__FRED_PILL__", fred_pill)
-        .replace("__ROW_XAU__", row("XAU"))
-        .replace("__ROW_US500__", row("US500"))
-        .replace("__ROW_WTI__", row("WTI"))
+        .replace("__ROWS__", rows_html)
         .replace("__JS_PAYLOAD__", js_payload)
         .replace("__TV_SYMBOLS__", tv_symbols)
     )

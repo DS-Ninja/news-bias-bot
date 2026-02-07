@@ -1,12 +1,10 @@
 # app.py
 # NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# - Fix: RSS timestamp uses UTC (calendar.timegm)
-# - Fix: /run POST auth (token required when RUN_TOKEN set)
-# - Adds: Myfxbook RSS (news + calendar + community)
-# - Adds: Econ calendar store + /calendar UI (TradingView-ish table, best-effort from RSS)
-# - Adds: Alert engine (server diff) + client toasts
-# - Adds: Ticker marquee auto-scroll
-# - Fix: View modal renders nicely (not raw code)
+# - FIX: UI buttons open MODALS (no raw code tabs)
+# - ADD: Myfxbook Economic Calendar iframe in modal + /myfx_calendar route
+# - ADD: TradingView Markets Ticker Tape (live prices) + keep Alerts/Bias marquee
+# - FIX: RUN with RUN_TOKEN prompts once and stores token in localStorage (UI-safe)
+# - KEEP: RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
 
 import os
 import json
@@ -106,6 +104,19 @@ FRED_SERIES = {
 # Token for /run GET/POST (cron)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 
+# MyFXBook widget iframe (as requested)
+MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
+
+# TradingView ticker tape symbols (edit as you like)
+# Note: symbols are TradingView ids. Your broker CFDs can differ; these are common proxies.
+TV_TICKER_SYMBOLS = [
+    {"proName": "OANDA:XAUUSD", "title": "XAUUSD"},
+    {"proName": "OANDA:EURUSD", "title": "EURUSD"},
+    {"proName": "SP:SPX", "title": "US500"},
+    {"proName": "TVC:USOIL", "title": "WTI"},
+    {"proName": "OANDA:USDJPY", "title": "USDJPY"},
+]
+
 # RSS feeds
 RSS_FEEDS: Dict[str, str] = {
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
@@ -138,7 +149,7 @@ RSS_FEEDS: Dict[str, str] = {
     # Calendar mirrors
     "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
 
-    # Myfxbook (requested)
+    # Myfxbook RSS
     "MYFX_CAL": "https://www.myfxbook.com/rss/forex-economic-calendar-events",
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "MYFX_COMM": "https://www.myfxbook.com/rss/forex-community-recent-topics",
@@ -363,7 +374,6 @@ def _ts_from_entry(e: dict, now_ts: int) -> int:
             return int(calendar.timegm(pp))
         except Exception:
             return int(now_ts)
-    # Try updated_parsed
     up = e.get("updated_parsed")
     if up:
         try:
@@ -432,8 +442,8 @@ def ingest_news_once(limit_per_feed: int = 40) -> int:
                         continue
 
                     published_ts = _ts_from_entry(e, now)
-
                     fp = fingerprint(title, link)
+
                     try:
                         cur.execute("""
                             INSERT INTO news_items(source, title, link, published_ts, fingerprint)
@@ -463,7 +473,6 @@ def _parse_calendar_fields(title: str, summary: str) -> Dict[str, Optional[str]]
     """
     t = (title or "").strip()
     s = (summary or "").strip()
-
     blob = (t + " " + s).strip()
 
     impact = None
@@ -481,8 +490,6 @@ def _parse_calendar_fields(title: str, summary: str) -> Dict[str, Optional[str]]
     if m:
         currency = m.group(1).upper()
 
-    # Attempt to extract A/P/F/C style tokens if present
-    # Examples vary wildly; we just try common patterns.
     def pick(pat: str) -> Optional[str]:
         mm = re.search(pat, blob, flags=re.I)
         if mm:
@@ -518,6 +525,7 @@ def ingest_calendar_once(limit_per_feed: int = 200) -> int:
                     d = feedparser.parse(url)
                 except Exception:
                     continue
+
                 entries = getattr(d, "entries", []) or []
                 if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
                     continue
@@ -559,7 +567,6 @@ def ingest_calendar_once(limit_per_feed: int = 200) -> int:
                             inserted += 1
                     except Exception:
                         pass
-
         conn.commit()
 
     return inserted
@@ -577,14 +584,9 @@ def _macro_recent_flag(rows: List[Tuple[str, str, str, int]], now_ts: int) -> bo
     return False
 
 def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
-    """
-    Pull upcoming events from DB calendar store first (better than raw RSS),
-    fallback to RSS if DB empty.
-    """
     lookahead_sec = int(EVENT_CFG["lookahead_hours"] * 3600)
     horizon = now_ts + lookahead_sec
 
-    # Try DB with event_ts
     out: List[Dict[str, Any]] = []
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -609,7 +611,6 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
-    # Fallback: show 1-2 from DB even if time unknown
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1032,6 +1033,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
                 "requests_present": bool(requests is not None),
             },
             "trump": trump,
+            "run_token_required": bool(RUN_TOKEN),
         },
         "event": {
             "enabled": bool(EVENT_CFG["enabled"]),
@@ -1136,21 +1138,17 @@ def pipeline_run():
 
     prev = load_bias()
 
-    # ingest
     inserted_news = ingest_news_once(limit_per_feed=40)
     inserted_cal = ingest_calendar_once(limit_per_feed=250)
 
-    # compute
     payload = compute_bias(lookback_hours=24, limit_rows=1200)
 
-    # feed health (live) — can be heavy, but kept here per your current design
     feeds_status = feeds_health_live()
 
     payload["meta"]["inserted_news_last_run"] = int(inserted_news)
     payload["meta"]["inserted_calendar_last_run"] = int(inserted_cal)
     payload["meta"]["feeds_status"] = feeds_status
 
-    # alerts
     alerts = compute_alerts(prev, payload)
     payload["meta"]["alerts"] = alerts[:25]
 
@@ -1244,6 +1242,7 @@ def health(pretty: int = 0):
         "trump_enabled": bool(TRUMP_ENABLED),
         "fred_enabled": bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None),
         "calendar_sources": list(CALENDAR_FEEDS),
+        "run_token_required": bool(RUN_TOKEN),
     }
     if pretty:
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
@@ -1260,6 +1259,7 @@ def diag():
         "PGSSLMODE": os.environ.get("PGSSLMODE", "prefer"),
         "FRED_enabled": bool(FRED_CFG["enabled"]),
         "requests_present": bool(requests is not None),
+        "RUN_TOKEN_set": bool(RUN_TOKEN),
     }
     ok = True
     news_items = 0
@@ -1313,7 +1313,6 @@ def run_get(token: str = ""):
 
 @app.post("/run")
 def run_post(token: str = ""):
-    # FIX: when RUN_TOKEN set, token is REQUIRED
     if RUN_TOKEN and not _auth_run(token):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
@@ -1411,6 +1410,26 @@ def morning_plan():
     }
     return JSONResponse(out)
 
+# MyFXBook calendar page (standalone)
+@app.get("/myfx_calendar", response_class=HTMLResponse)
+def myfx_calendar():
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MyFXBook Calendar</title>
+<style>
+html,body{{height:100%;margin:0;background:#070a0f;color:#d7e2ff;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial}}
+.wrap{{height:100%;}}
+iframe{{border:0;width:100%;height:100%;}}
+</style>
+</head><body>
+<div class="wrap">
+<iframe src="{MYFXBOOK_IFRAME_SRC}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
+</div>
+</body></html>"""
+    return HTMLResponse(html)
+
 # ============================================================
 # UI — Terminal
 # ============================================================
@@ -1442,7 +1461,6 @@ def dashboard():
     meta = payload.get("meta", {}) or {}
     event = payload.get("event", {}) or {}
     feeds_status = meta.get("feeds_status", {}) or {}
-    alerts = (meta.get("alerts", []) or [])[:25]
 
     updated = payload.get("updated_utc", "")
     gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
@@ -1519,6 +1537,7 @@ def dashboard():
         """
 
     js_payload = json.dumps(payload, ensure_ascii=False)
+    tv_symbols = json.dumps(TV_TICKER_SYMBOLS, ensure_ascii=False)
 
     TEMPLATE = """<!doctype html>
 <html>
@@ -1604,11 +1623,14 @@ def dashboard():
     .tick{font-family:var(--mono); font-size:12px; color:var(--muted);}
     .tick b{color:var(--amber);}
     .tick .tag{color:var(--cyan); font-weight:900;}
+    .tvwrap{margin-top:10px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
                  display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
     .modal .body{padding:12px;}
+    .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+    .iframebox iframe{width:100%; height:100%; border:0;}
     @media(max-width: 780px){
       .why{max-width:none;}
       th:nth-child(11), td:nth-child(11) {display:none;}
@@ -1629,6 +1651,24 @@ def dashboard():
       <span class="muted">• event_reason: __EVENT_REASON__</span>
     </div>
 
+    <!-- LIVE markets tape -->
+    <div class="tvwrap">
+      <div class="tradingview-widget-container">
+        <div class="tradingview-widget-container__widget"></div>
+        <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+        {
+          "symbols": __TV_SYMBOLS__,
+          "showSymbolLogo": true,
+          "isTransparent": true,
+          "displayMode": "adaptive",
+          "colorTheme": "dark",
+          "locale": "en"
+        }
+        </script>
+      </div>
+    </div>
+
+    <!-- Your internal marquee (alerts + bias snapshots) -->
     <div class="tickerline">
       <div class="marquee" id="marquee"></div>
     </div>
@@ -1644,12 +1684,12 @@ def dashboard():
     <div class="btnrow">
       <button class="btn" onclick="runNow()">R RUN</button>
       <button class="btn" onclick="openMorning()">M MORNING</button>
-      <button class="btn" onclick="openCalendar()">C CALENDAR</button>
+      <button class="btn" onclick="openCalendar()">C CAL (DB)</button>
+      <button class="btn" onclick="openMyfx()">E MYFX CAL</button>
       <button class="btn" onclick="openJson()">J JSON</button>
       <button class="btn" onclick="openAnalyst()">A ANALYST</button>
-      <a class="btn" href="/bias?pretty=1" target="_blank" rel="noopener">Bias JSON</a>
     </div>
-    <div class="hotkeys">Hotkeys: 1/2/3 view • R run • M morning • C calendar • J json • A analyst • Esc close</div>
+    <div class="hotkeys">Hotkeys: 1/2/3 view • R run • M morning • C calendar • E myfx • J json • A analyst • Esc close</div>
   </div>
 
   <div class="panel">
@@ -1698,6 +1738,7 @@ def dashboard():
 <script>
   const PAYLOAD = __JS_PAYLOAD__;
   const ALERTS = (PAYLOAD.meta && PAYLOAD.meta.alerts) ? PAYLOAD.meta.alerts : [];
+  const RUN_TOKEN_REQUIRED = !!(PAYLOAD.meta && PAYLOAD.meta.run_token_required);
 
   function $(id){ return document.getElementById(id); }
   function escapeHtml(s){
@@ -1709,13 +1750,23 @@ def dashboard():
     $('mb').innerHTML = html;
     $('modal').style.display = 'block';
   }
-  function closeModal(){
-    $('modal').style.display = 'none';
+  function closeModal(){ $('modal').style.display = 'none'; }
+
+  function getRunToken(){
+    if(!RUN_TOKEN_REQUIRED) return '';
+    let t = localStorage.getItem('run_token') || '';
+    if(!t){
+      t = prompt('RUN_TOKEN is required. Paste token:') || '';
+      if(t) localStorage.setItem('run_token', t);
+    }
+    return t || '';
   }
 
   async function runNow(){
     try{
-      const resp = await fetch('/run', { method:'POST' });
+      const token = getRunToken();
+      const url = token ? ('/run?token=' + encodeURIComponent(token)) : '/run';
+      const resp = await fetch(url, { method:'POST' });
       const js = await resp.json();
       if(js.ok === false && js.error){
         showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
@@ -1739,22 +1790,20 @@ def dashboard():
   function buildTicker(){
     const parts = [];
 
-    // Alerts first (top 6)
     (ALERTS || []).slice(0, 6).forEach(a=>{
       parts.push('<span class="tick"><span class="tag">ALERT</span> <b>' + escapeHtml(a.kind) + '</b> • ' + escapeHtml(a.message) + '</span>');
     });
 
-    // Per-asset snapshot
     const a = PAYLOAD.assets || {};
     ['XAU','US500','WTI'].forEach(sym=>{
       const x = a[sym] || {};
       const b = x.bias || '—';
       const q2 = x.quality_v2 ?? '—';
       const c = x.conflict_index ?? '—';
-      parts.push('<span class="tick"><span class="tag">' + sym + '</span> bias=<b>' + escapeHtml(b) + '</b> q2=<b>' + escapeHtml(q2) + '</b> conflict=' + escapeHtml(Number(c).toFixed ? Number(c).toFixed(3) : c) + '</span>');
+      const cTxt = (typeof c === 'number') ? c.toFixed(3) : (Number(c).toFixed ? Number(c).toFixed(3) : c);
+      parts.push('<span class="tick"><span class="tag">' + sym + '</span> bias=<b>' + escapeHtml(b) + '</b> q2=<b>' + escapeHtml(q2) + '</b> conflict=' + escapeHtml(cTxt) + '</span>');
     });
 
-    // Duplicate the string to make smooth loop (-50% trick)
     const line = parts.join(' <span class="tick muted">•</span> ');
     $('marquee').innerHTML = line + ' <span class="tick muted">•</span> ' + line;
   }
@@ -1800,7 +1849,7 @@ def dashboard():
 
     const whyHtml = `
       <div class="panel">
-        <div class="h2">WHY top 5 (rendered, not raw code)</div>
+        <div class="h2">WHY top 5</div>
         <div class="list">
           ${(why5.length? why5 : [{why:'—'}]).map((x,i)=>`
             <div class="item">
@@ -1842,9 +1891,9 @@ def dashboard():
         <div class="h2">Meta</div>
         <div class="kv">
           <div class="k">gate_profile</div><div>${escapeHtml(meta.gate_profile||'')}</div>
-          <div class="k">feeds_ok_ratio</div><div>${escapeHtml((meta.feeds_status? (Object.keys(meta.feeds_status).length>0 ? '' : '') : ''))}</div>
           <div class="k">fred_enabled</div><div>${escapeHtml(meta.fred && meta.fred.enabled)}</div>
           <div class="k">trump_flag</div><div>${escapeHtml(meta.trump && meta.trump.flag)}</div>
+          <div class="k">run_token_required</div><div>${escapeHtml(meta.run_token_required)}</div>
         </div>
       </div>
     `;
@@ -1865,10 +1914,9 @@ def dashboard():
 
   async function openCalendar(){
     try{
-      const resp = await fetch('/calendar_data?limit=140&hours_back=12&hours_fwd=48');
+      const resp = await fetch('/calendar_data?limit=160&hours_back=12&hours_fwd=48');
       const js = await resp.json();
       const items = js.items || [];
-      const now = js.now_ts || 0;
 
       function fmtTs(ts){
         if(!ts) return '(time unknown)';
@@ -1878,7 +1926,7 @@ def dashboard():
 
       const table = `
         <div class="panel">
-          <div class="h2">ECON CALENDAR (best-effort from RSS)</div>
+          <div class="h2">ECON CALENDAR (DB, best-effort from RSS)</div>
           <table>
             <thead>
               <tr>
@@ -1917,10 +1965,23 @@ def dashboard():
           <div class="kz">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>
         </div>
       `;
-      showModal('CALENDAR', table);
+      showModal('CALENDAR (DB)', table);
     }catch(e){
       showModal('CALENDAR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
+  }
+
+  function openMyfx(){
+    const html = `
+      <div class="panel">
+        <div class="h2">MyFXBook Economic Calendar</div>
+        <div class="iframebox">
+          <iframe src="/myfx_calendar" loading="lazy"></iframe>
+        </div>
+        <div class="kz">Tip: if the widget is blocked by browser policy, open /myfx_calendar in a new tab.</div>
+      </div>
+    `;
+    showModal('MYFX CAL', html);
   }
 
   async function openJson(){
@@ -1956,6 +2017,7 @@ def dashboard():
     if(k === 'r') runNow();
     if(k === 'm') openMorning();
     if(k === 'c') openCalendar();
+    if(k === 'e') openMyfx();
     if(k === 'j') openJson();
     if(k === 'a') openAnalyst();
     if(k === '1') openView('XAU');
@@ -1965,12 +2027,10 @@ def dashboard():
 
   $('modal').addEventListener('click', (e)=>{ if(e.target && e.target.id === 'modal') closeModal(); });
 
-  // Init ticker + show alerts as toasts (once per page load)
   buildTicker();
   (ALERTS||[]).slice(0,6).forEach(a=>{
     toast(a.kind, a.message, a.severity || 'WARN');
   });
-
 </script>
 </body>
 </html>
@@ -1991,6 +2051,7 @@ def dashboard():
         .replace("__ROW_US500__", row("US500"))
         .replace("__ROW_WTI__", row("WTI"))
         .replace("__JS_PAYLOAD__", js_payload)
+        .replace("__TV_SYMBOLS__", tv_symbols)
     )
 
     return HTMLResponse(html)

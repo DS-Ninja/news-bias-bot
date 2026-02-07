@@ -9,6 +9,20 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call /run endpoint
+      - name: Call /run endpoint (POST)
         run: |
-          curl -fsS "https://web-production-9bcf3.up.railway.app/run" > /dev/null
+          set -euo pipefail
+
+          URL="https://web-production-9bcf3.up.railway.app/run"
+
+          # POST request (your /run is @app.post)
+          # -f : fail on HTTP >= 400
+          # -sS: silent but show errors
+          # --max-time: hard timeout (seconds)
+          curl -f -sS -X POST "$URL" \
+            -H "Content-Type: application/json" \
+            -d '{}' \
+            --max-time 60 \
+            > /dev/null
+
+          echo "OK: /run triggered via POST"

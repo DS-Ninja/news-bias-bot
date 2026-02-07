@@ -1154,6 +1154,7 @@ def dashboard():
     event_mode = bool(event.get("event_mode", False))
     event_reason = event.get("reason", []) or []
     upcoming = (event.get("upcoming_events", []) or [])[:6]
+    event_reason = event.get("reason", []) or []
 
     trump = meta.get("trump", {}) or {}
     trump_flag = bool(trump.get("flag", False))

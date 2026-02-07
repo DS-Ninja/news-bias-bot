@@ -17,7 +17,6 @@ jobs:
 
           URL="https://web-production-9bcf3.up.railway.app/run?token=${RUN_TOKEN}"
 
-          # Retry to survive short Railway hiccups
           for i in 1 2 3 4 5; do
             echo "Attempt $i..."
             if curl -fsS --max-time 60 "$URL" > /dev/null; then

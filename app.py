@@ -1209,20 +1209,10 @@ def dashboard():
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
         """
-
     # payload for JS
     js_payload = json.dumps(payload, ensure_ascii=False)
 
-    # status pills
-    ev_pill = '<span class="pill ok">EVENT OFF</span>' if not event_mode else '<span class="pill warn">EVENT ON</span>'
-    tr_pill = '<span class="pill warn">TRUMP ACTIVE</span>' if (trump_enabled and trump_flag) else ('<span class="pill neu">TRUMP QUIET</span>' if trump_enabled else '<span class="pill neu">TRUMP DISABLED</span>')
-    feeds_pill = '<span class="pill ok">FEEDS OK</span>' if feeds_ok else '<span class="pill warn">FEEDS WARN</span>'
-    fred_pill = '<span class="pill ok">FRED ON</span>' if fred_on else '<span class="pill neu">FRED OFF</span>'
-
-    reason_txt = ", ".join([str(x) for x in event_reason]) if event_reason else "—"
-
-    html = f"""
-<!doctype html>
+    TEMPLATE = """<!doctype html>
 <html>
 <head>
   <meta charset="utf-8">
@@ -1231,7 +1221,7 @@ def dashboard():
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>NEWS BIAS // TERMINAL</title>
   <style>
-    :root {{
+    :root {
       --bg:#070a0f;
       --panel:#0b111a;
       --line:rgba(255,255,255,.08);
@@ -1247,68 +1237,67 @@ def dashboard():
       --btn2:#162238;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
       --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
-    }}
-    html,body{{height:100%; margin:0; background:var(--bg); color:var(--text);}}
-    body{{padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}}
-    a{{color:var(--cyan); text-decoration:none;}}
-    a:hover{{text-decoration:underline;}}
-    .wrap{{max-width:1200px; margin:0 auto; padding:14px;}}
-    .hdr{{border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px;}}
-    .title{{font-family:var(--mono); font-weight:900; letter-spacing:.8px;}}
-    .title b{{color:var(--amber);}}
-    .sub{{font-family:var(--mono); color:var(--muted); font-size:12px; margin-top:6px;}}
-    .bar{{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px;}}
-    .pill{{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}}
-    .bull{{color:var(--ok); border-color: rgba(0,255,106,.25);}}
-    .bear{{color:var(--no); border-color: rgba(255,59,59,.25);}}
-    .neu{{color:#b8c3da;}}
-    .ok{{color:var(--ok); border-color: rgba(0,255,106,.25);}}
-    .no{{color:var(--no); border-color: rgba(255,59,59,.25);}}
-    .warn{{color:var(--warn); border-color: rgba(255,176,0,.25);}}
-    .kz{{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:8px;}}
-    .hotkeys{{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px;}}
-    .btn{{background:var(--btn); border:1px solid var(--line); color:var(--text); padding:9px 12px; border-radius:12px; cursor:pointer; font-family:var(--mono); font-weight:900;}}
-    .btn:hover{{background:var(--btn2);}}
-    .btnrow{{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}}
-    .panel{{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}}
-    table{{width:100%; border-collapse:collapse; font-family:var(--mono);}}
-    th,td{{border-top:1px solid var(--line); padding:10px 8px; font-size:12px; vertical-align:top;}}
-    th{{color:var(--muted); font-weight:900;}}
-    .sym{{color:var(--amber); font-weight:900;}}
-    .num{{text-align:right; white-space:nowrap;}}
-    .gate{{white-space:nowrap;}}
-    .why{{max-width:420px;}}
-    .muted{{color:var(--muted);}}
-    .act{{text-align:right;}}
-    .ticker{{font-family:var(--mono); font-size:12px; color:var(--muted); display:flex; gap:8px; flex-wrap:wrap; align-items:center;}}
-    .ticker .tag{{color:var(--cyan);}}
-    /* Modal */
-    .modal{{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom));}}
-    .modal .box{{max-width:1100px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:82vh; overflow:auto; -webkit-overflow-scrolling:touch;}}
-    .modal .head{{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
-                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}}
-    .modal .body{{padding:12px;}}
-    pre{{white-space:pre-wrap; word-break:break-word; color:var(--text); font-family:var(--mono); font-size:12px;}}
-    @media(max-width: 780px){{
-      .why{{max-width:none;}}
-      th:nth-child(11), td:nth-child(11) {{display:none;}} /* hide TOP DRIVER on very small? */
-    }}
+    }
+    html,body{height:100%; margin:0; background:var(--bg); color:var(--text);}
+    body{padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
+    a{color:var(--cyan); text-decoration:none;}
+    a:hover{text-decoration:underline;}
+    .wrap{max-width:1200px; margin:0 auto; padding:14px;}
+    .hdr{border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px;}
+    .title{font-family:var(--mono); font-weight:900; letter-spacing:.8px;}
+    .title b{color:var(--amber);}
+    .sub{font-family:var(--mono); color:var(--muted); font-size:12px; margin-top:6px;}
+    .bar{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px;}
+    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
+    .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
+    .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
+    .neu{color:#b8c3da;}
+    .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
+    .no{color:var(--no); border-color: rgba(255,59,59,.25);}
+    .warn{color:var(--warn); border-color: rgba(255,176,0,.25);}
+    .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:8px;}
+    .hotkeys{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px;}
+    .btn{background:var(--btn); border:1px solid var(--line); color:var(--text); padding:9px 12px; border-radius:12px; cursor:pointer; font-family:var(--mono); font-weight:900;}
+    .btn:hover{background:var(--btn2);}
+    .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
+    .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
+    table{width:100%; border-collapse:collapse; font-family:var(--mono);}
+    th,td{border-top:1px solid var(--line); padding:10px 8px; font-size:12px; vertical-align:top;}
+    th{color:var(--muted); font-weight:900;}
+    .sym{color:var(--amber); font-weight:900;}
+    .num{text-align:right; white-space:nowrap;}
+    .gate{white-space:nowrap;}
+    .why{max-width:420px;}
+    .muted{color:var(--muted);}
+    .act{text-align:right;}
+    .ticker{font-family:var(--mono); font-size:12px; color:var(--muted); display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
+    .ticker .tag{color:var(--cyan);}
+    .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom));}
+    .modal .box{max-width:1100px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:82vh; overflow:auto; -webkit-overflow-scrolling:touch;}
+    .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
+                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
+    .modal .body{padding:12px;}
+    pre{white-space:pre-wrap; word-break:break-word; color:var(--text); font-family:var(--mono); font-size:12px;}
+    @media(max-width: 780px){
+      .why{max-width:none;}
+      th:nth-child(11), td:nth-child(11) {display:none;}
+    }
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="hdr">
     <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
-    <div class="sub">updated_utc={updated} • gate_profile={gate_profile} • event_mode={str(event_mode).lower()} • trump={'on' if trump_enabled else 'off'}</div>
+    <div class="sub">updated_utc=__UPDATED__ • gate_profile=__GATE_PROFILE__ • event_mode=__EVENT_MODE__ • trump=__TRUMP__</div>
     <div class="ticker">
-      <span class="tag">Next event:</span> {next_event}
-      <span class="muted">• event_reason: {reason_txt}</span>
+      <span class="tag">Next event:</span> __NEXT_EVENT__
+      <span class="muted">• event_reason: __EVENT_REASON__</span>
     </div>
     <div class="bar">
-      {ev_pill}
-      {tr_pill}
-      {feeds_pill}
-      {fred_pill}
+      __EV_PILL__
+      __TR_PILL__
+      __FEEDS_PILL__
+      __FRED_PILL__
       <a class="pill neu" href="/diag" target="_blank" rel="noopener">/diag</a>
     </div>
     <div class="btnrow">
@@ -1340,9 +1329,9 @@ def dashboard():
         </tr>
       </thead>
       <tbody>
-        {row("XAU")}
-        {row("US500")}
-        {row("WTI")}
+        __ROW_XAU__
+        __ROW_US500__
+        __ROW_WTI__
       </tbody>
     </table>
 
@@ -1365,7 +1354,7 @@ def dashboard():
 </div>
 
 <script>
-  const PAYLOAD = {js_payload};
+  const PAYLOAD = __JS_PAYLOAD__;
 
   function $(id){ return document.getElementById(id); }
 
@@ -1400,7 +1389,6 @@ def dashboard():
     const a = (PAYLOAD.assets||{})[asset] || {};
     const ev = PAYLOAD.event || {};
     const meta = PAYLOAD.meta || {};
-    const gate = a.gate_cached || null;
 
     const top3 = (a.top3_drivers||[]).map((x,i)=>`${i+1}. ${x.why} (abs=${x.abs_contrib_sum})`).join('\\n') || '—';
     const flip = a.flip || {};
@@ -1468,7 +1456,6 @@ def dashboard():
     showModal('ANALYST SNAPSHOT', '<pre>' + escapeHtml(JSON.stringify(s,null,2)) + '</pre>');
   }
 
-  // Hotkeys
   document.addEventListener('keydown', (e)=>{
     const k = (e.key||'').toLowerCase();
     if(k === 'escape') closeModal();
@@ -1481,10 +1468,29 @@ def dashboard():
     if(k === '3') openView('WTI');
   });
 
-  // Close modal by backdrop
   $('modal').addEventListener('click', (e)=>{ if(e.target && e.target.id === 'modal') closeModal(); });
 </script>
 </body>
 </html>
 """
+
+    html = (TEMPLATE
+        .replace("__UPDATED__", str(updated))
+        .replace("__GATE_PROFILE__", str(gate_profile))
+        .replace("__EVENT_MODE__", str(event_mode).lower())
+        .replace("__TRUMP__", ("on" if trump_enabled else "off"))
+        .replace("__NEXT_EVENT__", str(next_event))
+        .replace("__EVENT_REASON__", str(reason_txt))
+        .replace("__EV_PILL__", ev_pill)
+        .replace("__TR_PILL__", tr_pill)
+        .replace("__FEEDS_PILL__", feeds_pill)
+        .replace("__FRED_PILL__", fred_pill)
+        .replace("__ROW_XAU__", row("XAU"))
+        .replace("__ROW_US500__", row("US500"))
+        .replace("__ROW_WTI__", row("WTI"))
+        .replace("__JS_PAYLOAD__", js_payload)
+    )
+
     return HTMLResponse(html)
+
+    

@@ -9,20 +9,23 @@ jobs:
   run:
     runs-on: ubuntu-latest
     steps:
-      - name: Call /run endpoint (POST)
+      - name: Call /run endpoint (GET + token)
+        env:
+          RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
         run: |
           set -euo pipefail
 
-          URL="https://web-production-9bcf3.up.railway.app/run"
+          URL="https://web-production-9bcf3.up.railway.app/run?token=${RUN_TOKEN}"
 
-          # POST request (your /run is @app.post)
-          # -f : fail on HTTP >= 400
-          # -sS: silent but show errors
-          # --max-time: hard timeout (seconds)
-          curl -f -sS -X POST "$URL" \
-            -H "Content-Type: application/json" \
-            -d '{}' \
-            --max-time 60 \
-            > /dev/null
+          # Retry to survive short Railway hiccups
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i..."
+            if curl -fsS --max-time 60 "$URL" > /dev/null; then
+              echo "OK: /run triggered (GET)"
+              exit 0
+            fi
+            sleep $((i*3))
+          done
 
-          echo "OK: /run triggered via POST"
+          echo "ERROR: /run failed after retries"
+          exit 1

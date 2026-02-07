@@ -1,6 +1,12 @@
 # app.py
-# NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + iPhone-friendly UI
-# - Adds: /diag, GET /run with token, clearer flip units, event_mode reasons, ticker line + hotkeys, terminal table UI
+# NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
+# - Fix: RSS timestamp uses UTC (calendar.timegm)
+# - Fix: /run POST auth (token required when RUN_TOKEN set)
+# - Adds: Myfxbook RSS (news + calendar + community)
+# - Adds: Econ calendar store + /calendar UI (TradingView-ish table, best-effort from RSS)
+# - Adds: Alert engine (server diff) + client toasts
+# - Adds: Ticker marquee auto-scroll
+# - Fix: View modal renders nicely (not raw code)
 
 import os
 import json
@@ -8,6 +14,7 @@ import time
 import re
 import hashlib
 import math
+import calendar
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -73,6 +80,14 @@ EVENT_CFG = {
     "max_upcoming": 6,
 }
 
+# Alerts thresholds (server diff)
+ALERT_CFG = {
+    "enabled": True,
+    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),              # points
+    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")),  # delta
+    "feeds_degraded_ratio": float(os.environ.get("ALERT_FEEDS_DEGRADED_RATIO", "0.80")),  # ok share
+}
+
 # FRED
 FRED_CFG = {
     "enabled": os.environ.get("FRED_ENABLED", "1").strip() == "1",
@@ -88,9 +103,10 @@ FRED_SERIES = {
     "BAA10Y":   {"name": "BAA-10Y Spread", "freq": "d"},
 }
 
-# Token for /run GET (for GitHub cron)
+# Token for /run GET/POST (cron)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 
+# RSS feeds
 RSS_FEEDS: Dict[str, str] = {
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
     "BLS": "https://www.bls.gov/feed/news_release.rss",
@@ -119,14 +135,20 @@ RSS_FEEDS: Dict[str, str] = {
 
     "TRUMP_HEADLINES": "https://rss.politico.com/donald-trump.xml",
 
-    # FF calendar mirror
+    # Calendar mirrors
     "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
+
+    # Myfxbook (requested)
+    "MYFX_CAL": "https://www.myfxbook.com/rss/forex-economic-calendar-events",
+    "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
+    "MYFX_COMM": "https://www.myfxbook.com/rss/forex-community-recent-topics",
 }
-CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR"}
+
+# Calendar-only sources (do not add to bias evidence)
+CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR", "MYFX_CAL"}
 
 SOURCE_WEIGHT: Dict[str, float] = {
     "FED": 3.0, "BLS": 3.0, "BEA": 2.8,
-
     "FXSTREET_NEWS": 1.4, "FXSTREET_ANALYSIS": 1.2,
     "MARKETWATCH_TOP": 1.2, "MARKETWATCH_REALTIME": 1.3,
     "OILPRICE": 1.2,
@@ -144,7 +166,14 @@ SOURCE_WEIGHT: Dict[str, float] = {
     "RSSAPP_1": 1.0, "RSSAPP_2": 1.0,
     "TRUMP_HEADLINES": 1.2,
 
+    # Calendar feeds are not bias evidence
     "FOREXFACTORY_CALENDAR": 0.0,
+    "MYFX_CAL": 0.0,
+
+    # Myfxbook news/community weights
+    "MYFX_NEWS": 1.15,
+    "MYFX_COMM": 0.55,
+
     "FRED": 1.0,
 }
 
@@ -225,6 +254,41 @@ def db_init():
             );
             """)
             cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
+
+            # Econ calendar store
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS econ_events (
+                id BIGSERIAL PRIMARY KEY,
+                source TEXT NOT NULL,
+                title TEXT NOT NULL,
+                country TEXT,
+                currency TEXT,
+                impact TEXT,
+                actual TEXT,
+                previous TEXT,
+                consensus TEXT,
+                forecast TEXT,
+                event_ts BIGINT,
+                link TEXT,
+                fingerprint TEXT UNIQUE NOT NULL
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_events_ts ON econ_events(event_ts DESC);")
+
+            # Optional alerts log
+            cur.execute("""
+            CREATE TABLE IF NOT EXISTS alerts_log (
+                id BIGSERIAL PRIMARY KEY,
+                created_ts BIGINT NOT NULL,
+                kind TEXT NOT NULL,
+                asset TEXT,
+                severity TEXT,
+                message TEXT NOT NULL,
+                payload_json TEXT
+            );
+            """)
+            cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_log_created_ts ON alerts_log(created_ts DESC);")
+
         conn.commit()
 
 def save_bias(payload: Dict[str, Any]):
@@ -251,6 +315,16 @@ def load_bias() -> Optional[dict]:
         return json.loads(payload_json)
     except Exception:
         return None
+
+def log_alert(kind: str, message: str, asset: Optional[str] = None, severity: str = "INFO", payload: Optional[dict] = None):
+    now = int(time.time())
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                INSERT INTO alerts_log(created_ts, kind, asset, severity, message, payload_json)
+                VALUES (%s, %s, %s, %s, %s, %s);
+            """, (now, kind, asset, severity, message, json.dumps(payload or {}, ensure_ascii=False)))
+        conn.commit()
 
 # ============================================================
 # HELPERS
@@ -279,6 +353,25 @@ def match_rules(asset: str, title: str) -> List[Dict[str, Any]]:
             out.append({"pattern": pat, "w": float(w), "why": why})
     return out
 
+def _ts_from_entry(e: dict, now_ts: int) -> int:
+    """
+    RSS published_parsed is usually UTC-ish; use calendar.timegm() to avoid local-time mktime() shifts.
+    """
+    pp = e.get("published_parsed")
+    if pp:
+        try:
+            return int(calendar.timegm(pp))
+        except Exception:
+            return int(now_ts)
+    # Try updated_parsed
+    up = e.get("updated_parsed")
+    if up:
+        try:
+            return int(calendar.timegm(up))
+        except Exception:
+            return int(now_ts)
+    return int(now_ts)
+
 def feeds_health_live() -> Dict[str, Any]:
     res = {}
     for src, url in RSS_FEEDS.items():
@@ -293,11 +386,25 @@ def feeds_health_live() -> Dict[str, Any]:
             res[src] = {"ok": False, "error": str(e), "entries": 0}
     return res
 
+def _feeds_ok_ratio(feeds_status: dict) -> float:
+    ok = 0
+    total = 0
+    for k in RSS_FEEDS.keys():
+        total += 1
+        obj = (feeds_status.get(k, {}) or {})
+        if obj.get("skipped"):
+            ok += 1
+        elif obj.get("ok") and int(obj.get("entries", 0)) >= 0:
+            ok += 1
+    if total <= 0:
+        return 1.0
+    return ok / total
+
 # ============================================================
-# INGEST
+# INGEST (NEWS)
 # ============================================================
 
-def ingest_once(limit_per_feed: int = 40) -> int:
+def ingest_news_once(limit_per_feed: int = 40) -> int:
     inserted = 0
     now = int(time.time())
 
@@ -324,8 +431,7 @@ def ingest_once(limit_per_feed: int = 40) -> int:
                     if not title or not link:
                         continue
 
-                    published_parsed = e.get("published_parsed")
-                    published_ts = int(time.mktime(published_parsed)) if published_parsed else now
+                    published_ts = _ts_from_entry(e, now)
 
                     fp = fingerprint(title, link)
                     try:
@@ -338,6 +444,122 @@ def ingest_once(limit_per_feed: int = 40) -> int:
                             inserted += 1
                     except Exception:
                         pass
+        conn.commit()
+
+    return inserted
+
+# ============================================================
+# INGEST (CALENDAR)
+# ============================================================
+
+_IMPACT_PAT = re.compile(r"\b(high|medium|low)\b", re.I)
+_CC_PAT = re.compile(r"\b(US|EU|DE|FR|ES|UK|GB|JP|CN|AU|CA|CH|NZ)\b")
+_CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
+
+def _parse_calendar_fields(title: str, summary: str) -> Dict[str, Optional[str]]:
+    """
+    Best-effort parsing from RSS title/summary.
+    Different calendars format differently; we keep it robust and allow Nones.
+    """
+    t = (title or "").strip()
+    s = (summary or "").strip()
+
+    blob = (t + " " + s).strip()
+
+    impact = None
+    m = _IMPACT_PAT.search(blob)
+    if m:
+        impact = m.group(1).upper()
+
+    country = None
+    m = _CC_PAT.search(blob)
+    if m:
+        country = m.group(1).upper()
+
+    currency = None
+    m = _CUR_PAT.search(blob)
+    if m:
+        currency = m.group(1).upper()
+
+    # Attempt to extract A/P/F/C style tokens if present
+    # Examples vary wildly; we just try common patterns.
+    def pick(pat: str) -> Optional[str]:
+        mm = re.search(pat, blob, flags=re.I)
+        if mm:
+            return mm.group(1).strip()
+        return None
+
+    actual = pick(r"\bactual[:=]\s*([^\s|,;]+)")
+    previous = pick(r"\bprev(?:ious)?[:=]\s*([^\s|,;]+)")
+    consensus = pick(r"\bcons(?:ensus)?[:=]\s*([^\s|,;]+)")
+    forecast = pick(r"\bfore(?:cast)?[:=]\s*([^\s|,;]+)")
+
+    return {
+        "impact": impact,
+        "country": country,
+        "currency": currency,
+        "actual": actual,
+        "previous": previous,
+        "consensus": consensus,
+        "forecast": forecast,
+    }
+
+def ingest_calendar_once(limit_per_feed: int = 200) -> int:
+    inserted = 0
+    now = int(time.time())
+
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            for src in CALENDAR_FEEDS:
+                url = RSS_FEEDS.get(src)
+                if not url:
+                    continue
+                try:
+                    d = feedparser.parse(url)
+                except Exception:
+                    continue
+                entries = getattr(d, "entries", []) or []
+                if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
+                    continue
+
+                for e in entries[:limit_per_feed]:
+                    title = (e.get("title") or "").strip()
+                    link = (e.get("link") or "").strip()
+                    summary = (e.get("summary") or e.get("description") or "").strip()
+                    if not title:
+                        continue
+
+                    event_ts = None
+                    pp = e.get("published_parsed") or e.get("updated_parsed")
+                    if pp:
+                        try:
+                            event_ts = int(calendar.timegm(pp))
+                        except Exception:
+                            event_ts = None
+
+                    fields = _parse_calendar_fields(title, summary)
+                    fp = fingerprint(f"{src}||{title}", link or title)
+
+                    try:
+                        cur.execute("""
+                            INSERT INTO econ_events(
+                                source, title, country, currency, impact,
+                                actual, previous, consensus, forecast,
+                                event_ts, link, fingerprint
+                            )
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (fingerprint) DO NOTHING;
+                        """, (
+                            src, title,
+                            fields.get("country"), fields.get("currency"), fields.get("impact"),
+                            fields.get("actual"), fields.get("previous"), fields.get("consensus"), fields.get("forecast"),
+                            event_ts, link, fp
+                        ))
+                        if cur.rowcount == 1:
+                            inserted += 1
+                    except Exception:
+                        pass
+
         conn.commit()
 
     return inserted
@@ -356,54 +578,52 @@ def _macro_recent_flag(rows: List[Tuple[str, str, str, int]], now_ts: int) -> bo
 
 def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     """
-    FF mirror RSS часто не даёт правильного event timestamp.
-    Поэтому:
-    - пытаемся взять published_parsed (как есть)
-    - если ts не попал в lookahead — всё равно покажем 1-2 элемента как "time unknown"
+    Pull upcoming events from DB calendar store first (better than raw RSS),
+    fallback to RSS if DB empty.
     """
-    url = RSS_FEEDS.get("FOREXFACTORY_CALENDAR")
-    if not url:
-        return []
-
-    try:
-        d = feedparser.parse(url)
-        entries = getattr(d, "entries", []) or []
-    except Exception:
-        return []
-
     lookahead_sec = int(EVENT_CFG["lookahead_hours"] * 3600)
     horizon = now_ts + lookahead_sec
 
+    # Try DB with event_ts
     out: List[Dict[str, Any]] = []
-    unknown: List[Dict[str, Any]] = []
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source, title, link, event_ts
+                FROM econ_events
+                WHERE event_ts IS NOT NULL AND event_ts BETWEEN %s AND %s
+                ORDER BY event_ts ASC
+                LIMIT %s;
+            """, (now_ts, horizon, int(EVENT_CFG["max_upcoming"])))
+            rows = cur.fetchall()
 
-    for e in entries[:250]:
-        title = (e.get("title") or "").strip()
-        link = (e.get("link") or "").strip()
-        if not title:
-            continue
+    for (source, title, link, ts) in rows:
+        out.append({
+            "source": source,
+            "title": title,
+            "link": link,
+            "ts": int(ts),
+            "in_hours": round((int(ts) - now_ts) / 3600.0, 2),
+        })
 
-        ts = None
-        pp = e.get("published_parsed")
-        if pp:
-            try:
-                ts = int(time.mktime(pp))
-            except Exception:
-                ts = None
+    if out:
+        return out[: int(EVENT_CFG["max_upcoming"])]
 
-        if ts is not None and (now_ts <= ts <= horizon):
-            out.append({"title": title, "link": link, "ts": int(ts), "in_hours": round((ts - now_ts) / 3600.0, 2)})
-        else:
-            if len(unknown) < 2:
-                unknown.append({"title": title, "link": link, "ts": None, "in_hours": None})
+    # Fallback: show 1-2 from DB even if time unknown
+    with db_conn() as conn:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source, title, link, event_ts
+                FROM econ_events
+                ORDER BY COALESCE(event_ts, 0) DESC, id DESC
+                LIMIT 2;
+            """)
+            rows2 = cur.fetchall()
 
-        if len(out) >= EVENT_CFG["max_upcoming"]:
-            break
-
-    out.sort(key=lambda x: x["ts"] or 10**18)
-    if not out:
-        out = unknown[:2]
-    return out[:EVENT_CFG["max_upcoming"]]
+    unknown = []
+    for (source, title, link, ts) in rows2:
+        unknown.append({"source": source, "title": title, "link": link, "ts": int(ts) if ts else None, "in_hours": None})
+    return unknown[:2]
 
 def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours: float = 12.0) -> Dict[str, Any]:
     cutoff = now_ts - int(hours * 3600)
@@ -593,18 +813,10 @@ def _median_abs_contrib(contribs: List[Dict[str, Any]]) -> float:
     return 0.5 * float(vals[mid - 1] + vals[mid])
 
 # ============================================================
-# FLIP METRICS (clearer)
+# FLIP METRICS
 # ============================================================
 
 def flip_metrics(score: float, th: float, bias: str, median_abs: float) -> Dict[str, Any]:
-    """
-    Distances are in score-units.
-    - to_bullish: ΔScore needed to reach +th
-    - to_bearish: ΔScore needed to reach -th
-    - to_neutral: ΔScore needed to get back inside (-th,+th) from current bias
-    - to_opposite: ΔScore needed to flip to opposite side (cross other threshold)
-    - approx_headlines_to_flip: translate to #median-headlines (rough, optional)
-    """
     to_bull = max(0.0, th - score)
     to_bear = max(0.0, score + th)
 
@@ -630,7 +842,7 @@ def flip_metrics(score: float, th: float, bias: str, median_abs: float) -> Dict[
         "to_opposite": round(float(to_opposite), 4),
         "median_abs_contrib": round(float(median_abs), 4),
         "approx_headlines_to_flip": approx,
-        "note": "Units: score-sum (weighted evidence). Not price points. 'approx_headlines' uses median abs contribution.",
+        "note": "Units: score-sum (weighted evidence). Not price points.",
     }
 
 # ============================================================
@@ -755,10 +967,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         evidence_count = len(contribs)
         src_div = len(set([w["source"] for w in contribs])) if contribs else 0
 
-        # Quality v1
-        strength = min(1.0, abs(score) / max(th, 1e-9))
-        quality_v1 = int(min(100, (strength * 60.0) + min(30, evidence_count * 2.0) + min(10, src_div * 2.0)))
-
         # Consensus/conflict
         consensus_ratio, conflict_index, _abs_sum = _consensus_stats(contribs)
 
@@ -774,6 +982,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         if fresh_total > 0:
             fresh_score = min(1.0, (fresh02 * 1.0 + fresh28 * 0.6) / max(1.0, fresh_total))
 
+        # Event penalty (slight)
         event_penalty = 0.15 if event_mode else 0.0
 
         raw_v2 = (
@@ -797,17 +1006,12 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             "bias": bias,
             "score": round(score, 4),
             "threshold": th,
-
-            "quality": int(quality_v1),
             "quality_v2": int(quality_v2),
-
             "evidence_count": int(evidence_count),
             "source_diversity": int(src_div),
-
             "consensus_ratio": float(consensus_ratio),
             "conflict_index": float(conflict_index),
             "freshness": freshness,
-
             "top3_drivers": top3,
             "flip": flip,
             "consensus_by_source": cons_by_src,
@@ -837,17 +1041,119 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             "upcoming_events": upcoming_events,
             "lookahead_hours": float(EVENT_CFG["lookahead_hours"]),
             "recent_hours": float(EVENT_CFG["recent_hours"]),
-            "ff_calendar_enabled": "FOREXFACTORY_CALENDAR" in RSS_FEEDS,
+            "calendar_sources": list(CALENDAR_FEEDS),
         }
     }
     return payload
 
+# ============================================================
+# ALERT ENGINE (server-side diff)
+# ============================================================
+
+def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
+    if not ALERT_CFG.get("enabled", True):
+        return []
+
+    alerts: List[Dict[str, Any]] = []
+    now = int(time.time())
+
+    def push(kind: str, message: str, asset: Optional[str] = None, severity: str = "INFO", extra: Optional[dict] = None):
+        obj = {
+            "id": f"{now}-{kind}-{asset or 'ALL'}-{hashlib.md5(message.encode('utf-8')).hexdigest()[:8]}",
+            "ts": now,
+            "kind": kind,
+            "asset": asset,
+            "severity": severity,
+            "message": message,
+            "extra": extra or {},
+        }
+        alerts.append(obj)
+        try:
+            log_alert(kind, message, asset=asset, severity=severity, payload=obj)
+        except Exception:
+            pass
+
+    if not prev:
+        return alerts
+
+    p_assets = (prev.get("assets", {}) or {})
+    c_assets = (cur.get("assets", {}) or {})
+
+    # Event mode flip
+    p_ev = bool((prev.get("event", {}) or {}).get("event_mode", False))
+    c_ev = bool((cur.get("event", {}) or {}).get("event_mode", False))
+    if p_ev != c_ev:
+        push("event_mode_flip", f"EVENT MODE {'ON' if c_ev else 'OFF'}", asset=None, severity="WARN",
+             extra={"prev": p_ev, "cur": c_ev, "reason": (cur.get("event", {}) or {}).get("reason", [])})
+
+    # Per-asset diffs
+    q2_drop_th = int(ALERT_CFG.get("q2_drop", 12))
+    conflict_spike_th = float(ALERT_CFG.get("conflict_spike", 0.18))
+
+    for a in ASSETS:
+        pa = (p_assets.get(a, {}) or {})
+        ca = (c_assets.get(a, {}) or {})
+
+        pb = str(pa.get("bias", "NEUTRAL"))
+        cb = str(ca.get("bias", "NEUTRAL"))
+        if pb != cb:
+            push("bias_flip", f"{a} bias flip: {pb} → {cb}", asset=a, severity="WARN",
+                 extra={"prev": pb, "cur": cb, "score": ca.get("score"), "q2": ca.get("quality_v2"), "conflict": ca.get("conflict_index")})
+
+        pq2 = int(pa.get("quality_v2", 0))
+        cq2 = int(ca.get("quality_v2", 0))
+        if (pq2 - cq2) >= q2_drop_th:
+            push("q2_drop", f"{a} Q2 drop: {pq2} → {cq2} (Δ={pq2-cq2})", asset=a, severity="WARN",
+                 extra={"prev": pq2, "cur": cq2})
+
+        pc = float(pa.get("conflict_index", 0.0))
+        cc = float(ca.get("conflict_index", 0.0))
+        if (cc - pc) >= conflict_spike_th:
+            push("conflict_spike", f"{a} conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})", asset=a, severity="WARN",
+                 extra={"prev": pc, "cur": cc})
+
+    # Feeds degraded flip based on ratio
+    p_meta = (prev.get("meta", {}) or {})
+    c_meta = (cur.get("meta", {}) or {})
+    p_fs = (p_meta.get("feeds_status", {}) or {})
+    c_fs = (c_meta.get("feeds_status", {}) or {})
+    if c_fs:
+        pr = _feeds_ok_ratio(p_fs) if p_fs else 1.0
+        cr = _feeds_ok_ratio(c_fs)
+        thr = float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
+        if pr >= thr and cr < thr:
+            push("feeds_degraded", f"FEEDS degraded: ok_ratio {pr:.2f} → {cr:.2f}", asset=None, severity="WARN",
+                 extra={"prev_ratio": pr, "cur_ratio": cr})
+
+    return alerts
+
+# ============================================================
+# PIPELINE RUN
+# ============================================================
+
 def pipeline_run():
     db_init()
-    inserted = ingest_once(limit_per_feed=40)
+
+    prev = load_bias()
+
+    # ingest
+    inserted_news = ingest_news_once(limit_per_feed=40)
+    inserted_cal = ingest_calendar_once(limit_per_feed=250)
+
+    # compute
     payload = compute_bias(lookback_hours=24, limit_rows=1200)
-    payload["meta"]["inserted_last_run"] = int(inserted)
-    payload["meta"]["feeds_status"] = feeds_health_live()
+
+    # feed health (live) — can be heavy, but kept here per your current design
+    feeds_status = feeds_health_live()
+
+    payload["meta"]["inserted_news_last_run"] = int(inserted_news)
+    payload["meta"]["inserted_calendar_last_run"] = int(inserted_cal)
+    payload["meta"]["feeds_status"] = feeds_status
+
+    # alerts
+    alerts = compute_alerts(prev, payload)
+    payload["meta"]["alerts"] = alerts[:25]
+
     save_bias(payload)
     return payload
 
@@ -862,7 +1168,6 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
     q2 = int(asset_obj.get("quality_v2", 0))
     conflict = float(asset_obj.get("conflict_index", 1.0))
     flip = asset_obj.get("flip", {}) or {}
-
     to_opp = float(flip.get("to_opposite", 999.0))
 
     fail = []
@@ -938,6 +1243,7 @@ def health(pretty: int = 0):
         "gate_profile": GATE_PROFILE,
         "trump_enabled": bool(TRUMP_ENABLED),
         "fred_enabled": bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None),
+        "calendar_sources": list(CALENDAR_FEEDS),
     }
     if pretty:
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
@@ -959,6 +1265,7 @@ def diag():
     news_items = 0
     fred_points = 0
     has_bias_state = False
+    econ_events = 0
     try:
         with db_conn() as conn:
             with conn.cursor() as cur:
@@ -968,10 +1275,12 @@ def diag():
                 fred_points = int(cur.fetchone()[0])
                 cur.execute("SELECT COUNT(*) FROM bias_state;")
                 has_bias_state = int(cur.fetchone()[0]) > 0
+                cur.execute("SELECT COUNT(*) FROM econ_events;")
+                econ_events = int(cur.fetchone()[0])
     except Exception:
         ok = False
 
-    return {"db": {"ok": ok, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state}, "env": env}
+    return {"db": {"ok": ok, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events}, "env": env}
 
 @app.get("/rules")
 def rules():
@@ -1004,7 +1313,8 @@ def run_get(token: str = ""):
 
 @app.post("/run")
 def run_post(token: str = ""):
-    if RUN_TOKEN and token and not _auth_run(token):
+    # FIX: when RUN_TOKEN set, token is REQUIRED
+    if RUN_TOKEN and not _auth_run(token):
         return JSONResponse({"ok": False, "error": "unauthorized"}, status_code=401)
     try:
         payload = pipeline_run()
@@ -1026,52 +1336,40 @@ def latest(limit: int = 40):
             rows = cur.fetchall()
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
-@app.get("/explain")
-def explain(asset: str = "US500", limit: int = 80):
-    asset = asset.upper().strip()
-    if asset not in ASSETS:
-        return {"error": "Unknown asset. Use XAU, US500, WTI."}
-
+@app.get("/calendar_data")
+def calendar_data(limit: int = 120, hours_back: int = 12, hours_fwd: int = 48):
     db_init()
     now = int(time.time())
-    cutoff = now - 24 * 3600
-
+    lo = now - int(hours_back * 3600)
+    hi = now + int(hours_fwd * 3600)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT source, title, link, published_ts
-                FROM news_items
-                WHERE published_ts >= %s
-                ORDER BY published_ts DESC
-                LIMIT 1200;
-            """, (cutoff,))
+                SELECT source, title, country, currency, impact, actual, previous, consensus, forecast, event_ts, link
+                FROM econ_events
+                WHERE (event_ts IS NULL) OR (event_ts BETWEEN %s AND %s)
+                ORDER BY COALESCE(event_ts, 0) ASC, id DESC
+                LIMIT %s;
+            """, (lo, hi, limit))
             rows = cur.fetchall()
 
-    out = []
-    for (source, title, link, ts) in rows:
-        matches = match_rules(asset, title)
-        if not matches:
-            continue
-        age = max(0, now - int(ts))
-        w_src = float(SOURCE_WEIGHT.get(source, 1.0))
-        w_time = decay_weight(age)
-        for m in matches:
-            contrib = float(m["w"]) * w_src * float(w_time)
-            out.append({
-                "source": source,
-                "title": title,
-                "link": link,
-                "age_min": int(age / 60),
-                "base_w": float(m["w"]),
-                "src_w": float(w_src),
-                "time_w": round(float(w_time), 4),
-                "contrib": round(float(contrib), 4),
-                "why": m["why"],
-                "pattern": m["pattern"],
-            })
-
-    out_sorted = sorted(out, key=lambda x: abs(float(x["contrib"])), reverse=True)[:limit]
-    return {"asset": asset, "top_matches": out_sorted, "rules_count": len(RULES.get(asset, []))}
+    items = []
+    for r in rows:
+        (source, title, country, currency, impact, actual, previous, consensus, forecast, event_ts, link) = r
+        items.append({
+            "source": source,
+            "title": title,
+            "country": country,
+            "currency": currency,
+            "impact": impact,
+            "actual": actual,
+            "previous": previous,
+            "consensus": consensus,
+            "forecast": forecast,
+            "event_ts": int(event_ts) if event_ts else None,
+            "link": link,
+        })
+    return {"now_ts": now, "items": items}
 
 @app.get("/morning_plan")
 def morning_plan():
@@ -1108,6 +1406,7 @@ def morning_plan():
         "event_mode": event_mode,
         "event_reason": event.get("reason", []),
         "upcoming_events": (event.get("upcoming_events", []) or [])[:6],
+        "alerts": (meta.get("alerts", []) or [])[:25],
         "plan": {"XAU": pack("XAU"), "US500": pack("US500"), "WTI": pack("WTI")}
     }
     return JSONResponse(out)
@@ -1143,15 +1442,14 @@ def dashboard():
     meta = payload.get("meta", {}) or {}
     event = payload.get("event", {}) or {}
     feeds_status = meta.get("feeds_status", {}) or {}
+    alerts = (meta.get("alerts", []) or [])[:25]
 
     updated = payload.get("updated_utc", "")
     gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
     event_mode = bool(event.get("event_mode", False))
     upcoming = (event.get("upcoming_events", []) or [])[:6]
 
-    # event reason text (SAFE)
-    event_reason = event.get("reason", []) or []
-    event_reason = [str(x) for x in (event_reason or [])]
+    event_reason = [str(x) for x in (event.get("reason", []) or [])]
     reason_txt = ", ".join(event_reason) if event_reason else "—"
 
     trump = meta.get("trump", {}) or {}
@@ -1160,14 +1458,10 @@ def dashboard():
 
     fred_on = bool(meta.get("fred", {}).get("enabled", False))
 
-    feeds_ok = all(
-        bool((feeds_status.get(k, {}) or {}).get("ok", False)) or bool((feeds_status.get(k, {}) or {}).get("skipped", False))
-        for k in RSS_FEEDS.keys()
-    )
+    feeds_ok_ratio = _feeds_ok_ratio(feeds_status) if feeds_status else 1.0
+    feeds_ok = feeds_ok_ratio >= float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
 
-    # Pills (WERE MISSING BEFORE)
     ev_pill = '<span class="pill warn">EVENT MODE</span>' if event_mode else '<span class="pill neu">EVENT: off</span>'
-
     if trump_enabled and trump_flag:
         tr_pill = '<span class="pill warn">TRUMP: flag</span>'
     elif trump_enabled:
@@ -1175,10 +1469,9 @@ def dashboard():
     else:
         tr_pill = '<span class="pill neu">TRUMP: off</span>'
 
-    feeds_pill = '<span class="pill ok">FEEDS: ok</span>' if feeds_ok else '<span class="pill no">FEEDS: bad</span>'
+    feeds_pill = f'<span class="pill {"ok" if feeds_ok else "no"}">FEEDS: {"ok" if feeds_ok else "degraded"} ({feeds_ok_ratio:.2f})</span>'
     fred_pill = '<span class="pill neu">FRED: on</span>' if fred_on else '<span class="pill neu">FRED: off</span>'
 
-    # next event line
     next_event = "—"
     if upcoming:
         u = upcoming[0]
@@ -1257,7 +1550,7 @@ def dashboard():
     body{padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
     a{color:var(--cyan); text-decoration:none;}
     a:hover{text-decoration:underline;}
-    .wrap{max-width:1200px; margin:0 auto; padding:14px;}
+    .wrap{max-width:1250px; margin:0 auto; padding:14px;}
     .hdr{border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px;}
     .title{font-family:var(--mono); font-weight:900; letter-spacing:.8px;}
     .title b{color:var(--amber);}
@@ -1285,29 +1578,61 @@ def dashboard():
     .why{max-width:420px;}
     .muted{color:var(--muted);}
     .act{text-align:right;}
-    .ticker{font-family:var(--mono); font-size:12px; color:var(--muted); display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
-    .ticker .tag{color:var(--cyan);}
-    .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom));}
-    .modal .box{max-width:1100px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:82vh; overflow:auto; -webkit-overflow-scrolling:touch;}
+    .row2{display:flex; gap:12px; flex-wrap:wrap;}
+    .card{flex:1; min-width:320px;}
+    .h2{font-family:var(--mono); font-weight:900; color:var(--muted); font-size:12px; margin-bottom:8px;}
+    .kv{display:grid; grid-template-columns: 160px 1fr; gap:8px; font-family:var(--mono); font-size:12px;}
+    .kv div{padding:6px 0; border-top:1px solid var(--line);}
+    .kv .k{color:var(--muted);}
+    .list{font-family:var(--mono); font-size:12px;}
+    .item{padding:10px 0; border-top:1px solid var(--line);}
+    .item .t{font-weight:900;}
+    .item .m{color:var(--muted); margin-top:4px;}
+    .item .lnk{margin-top:6px;}
+    .toastwrap{position:fixed; right:14px; top:14px; z-index:9999; display:flex; flex-direction:column; gap:8px; max-width:520px; padding-top: env(safe-area-inset-top);}
+    .toast{background:rgba(11,17,26,.95); border:1px solid var(--line); border-radius:14px; padding:10px 12px; font-family:var(--mono); font-size:12px;}
+    .toast .k{color:var(--cyan); font-weight:900;}
+    .toast.warn{border-color: rgba(255,176,0,.25);}
+    .toast.bad{border-color: rgba(255,59,59,.25);}
+    .tickerline{margin-top:8px; border-top:1px solid var(--line); border-bottom:1px solid var(--line); padding:8px 0; overflow:hidden;}
+    .marquee{display:flex; gap:40px; align-items:center; white-space:nowrap; will-change:transform; animation: scroll 28s linear infinite;}
+    .marquee:hover{animation-play-state:paused;}
+    @keyframes scroll{
+      0%{transform: translateX(0);}
+      100%{transform: translateX(-50%);}
+    }
+    .tick{font-family:var(--mono); font-size:12px; color:var(--muted);}
+    .tick b{color:var(--amber);}
+    .tick .tag{color:var(--cyan); font-weight:900;}
+    .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
+    .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
                  display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
     .modal .body{padding:12px;}
-    pre{white-space:pre-wrap; word-break:break-word; color:var(--text); font-family:var(--mono); font-size:12px;}
     @media(max-width: 780px){
       .why{max-width:none;}
       th:nth-child(11), td:nth-child(11) {display:none;}
+      .toastwrap{left:14px; right:14px; max-width:none;}
     }
   </style>
 </head>
 <body>
+<div class="toastwrap" id="toasts"></div>
+
 <div class="wrap">
   <div class="hdr">
     <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
     <div class="sub">updated_utc=__UPDATED__ • gate_profile=__GATE_PROFILE__ • event_mode=__EVENT_MODE__ • trump=__TRUMP__</div>
-    <div class="ticker">
+
+    <div class="tick">
       <span class="tag">Next event:</span> __NEXT_EVENT__
       <span class="muted">• event_reason: __EVENT_REASON__</span>
     </div>
+
+    <div class="tickerline">
+      <div class="marquee" id="marquee"></div>
+    </div>
+
     <div class="bar">
       __EV_PILL__
       __TR_PILL__
@@ -1315,14 +1640,16 @@ def dashboard():
       __FRED_PILL__
       <a class="pill neu" href="/diag" target="_blank" rel="noopener">/diag</a>
     </div>
+
     <div class="btnrow">
       <button class="btn" onclick="runNow()">R RUN</button>
       <button class="btn" onclick="openMorning()">M MORNING</button>
+      <button class="btn" onclick="openCalendar()">C CALENDAR</button>
       <button class="btn" onclick="openJson()">J JSON</button>
       <button class="btn" onclick="openAnalyst()">A ANALYST</button>
       <a class="btn" href="/bias?pretty=1" target="_blank" rel="noopener">Bias JSON</a>
     </div>
-    <div class="hotkeys">Hotkeys: 1/2/3 = jump XAU/US500/WTI • R run • M morning • J json • A analyst • Esc close</div>
+    <div class="hotkeys">Hotkeys: 1/2/3 view • R run • M morning • C calendar • J json • A analyst • Esc close</div>
   </div>
 
   <div class="panel">
@@ -1353,7 +1680,7 @@ def dashboard():
     <div class="kz">
       Flip units: score-sum (weighted evidence), not % / not market points.
       TO_NEU = ΔScore to return to Neutral band. TO_OPP = ΔScore to flip to opposite bias.
-      ≈HEADLINES = TO_OPP / median(|contrib|) (rough intuition).
+      ≈HEADLINES = TO_OPP / median(|contrib|) (rough).
     </div>
   </div>
 </div>
@@ -1370,8 +1697,12 @@ def dashboard():
 
 <script>
   const PAYLOAD = __JS_PAYLOAD__;
+  const ALERTS = (PAYLOAD.meta && PAYLOAD.meta.alerts) ? PAYLOAD.meta.alerts : [];
 
   function $(id){ return document.getElementById(id); }
+  function escapeHtml(s){
+    return (s||'').toString().replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+  }
 
   function showModal(title, html){
     $('mt').innerText = title;
@@ -1387,17 +1718,45 @@ def dashboard():
       const resp = await fetch('/run', { method:'POST' });
       const js = await resp.json();
       if(js.ok === false && js.error){
-        showModal('RUN ERROR', '<pre>' + escapeHtml(JSON.stringify(js,null,2)) + '</pre>');
+        showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
         return;
       }
       setTimeout(()=>location.reload(), 400);
     }catch(e){
-      showModal('RUN ERROR', '<pre>' + escapeHtml(String(e)) + '</pre>');
+      showModal('RUN ERROR', '<div class="panel"><div class="h2">Exception</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
   }
 
-  function escapeHtml(s){
-    return (s||'').replaceAll('&','&amp;').replaceAll('<','&lt;').replaceAll('>','&gt;').replaceAll('"','&quot;').replaceAll("'",'&#039;');
+  function toast(kind, msg, sev){
+    const w = $('toasts');
+    const div = document.createElement('div');
+    div.className = 'toast ' + ((sev||'').toLowerCase()==='warn' ? 'warn' : '');
+    div.innerHTML = '<div class="k">' + escapeHtml(kind) + '</div><div>' + escapeHtml(msg) + '</div>';
+    w.appendChild(div);
+    setTimeout(()=>{ try{ div.remove(); }catch(e){} }, 9000);
+  }
+
+  function buildTicker(){
+    const parts = [];
+
+    // Alerts first (top 6)
+    (ALERTS || []).slice(0, 6).forEach(a=>{
+      parts.push('<span class="tick"><span class="tag">ALERT</span> <b>' + escapeHtml(a.kind) + '</b> • ' + escapeHtml(a.message) + '</span>');
+    });
+
+    // Per-asset snapshot
+    const a = PAYLOAD.assets || {};
+    ['XAU','US500','WTI'].forEach(sym=>{
+      const x = a[sym] || {};
+      const b = x.bias || '—';
+      const q2 = x.quality_v2 ?? '—';
+      const c = x.conflict_index ?? '—';
+      parts.push('<span class="tick"><span class="tag">' + sym + '</span> bias=<b>' + escapeHtml(b) + '</b> q2=<b>' + escapeHtml(q2) + '</b> conflict=' + escapeHtml(Number(c).toFixed ? Number(c).toFixed(3) : c) + '</span>');
+    });
+
+    // Duplicate the string to make smooth loop (-50% trick)
+    const line = parts.join(' <span class="tick muted">•</span> ');
+    $('marquee').innerHTML = line + ' <span class="tick muted">•</span> ' + line;
   }
 
   function openView(asset){
@@ -1405,33 +1764,92 @@ def dashboard():
     const ev = PAYLOAD.event || {};
     const meta = PAYLOAD.meta || {};
 
-    const top3 = (a.top3_drivers||[]).map((x,i)=>`${i+1}. ${x.why} (abs=${x.abs_contrib_sum})`).join('\\n') || '—';
     const flip = a.flip || {};
-    const why5 = (a.why_top5||[]).map((x,i)=>`${i+1}. ${x.why}\\n   src=${x.source} age=${x.age_min}m contrib=${x.contrib}\\n   ${x.title}\\n   ${x.link}\\n`).join('\\n') || '—';
+    const top3 = (a.top3_drivers||[]);
+    const why5 = (a.why_top5||[]);
 
-    const html = `
-      <div class="ticker"><span class="tag">${asset}</span> bias=${escapeHtml(a.bias||'')} score=${a.score} th=${a.threshold} q2=${a.quality_v2} conflict=${a.conflict_index}</div>
-      <div class="panel" style="margin-top:10px;">
-        <div class="sub">Flip</div>
-        <pre>${escapeHtml(JSON.stringify(flip,null,2))}</pre>
-      </div>
-      <div class="panel" style="margin-top:10px;">
-        <div class="sub">Top drivers</div>
-        <pre>${escapeHtml(top3)}</pre>
-      </div>
-      <div class="panel" style="margin-top:10px;">
-        <div class="sub">WHY top 5</div>
-        <pre>${escapeHtml(why5)}</pre>
-      </div>
-      <div class="panel" style="margin-top:10px;">
-        <div class="sub">Event</div>
-        <pre>${escapeHtml(JSON.stringify(ev,null,2))}</pre>
-      </div>
-      <div class="panel" style="margin-top:10px;">
-        <div class="sub">Meta</div>
-        <pre>${escapeHtml(JSON.stringify({gate_profile: meta.gate_profile, fred: meta.fred, trump: meta.trump},null,2))}</pre>
+    const flipHtml = `
+      <div class="panel card">
+        <div class="h2">Flip</div>
+        <div class="kv">
+          <div class="k">state</div><div>${escapeHtml(flip.state||'')}</div>
+          <div class="k">to_bullish</div><div>${escapeHtml(flip.to_bullish)}</div>
+          <div class="k">to_bearish</div><div>${escapeHtml(flip.to_bearish)}</div>
+          <div class="k">to_neutral</div><div>${escapeHtml(flip.to_neutral)}</div>
+          <div class="k">to_opposite</div><div>${escapeHtml(flip.to_opposite)}</div>
+          <div class="k">median_abs</div><div>${escapeHtml(flip.median_abs_contrib)}</div>
+          <div class="k">≈headlines</div><div>${escapeHtml(flip.approx_headlines_to_flip ?? '—')}</div>
+        </div>
+        <div class="kz">${escapeHtml(flip.note||'')}</div>
       </div>
     `;
+
+    const topHtml = `
+      <div class="panel card">
+        <div class="h2">Top drivers</div>
+        <div class="list">
+          ${(top3.length? top3 : [{why:'—', abs_contrib_sum:''}]).map((x,i)=>`
+            <div class="item">
+              <div class="t">${i+1}. ${escapeHtml(x.why||'—')}</div>
+              <div class="m">abs=${escapeHtml(x.abs_contrib_sum ?? '')}</div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+
+    const whyHtml = `
+      <div class="panel">
+        <div class="h2">WHY top 5 (rendered, not raw code)</div>
+        <div class="list">
+          ${(why5.length? why5 : [{why:'—'}]).map((x,i)=>`
+            <div class="item">
+              <div class="t">${i+1}. ${escapeHtml(x.why||'—')}</div>
+              <div class="m">src=${escapeHtml(x.source||'')} • age=${escapeHtml(x.age_min||0)}m • contrib=${escapeHtml(x.contrib||'')}</div>
+              <div class="m">${escapeHtml(x.title||'')}</div>
+              <div class="lnk"><a href="${escapeHtml(x.link||'#')}" target="_blank" rel="noopener">Open source</a></div>
+            </div>
+          `).join('')}
+        </div>
+      </div>
+    `;
+
+    const headHtml = `
+      <div class="tick" style="margin-bottom:10px;">
+        <span class="tag">${asset}</span>
+        bias=<b>${escapeHtml(a.bias||'')}</b>
+        score=<b>${escapeHtml(a.score)}</b>
+        th=${escapeHtml(a.threshold)}
+        q2=<b>${escapeHtml(a.quality_v2)}</b>
+        conflict=${escapeHtml(a.conflict_index)}
+      </div>
+    `;
+
+    const eventHtml = `
+      <div class="panel">
+        <div class="h2">Event</div>
+        <div class="kv">
+          <div class="k">event_mode</div><div>${escapeHtml(ev.event_mode)}</div>
+          <div class="k">reason</div><div>${escapeHtml((ev.reason||[]).join(', ') || '—')}</div>
+          <div class="k">lookahead_hours</div><div>${escapeHtml(ev.lookahead_hours)}</div>
+          <div class="k">recent_hours</div><div>${escapeHtml(ev.recent_hours)}</div>
+        </div>
+      </div>
+    `;
+
+    const metaHtml = `
+      <div class="panel">
+        <div class="h2">Meta</div>
+        <div class="kv">
+          <div class="k">gate_profile</div><div>${escapeHtml(meta.gate_profile||'')}</div>
+          <div class="k">feeds_ok_ratio</div><div>${escapeHtml((meta.feeds_status? (Object.keys(meta.feeds_status).length>0 ? '' : '') : ''))}</div>
+          <div class="k">fred_enabled</div><div>${escapeHtml(meta.fred && meta.fred.enabled)}</div>
+          <div class="k">trump_flag</div><div>${escapeHtml(meta.trump && meta.trump.flag)}</div>
+        </div>
+      </div>
+    `;
+
+    const html = headHtml + `<div class="row2">${flipHtml}${topHtml}</div>` + whyHtml + eventHtml + metaHtml;
     showModal('VIEW ' + asset, html);
   }
 
@@ -1439,9 +1857,69 @@ def dashboard():
     try{
       const resp = await fetch('/morning_plan');
       const js = await resp.json();
-      showModal('MORNING PLAN', '<pre>' + escapeHtml(JSON.stringify(js,null,2)) + '</pre>');
+      showModal('MORNING PLAN', '<div class="panel"><div class="h2">JSON</div><div class="list"><div class="item"><pre style="margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px;">' + escapeHtml(JSON.stringify(js,null,2)) + '</pre></div></div></div>');
     }catch(e){
-      showModal('MORNING PLAN', '<pre>' + escapeHtml(String(e)) + '</pre>');
+      showModal('MORNING PLAN', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
+    }
+  }
+
+  async function openCalendar(){
+    try{
+      const resp = await fetch('/calendar_data?limit=140&hours_back=12&hours_fwd=48');
+      const js = await resp.json();
+      const items = js.items || [];
+      const now = js.now_ts || 0;
+
+      function fmtTs(ts){
+        if(!ts) return '(time unknown)';
+        const d = new Date(ts*1000);
+        return d.toISOString().slice(0,16).replace('T',' ') + ' UTC';
+      }
+
+      const table = `
+        <div class="panel">
+          <div class="h2">ECON CALENDAR (best-effort from RSS)</div>
+          <table>
+            <thead>
+              <tr>
+                <th>TIME (UTC)</th>
+                <th>SRC</th>
+                <th>CC</th>
+                <th>CUR</th>
+                <th>IMPACT</th>
+                <th>EVENT</th>
+                <th class="num">ACT</th>
+                <th class="num">PREV</th>
+                <th class="num">CONS</th>
+                <th class="num">FCST</th>
+              </tr>
+            </thead>
+            <tbody>
+              ${items.map(x=>`
+                <tr>
+                  <td>${escapeHtml(fmtTs(x.event_ts))}</td>
+                  <td class="muted">${escapeHtml(x.source||'')}</td>
+                  <td>${escapeHtml(x.country||'—')}</td>
+                  <td>${escapeHtml(x.currency||'—')}</td>
+                  <td>${escapeHtml(x.impact||'—')}</td>
+                  <td>
+                    ${escapeHtml(x.title||'')}
+                    ${x.link ? `<div class="lnk"><a href="${escapeHtml(x.link)}" target="_blank" rel="noopener">open</a></div>` : ''}
+                  </td>
+                  <td class="num">${escapeHtml(x.actual||'—')}</td>
+                  <td class="num">${escapeHtml(x.previous||'—')}</td>
+                  <td class="num">${escapeHtml(x.consensus||'—')}</td>
+                  <td class="num">${escapeHtml(x.forecast||'—')}</td>
+                </tr>
+              `).join('')}
+            </tbody>
+          </table>
+          <div class="kz">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>
+        </div>
+      `;
+      showModal('CALENDAR', table);
+    }catch(e){
+      showModal('CALENDAR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
   }
 
@@ -1449,9 +1927,9 @@ def dashboard():
     try{
       const resp = await fetch('/bias?pretty=1');
       const txt = await resp.text();
-      showModal('BIAS JSON', '<pre>' + escapeHtml(txt) + '</pre>');
+      showModal('BIAS JSON', '<div class="panel"><div class="h2">JSON</div><div class="list"><div class="item"><pre style="margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px;">' + escapeHtml(txt) + '</pre></div></div></div>');
     }catch(e){
-      showModal('BIAS JSON', '<pre>' + escapeHtml(String(e)) + '</pre>');
+      showModal('BIAS JSON', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
   }
 
@@ -1464,11 +1942,12 @@ def dashboard():
       gate_profile: gp,
       event_mode: ev.event_mode,
       event_reason: ev.reason,
+      alerts: (PAYLOAD.meta && PAYLOAD.meta.alerts) ? PAYLOAD.meta.alerts.slice(0,10) : [],
       xau: {bias:a.XAU?.bias, score:a.XAU?.score, q2:a.XAU?.quality_v2, conflict:a.XAU?.conflict_index, flip:a.XAU?.flip},
       us500: {bias:a.US500?.bias, score:a.US500?.score, q2:a.US500?.quality_v2, conflict:a.US500?.conflict_index, flip:a.US500?.flip},
       wti: {bias:a.WTI?.bias, score:a.WTI?.score, q2:a.WTI?.quality_v2, conflict:a.WTI?.conflict_index, flip:a.WTI?.flip},
     };
-    showModal('ANALYST SNAPSHOT', '<pre>' + escapeHtml(JSON.stringify(s,null,2)) + '</pre>');
+    showModal('ANALYST SNAPSHOT', '<div class="panel"><div class="h2">JSON</div><div class="list"><div class="item"><pre style="margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px;">' + escapeHtml(JSON.stringify(s,null,2)) + '</pre></div></div></div>');
   }
 
   document.addEventListener('keydown', (e)=>{
@@ -1476,6 +1955,7 @@ def dashboard():
     if(k === 'escape') closeModal();
     if(k === 'r') runNow();
     if(k === 'm') openMorning();
+    if(k === 'c') openCalendar();
     if(k === 'j') openJson();
     if(k === 'a') openAnalyst();
     if(k === '1') openView('XAU');
@@ -1484,6 +1964,13 @@ def dashboard():
   });
 
   $('modal').addEventListener('click', (e)=>{ if(e.target && e.target.id === 'modal') closeModal(); });
+
+  // Init ticker + show alerts as toasts (once per page load)
+  buildTicker();
+  (ALERTS||[]).slice(0,6).forEach(a=>{
+    toast(a.kind, a.message, a.severity || 'WARN');
+  });
+
 </script>
 </body>
 </html>

@@ -1,10 +1,7 @@
 # app.py
 # NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# - FIX: 3-tier ticker stack: (1) TV live tape (2) headlines (3) alerts+bias
-# - FIX: MYFX calendar in modal uses dark filter + toggle
-# - FIX: M/J/A open readable cards (not raw code only), raw JSON available via button
-# - FIX: Safari-safe JS (no replaceAll / ?? / optional chaining)
-# - FIX (UI): Clean terminal header (no "vinegret"): status grid + next event + event reason
+# - UI FIX (Header): clean "Status Panel" grid + no ugly ellipsis + safe wrap/scroll on small widths
+# - UI FIX (Next event): shows countdown (T- / T+ hours) + separate reason line
 # - KEEP: pipeline, RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
 
 import os
@@ -82,8 +79,8 @@ EVENT_CFG = {
 # Alerts thresholds (server diff)
 ALERT_CFG = {
     "enabled": True,
-    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),                   # points
-    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")), # delta
+    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),              # points
+    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")),  # delta
     "feeds_degraded_ratio": float(os.environ.get("ALERT_FEEDS_DEGRADED_RATIO", "0.80")),  # ok share
 }
 
@@ -109,7 +106,6 @@ RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
 
 # TradingView ticker tape symbols (edit as you like)
-# Note: symbols are TradingView ids. Your broker CFDs can differ; these are common proxies.
 TV_TICKER_SYMBOLS = [
     {"proName": "OANDA:XAUUSD", "title": "XAUUSD"},
     {"proName": "OANDA:EURUSD", "title": "EURUSD"},
@@ -998,12 +994,11 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         )
         quality_v2 = int(max(0, min(100, round(raw_v2 * 100))))
 
+        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
         top3 = _top_drivers(contribs, topn=3)
         cons_by_src = _consensus_by_source(contribs)
         med_abs = _median_abs_contrib(contribs)
         flip = flip_metrics(score, th, bias, med_abs)
-
-        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
 
         assets_out[asset] = {
             "bias": bias,
@@ -1452,6 +1447,25 @@ def _fmt(x: Any, n: int = 3) -> str:
     except Exception:
         return "—"
 
+def _fmt_updated_short(iso_utc: str) -> str:
+    # expects ISO like 2026-02-08T03:29:38.474340+00:00
+    try:
+        # keep YYYY-MM-DD HH:MM UTC
+        dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
+        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        return str(iso_utc)[:16] + " UTC"
+
+def _fmt_countdown_hours(now_ts: int, event_ts: int) -> str:
+    # T-3.2h or T+1.1h
+    try:
+        dh = (int(event_ts) - int(now_ts)) / 3600.0
+        if dh >= 0:
+            return f"T-{dh:.1f}h"
+        return f"T+{abs(dh):.1f}h"
+    except Exception:
+        return ""
+
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
     db_init()
@@ -1464,7 +1478,8 @@ def dashboard():
     event = payload.get("event", {}) or {}
     feeds_status = meta.get("feeds_status", {}) or {}
 
-    updated = payload.get("updated_utc", "")
+    updated_iso = payload.get("updated_utc", "")
+    updated_short = _fmt_updated_short(str(updated_iso))
     gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
     event_mode = bool(event.get("event_mode", False))
     upcoming = (event.get("upcoming_events", []) or [])[:6]
@@ -1492,38 +1507,20 @@ def dashboard():
     feeds_pill = f'<span class="pill {"ok" if feeds_ok else "no"}">FEEDS: {"ok" if feeds_ok else "degraded"} ({feeds_ok_ratio:.2f})</span>'
     fred_pill = '<span class="pill neu">FRED: on</span>' if fred_on else '<span class="pill neu">FRED: off</span>'
 
-    # ---------------------------
-    # Header formatting (clean top)
-    # ---------------------------
-    updated_pretty = updated
-    try:
-        dt_u = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
-        updated_pretty = dt_u.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        pass
+    # Next event line (with countdown)
+    now_ts = int(time.time())
+    next_event_main = "—"
+    next_event_reason_line = reason_txt
 
-    next_event_pretty = "—"
-    next_event_tminus = "—"
     if upcoming:
-        u0 = upcoming[0]
-        ts0 = u0.get("ts")
-        ih = u0.get("in_hours")
-        if ih is not None:
-            try:
-                next_event_tminus = f"T-{float(ih):.1f}h"
-            except Exception:
-                next_event_tminus = "T-?h"
-
-        if ts0:
-            try:
-                dt0 = datetime.fromtimestamp(int(ts0), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-                next_event_pretty = f"{dt0} • {u0.get('title','')}"
-            except Exception:
-                next_event_pretty = f"(UTC) • {u0.get('title','')}"
+        u = upcoming[0]
+        if u.get("ts"):
+            ets = int(u["ts"])
+            dt = datetime.fromtimestamp(ets, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+            cd = _fmt_countdown_hours(now_ts, ets)
+            next_event_main = f"{dt} • {u.get('title','')} ({cd})"
         else:
-            next_event_pretty = f"(time unknown) • {u0.get('title','')}"
-
-    reason_pretty = " • ".join(event_reason) if event_reason else "—"
+            next_event_main = f"(time unknown) • {u.get('title','')}"
 
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
@@ -1596,19 +1593,112 @@ def dashboard():
     a{color:var(--cyan); text-decoration:none;}
     a:hover{text-decoration:underline;}
     .wrap{max-width:1250px; margin:0 auto; padding:14px;}
-    .hdr{border-bottom:1px solid var(--line); padding-bottom:10px; margin-bottom:12px;}
+
+    .hdr{border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px;}
     .title{font-family:var(--mono); font-weight:900; letter-spacing:.8px;}
     .title b{color:var(--amber);}
-    .sub{font-family:var(--mono); color:var(--muted); font-size:12px; margin-top:6px;}
+
+    /* ========= HEADER FIX ========= */
+    .statuspanel{
+      margin-top:10px;
+      background:linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,.01));
+      border:1px solid var(--line);
+      border-radius:18px;
+      padding:12px;
+    }
+    .statusTop{
+      display:flex;
+      justify-content:space-between;
+      gap:10px;
+      align-items:flex-start;
+      flex-wrap:wrap;
+    }
+    .statusGrid{
+      display:grid;
+      grid-template-columns: repeat(6, minmax(160px, 1fr));
+      gap:10px;
+      margin-top:10px;
+    }
+    .kvb{
+      border:1px solid var(--line);
+      background:rgba(255,255,255,.02);
+      border-radius:14px;
+      padding:10px 10px;
+      min-width:0;
+    }
+    .kvb .k{
+      font-family:var(--mono);
+      font-size:11px;
+      letter-spacing:.6px;
+      color:var(--muted);
+      margin-bottom:6px;
+      text-transform:uppercase;
+    }
+    .kvb .v{
+      font-family:var(--mono);
+      font-size:13px;
+      font-weight:900;
+      min-width:0;
+      white-space:nowrap;
+      overflow:hidden;
+      text-overflow:ellipsis;
+    }
+    .kvb .v.wrap{
+      white-space:normal;
+      overflow:visible;
+      text-overflow:clip;
+      line-height:1.25;
+    }
+    .kvb .v .pill{
+      margin-right:8px;
+    }
+    .nextEventRow{
+      margin-top:10px;
+      border-top:1px solid var(--line);
+      padding-top:10px;
+      font-family:var(--mono);
+      font-size:12px;
+      color:var(--text);
+      line-height:1.35;
+    }
+    .nextEventRow .k{color:var(--muted); font-weight:900; margin-right:8px;}
+    .nextEventRow .reason{margin-top:6px; color:var(--muted);}
+
+    /* On smaller widths: reduce columns + allow horizontal scroll if needed */
+    @media(max-width: 1200px){
+      .statusGrid{grid-template-columns: repeat(3, minmax(180px, 1fr));}
+    }
+    @media(max-width: 780px){
+      .statusGrid{grid-template-columns: repeat(2, minmax(160px, 1fr));}
+    }
+    @media(max-width: 420px){
+      .statusGrid{grid-template-columns: 1fr;}
+    }
+
+    /* ========= COMMON ========= */
     .bar{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px;}
-    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
+    .pill{
+      font-family:var(--mono);
+      font-size:12px;
+      font-weight:900;
+      padding:6px 10px;
+      border-radius:999px;
+      border:1px solid var(--line);
+      background:var(--pillbg);
+      white-space:nowrap;              /* prevent weird wrap inside pills */
+      overflow:visible;                /* avoid ellipsis */
+      text-overflow:clip;
+      display:inline-flex;
+      align-items:center;
+      gap:6px;
+    }
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
     .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .no{color:var(--no); border-color: rgba(255,59,59,.25);}
     .warn{color:var(--warn); border-color: rgba(255,176,0,.25);}
-    .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:8px;}
+
     .hotkeys{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px;}
     .btn{background:var(--btn); border:1px solid var(--line); color:var(--text); padding:9px 12px; border-radius:12px; cursor:pointer; font-family:var(--mono); font-weight:900;}
     .btn:hover{background:var(--btn2);}
@@ -1667,46 +1757,6 @@ def dashboard():
     }
     .toggleRow{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;}
 
-    /* --- Clean terminal header --- */
-    .statusbox{
-      margin-top:10px;
-      padding:10px 12px;
-      border:1px solid var(--line);
-      border-radius:14px;
-      background:rgba(255,255,255,.02);
-    }
-    .statusgrid{
-      display:grid;
-      grid-template-columns: 170px 140px 140px 140px 160px 120px;
-      gap:8px 10px;
-      align-items:center;
-      font-family:var(--mono);
-      font-size:12px;
-    }
-    .kvp{display:flex; gap:8px; align-items:center; white-space:nowrap; overflow:hidden;}
-    .kvp .k{color:var(--muted); font-weight:900;}
-    .kvp .v{overflow:hidden; text-overflow:ellipsis;}
-    .line2{
-      margin-top:10px;
-      font-family:var(--mono);
-      font-size:12px;
-      display:flex;
-      gap:10px;
-      flex-wrap:wrap;
-      align-items:center;
-    }
-    .line2 .k{color:var(--muted); font-weight:900;}
-    .line2 .v{color:var(--text);}
-    .line3{
-      margin-top:6px;
-      font-family:var(--mono);
-      font-size:12px;
-      color:var(--muted);
-    }
-    @media(max-width: 980px){
-      .statusgrid{grid-template-columns: 1fr 1fr;}
-    }
-
     @media(max-width: 780px){
       .why{max-width:none;}
       th:nth-child(11), td:nth-child(11) {display:none;}
@@ -1721,24 +1771,43 @@ def dashboard():
   <div class="hdr">
     <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
 
-    <div class="statusbox">
-      <div class="statusgrid">
-        <div class="kvp"><span class="k">Updated (UTC)</span><span class="v">__UPDATED_PRETTY__</span></div>
-        <div class="kvp"><span class="k">Gate</span><span class="v">__GATE_PROFILE__</span></div>
-        <div class="kvp"><span class="k">Event</span><span class="v">__EV_PILL__</span></div>
-        <div class="kvp"><span class="k">Trump</span><span class="v">__TR_PILL__</span></div>
-        <div class="kvp"><span class="k">Feeds</span><span class="v">__FEEDS_PILL__</span></div>
-        <div class="kvp"><span class="k">FRED</span><span class="v">__FRED_PILL__</span></div>
+    <!-- STATUS PANEL (clean + readable) -->
+    <div class="statuspanel">
+      <div class="statusTop">
+        <div class="tick"><span class="tag">Updated</span> <b>__UPDATED_SHORT__</b></div>
+        <div class="tick"><span class="tag">Profile</span> <b>__GATE_PROFILE__</b></div>
       </div>
 
-      <div class="line2">
-        <span class="k">Next event</span>
-        <span class="v">__NEXT_EVENT_PRETTY__</span>
-        <span class="muted">(__NEXT_EVENT_TMINUS__)</span>
+      <div class="statusGrid">
+        <div class="kvb">
+          <div class="k">Event</div>
+          <div class="v wrap">__EV_PILL__</div>
+        </div>
+        <div class="kvb">
+          <div class="k">Trump</div>
+          <div class="v wrap">__TR_PILL__</div>
+        </div>
+        <div class="kvb">
+          <div class="k">Feeds</div>
+          <div class="v wrap">__FEEDS_PILL__</div>
+        </div>
+        <div class="kvb">
+          <div class="k">FRED</div>
+          <div class="v wrap">__FRED_PILL__</div>
+        </div>
+        <div class="kvb">
+          <div class="k">Diagnostics</div>
+          <div class="v"><a class="pill neu" href="/diag" target="_blank" rel="noopener">/diag</a></div>
+        </div>
+        <div class="kvb">
+          <div class="k">Run</div>
+          <div class="v wrap"><span class="pill neu">token_required=__RUN_TOKEN_REQUIRED__</span></div>
+        </div>
       </div>
 
-      <div class="line3">
-        <span class="k">Event reason:</span> __EVENT_REASON_PRETTY__
+      <div class="nextEventRow">
+        <div><span class="k">Next event</span> __NEXT_EVENT__</div>
+        <div class="reason"><span class="k">Reason</span> __EVENT_REASON__</div>
       </div>
     </div>
 
@@ -1767,10 +1836,6 @@ def dashboard():
       <div class="tickerline">
         <div class="marquee marq-fast" id="marqueeAB"></div>
       </div>
-    </div>
-
-    <div class="btnrow">
-      <a class="btn" href="/diag" target="_blank" rel="noopener">/diag</a>
     </div>
 
     <div class="btnrow">
@@ -1809,7 +1874,7 @@ def dashboard():
       </tbody>
     </table>
 
-    <div class="kz">
+    <div class="tick" style="margin-top:10px;">
       Flip units: score-sum (weighted evidence), not % / not market points.
       TO_NEU = ΔScore to return to Neutral band. TO_OPP = ΔScore to flip to opposite bias.
       ≈HEADLINES = TO_OPP / median(|contrib|) (rough).
@@ -1955,7 +2020,7 @@ def dashboard():
       '    <div class="k">median_abs</div><div>' + escapeHtml(flip.median_abs_contrib) + '</div>' +
       '    <div class="k">≈headlines</div><div>' + escapeHtml(approx) + '</div>' +
       '  </div>' +
-      '  <div class="kz">' + escapeHtml(flip.note||'') + '</div>' +
+      '  <div class="tick" style="margin-top:10px;">' + escapeHtml(flip.note||'') + '</div>' +
       '</div>';
 
     var topHtml =
@@ -2054,10 +2119,10 @@ def dashboard():
           +    '<b>Q2=' + escapeHtml(p.quality_v2) + '</b> <span class="muted">conflict=' + escapeHtml(p.conflict) + '</span>'
           + '  </div>'
           + '  <div style="margin-top:10px;">' + pillGate(!!gate.ok) + '</div>'
-          + '  <div class="kz" style="margin-top:10px;"><b>Drivers:</b> ' + escapeHtml(why.join(' | ') || '—') + '</div>'
-          + '  <div class="kz" style="margin-top:10px;"><b>Flip:</b> to_neu=' + escapeHtml(flip.to_neutral) + ' • to_opp=' + escapeHtml(flip.to_opposite) + ' • ≈headlines=' + escapeHtml(approx) + '</div>'
-          + (fails ? ('<div class="kz" style="margin-top:10px;"><b>Blocks:</b>' + fails + '</div>') : '')
-          + (must ? ('<div class="kz" style="margin-top:10px;"><b>Must change:</b>' + must + '</div>') : '')
+          + '  <div class="tick" style="margin-top:10px;"><b>Drivers:</b> ' + escapeHtml(why.join(' | ') || '—') + '</div>'
+          + '  <div class="tick" style="margin-top:10px;"><b>Flip:</b> to_neu=' + escapeHtml(flip.to_neutral) + ' • to_opp=' + escapeHtml(flip.to_opposite) + ' • ≈headlines=' + escapeHtml(approx) + '</div>'
+          + (fails ? ('<div class="tick" style="margin-top:10px;"><b>Blocks:</b>' + fails + '</div>') : '')
+          + (must ? ('<div class="tick" style="margin-top:10px;"><b>Must change:</b>' + must + '</div>') : '')
           + '</div>';
       }
 
@@ -2125,7 +2190,7 @@ def dashboard():
         }).join('') +
         '    </tbody>' +
         '  </table>' +
-        '  <div class="kz">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>' +
+        '  <div class="tick" style="margin-top:10px;">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>' +
         '</div>';
 
       showModal('C CAL (DB)', table);
@@ -2145,8 +2210,8 @@ def dashboard():
       + '  <div class="iframebox dark" id="myfxBox">'
       + '    <iframe src="/myfx_calendar" loading="lazy"></iframe>'
       + '  </div>'
-      + '  <div class="kz">If blocked, open /myfx_calendar in a new tab.</div>'
-      + '</div>';
+      + '  <div class="tick" style="margin-top:10px;">If blocked, open /myfx_calendar in a new tab.</div>' +
+      '</div>';
     showModal('E MYFX CAL', html);
   }
 
@@ -2257,15 +2322,15 @@ def dashboard():
 """
 
     html = (TEMPLATE
-        .replace("__UPDATED_PRETTY__", str(updated_pretty))
+        .replace("__UPDATED_SHORT__", str(updated_short))
         .replace("__GATE_PROFILE__", str(gate_profile))
+        .replace("__NEXT_EVENT__", str(next_event_main))
+        .replace("__EVENT_REASON__", str(next_event_reason_line))
         .replace("__EV_PILL__", ev_pill)
         .replace("__TR_PILL__", tr_pill)
         .replace("__FEEDS_PILL__", feeds_pill)
         .replace("__FRED_PILL__", fred_pill)
-        .replace("__NEXT_EVENT_PRETTY__", str(next_event_pretty))
-        .replace("__NEXT_EVENT_TMINUS__", str(next_event_tminus))
-        .replace("__EVENT_REASON_PRETTY__", str(reason_pretty))
+        .replace("__RUN_TOKEN_REQUIRED__", "true" if bool(meta.get("run_token_required", False)) else "false")
         .replace("__ROW_XAU__", row("XAU"))
         .replace("__ROW_US500__", row("US500"))
         .replace("__ROW_WTI__", row("WTI"))

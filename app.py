@@ -1858,6 +1858,21 @@ def dashboard():
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
+    /* === SUMMARY TABLE: fix misalignment / overflow === */
+.tablewrap{
+  overflow-x:auto;
+  -webkit-overflow-scrolling:touch;
+}
+
+/* Make the last column stable and prevent the View button from overflowing */
+.panel table .btn{
+  padding: 8px 10px;
+  border-radius: 10px;
+  font-size: 12px;
+  line-height: 1;
+  box-sizing: border-box;
+}
+
   </style>
 </head>
 <body>
@@ -1940,21 +1955,25 @@ def dashboard():
   </div>
 
   <div class="panel">
-    <div class="blockTitle">SUMMARY TABLE</div>
+  <div class="blockTitle">SUMMARY TABLE</div>
+
+  <div class="tablewrap">
     <table>
       <colgroup>
         <col style="width:90px">
         <col style="width:140px">
         <col style="width:140px">
         <col>
-        <col style="width:92px">
+        <col style="width:112px">
       </colgroup>
       <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (short)</th><th></th></tr></thead>
       <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
     </table>
-    <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.</div>
   </div>
+
+  <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.</div>
 </div>
+
 
 <div class="modal" id="modal">
   <div class="box">

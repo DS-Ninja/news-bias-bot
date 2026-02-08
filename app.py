@@ -1655,6 +1655,9 @@ def dashboard():
       animation:scroll 30s linear infinite;
     }
     .marquee:hover .marqueeInner{animation-play-state:paused;}
+    
+    #marqueeNews{ animation-duration: 60s; }   /* HEADLINES в 2 раза медленнее */
+    
     @keyframes scroll{
       0%{transform:translateX(0);}
       100%{transform:translateX(-50%);}

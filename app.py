@@ -1,14 +1,11 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# FIXES v2026-02-08b:
-# - UI: named blocks (META / SWITCHBOARD / ACTIONS / MARKET TAPE / TICKERS / SUMMARY TABLE)
-# - UI: table stability (fixed layout + colgroup + wrap) to prevent “pushing/misalignment”
-# - Calendar: stronger parsing for MYFX_CAL + generic blob datetime parse (prevents USD events missing ts)
-# - Next event: prefers USD; if USD exists but has no ts, shows USD "(time unknown)" instead of switching to JPY
-# - Calendar: impact normalization LOW/MED/HIGH displayed everywhere
-# - RUN token: supports RUN_TOKENS (comma-separated) + better mismatch UX + clear saved token
-# - /diag: shows run_token_hashes (safe) to debug token mismatch
-# - VIEW: keeps existing evidence view; calendar fields cleaner
+# FIXES v2026-02-08c:
+# - UI: SUMMARY TABLE overflow fix (tablewrap + wider action col + table-only button override)
+# - SWITCHBOARD: renamed + clickable chips -> modal explanations (mobile friendly)
+# - DIAG: /diag is now HTML page, /diag.json is raw JSON
+# - RUN: label now OPEN/LOCKED
+# - MACRO: label now MACRO ON/OFF (FRED drivers)
 
 import os
 import json
@@ -466,7 +463,7 @@ def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
 def _run_token_status() -> Tuple[bool, str]:
     if not RUN_TOKENS:
         return False, "Open (no token required)"
-    return True, f"Protected (token required). expected_hash={','.join(RUN_TOKEN_HASHES) or '—'}"
+    return True, f"Locked (token required). expected_hash={','.join(RUN_TOKEN_HASHES) or '—'}"
 
 def _fmt_hhmm_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -481,14 +478,12 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
     if not x:
         return None
     s = str(x).strip().upper()
-    # normalize common variants
     if s in ("HIGH", "H"):
         return "HIGH"
     if s in ("MEDIUM", "MED", "M"):
         return "MED"
     if s in ("LOW", "L"):
         return "LOW"
-    # ForexFactory sometimes uses "High", "Medium", "Low"
     if s.startswith("HI"):
         return "HIGH"
     if s.startswith("ME"):
@@ -562,7 +557,6 @@ def _get_entry_field(e: dict, keys: List[str]) -> Optional[str]:
         v = e.get(k)
         if v is None:
             continue
-        # feedparser may return lists for some tags
         if isinstance(v, list) and v:
             vv = v[0]
             if vv is not None:
@@ -571,10 +565,6 @@ def _get_entry_field(e: dict, keys: List[str]) -> Optional[str]:
     return None
 
 def _try_parse_ff_datetime(e: dict) -> Optional[int]:
-    """
-    ForexFactory xml often has custom tags: date, time, datetime, etc.
-    We try several keys and patterns. If we cannot parse, return None.
-    """
     d_raw = _get_entry_field(e, ["date", "event_date", "ff_date", "ev_date"])
     t_raw = _get_entry_field(e, ["time", "event_time", "ff_time", "ev_time"])
 
@@ -582,7 +572,6 @@ def _try_parse_ff_datetime(e: dict) -> Optional[int]:
         d_raw2 = d_raw.strip()
         t_raw2 = t_raw.strip()
 
-        # If time like "All Day" or "Tentative" -> not parseable
         if not re.search(r"\d", t_raw2):
             return None
 
@@ -619,21 +608,15 @@ def _try_parse_ff_datetime(e: dict) -> Optional[int]:
     return None
 
 def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
-    """
-    Generic fallback: parse common datetime patterns from title/summary blob.
-    Returns UTC ts or None.
-    """
     if not blob:
         return None
     s = " ".join(str(blob).split())
 
-    # 1) ISO: 2026-02-08 23:30
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})", s)
     if m:
         y, mo, da, hh, mm = [int(m.group(i)) for i in range(1, 6)]
         return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # 2) US-ish: Feb 8, 2026 23:30
     m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         mon = _MONTHS.get(m.group(1).lower()[:3])
@@ -641,7 +624,6 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # 3) EU-ish: 08 Feb 2026 23:30
     m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da = int(m.group(1)); mon = _MONTHS.get(m.group(2).lower()[:3]); y = int(m.group(3))
@@ -649,7 +631,6 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # 4) DD/MM/YYYY HH:MM
     m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da, mo, y, hh, mm = [int(m.group(i)) for i in range(1, 6)]
@@ -659,19 +640,13 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
     return None
 
 def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
-    """
-    Extract currency/impact/values from entry fields and text blob.
-    Handles MYFXBook/FF quirks: currency often lives in tags/categories.
-    """
     title = (e.get("title") or "").strip()
     summary = (e.get("summary") or e.get("description") or "").strip()
     blob = (title + " " + summary).strip()
 
-    # Direct tags (best)
     currency = _get_entry_field(e, ["currency", "ccy", "cur", "ff_currency"])
     impact = _get_entry_field(e, ["impact", "importance", "ff_impact", "volatility"])
 
-    # --- NEW: read tags/categories (MYFXBook часто кладёт валюту туда)
     if not currency:
         tags = e.get("tags") or e.get("categories") or []
         try:
@@ -688,7 +663,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
         except Exception:
             pass
 
-    # Text fallback
     if not currency:
         m = _CUR_PAT.search(blob)
         if m:
@@ -762,7 +736,6 @@ def ingest_calendar_once(limit_per_feed: int = 250) -> int:
                             except Exception:
                                 event_ts = None
 
-                    # NEW: generic blob parse (helps MYFX_CAL / messy feeds)
                     if event_ts is None:
                         blob = ((e.get("title") or "") + " " + (e.get("summary") or e.get("description") or "")).strip()
                         event_ts = _try_parse_any_datetime_from_blob(blob)
@@ -845,7 +818,6 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
-    # fallback: show latest rows even if ts missing (for diagnostics/morning modal)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1323,7 +1295,6 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     p_assets = (prev.get("assets", {}) or {})
     c_assets = (cur.get("assets", {}) or {})
 
-    # Event mode flip
     p_ev = bool((prev.get("event", {}) or {}).get("event_mode", False))
     c_ev = bool((cur.get("event", {}) or {}).get("event_mode", False))
     if p_ev != c_ev:
@@ -1375,7 +1346,6 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
                 extra={"prev": pc, "cur": cc}
             )
 
-    # Feeds degraded flip based on ratio
     p_meta = (prev.get("meta", {}) or {})
     c_meta = (cur.get("meta", {}) or {})
     p_fs = (p_meta.get("feeds_status", {}) or {})
@@ -1473,7 +1443,7 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
             oc = float(cfg.get("event_override_conflict", 0.45))
             if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
                 fail.append("Event mode is ON (macro risk)")
-                fail_short.append("EVENT")
+                fail_short.append("RISK")
                 must.append(f"Wait OR require Q2≥{oq} & Conflict≤{oc} & bias!=NEUTRAL")
 
     ok = (len(fail) == 0)
@@ -1515,8 +1485,9 @@ def health(pretty: int = 0):
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
     return out
 
-@app.get("/diag")
-def diag():
+# ---- RAW JSON DIAG (for you)
+@app.get("/diag.json")
+def diag_json():
     db_init()
     env = {
         "has_DATABASE_URL": bool(os.environ.get("DATABASE_URL", "").strip()),
@@ -1547,6 +1518,40 @@ def diag():
 
     return {"db": {"ok": ok, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events}, "env": env}
 
+# ---- HTML DIAG PAGE (human)
+@app.get("/diag", response_class=HTMLResponse)
+def diag_page():
+    d = diag_json()
+    pretty = json.dumps(d, ensure_ascii=False, indent=2)
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DIAG</title>
+<style>
+html,body{{margin:0;background:#070a0f;color:#d7e2ff;font-family:ui-monospace,Menlo,Consolas,monospace}}
+.wrap{{max-width:1100px;margin:0 auto;padding:16px}}
+h1{{font-size:14px;color:#ffb000;margin:0 0 12px 0}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#0b111a;border:1px solid rgba(255,255,255,.08);
+padding:12px;border-radius:12px;}}
+a{{color:#00e5ff;text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 14px}}
+.btn{{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
+background:#0f1724;color:#d7e2ff}}
+</style>
+</head><body>
+<div class="wrap">
+  <h1>DIAG</h1>
+  <div class="row">
+    <a class="btn" href="/dashboard">← Back</a>
+    <a class="btn" href="/diag.json" target="_blank" rel="noopener">Open JSON</a>
+  </div>
+  <pre>{pretty}</pre>
+</div>
+</body></html>"""
+    return HTMLResponse(html)
+
 @app.get("/rules")
 def rules():
     return {"assets": ASSETS, "rules": RULES}
@@ -1567,7 +1572,6 @@ def _auth_run(token: str) -> bool:
     t = (token or "").strip()
     if not t:
         return False
-    # constant-ish time compare across list
     for x in RUN_TOKENS:
         if hashlib.sha256(t.encode()).digest() == hashlib.sha256(x.encode()).digest():
             return True
@@ -1652,21 +1656,15 @@ def _pill_impact(imp: Optional[str]) -> str:
     return '<span class="pill neu">—</span>'
 
 def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str]:
-    """
-    STRICT: Next event should be only prefer_ccy (default USD).
-    If no prefer_ccy events exist -> show explicit message.
-    """
     if not upcoming:
         return "No upcoming events in horizon", ""
 
     prefer_ccy = (prefer_ccy or "USD").upper()
 
-    # Keep only prefer_ccy events (both timed and unknown-time)
     pref = [x for x in upcoming if str(x.get("currency") or "").upper() == prefer_ccy]
     if not pref:
         return f"No {prefer_ccy} events in horizon", ""
 
-    # First: timed
     timed = [x for x in pref if x.get("ts")]
     if timed:
         timed.sort(key=lambda x: int(x.get("ts") or 0))
@@ -1678,7 +1676,6 @@ def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: st
             str(pick.get("source", "")),
         )
 
-    # Else: unknown time
     u = pref[0]
     imp = _impact_norm(u.get("impact"))
     return (f"(time unknown) • {prefer_ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", "")))
@@ -1720,19 +1717,30 @@ def dashboard():
         assets[sym] = a
     payload["assets"] = assets
 
-    def _chip(label: str, value: str, cls: str, tip: str) -> str:
-        return f'<span class="chip {cls}" title="{tip}"><span class="k">{label}</span> {value}</span>'
+    def _chip(label: str, value: str, cls: str, tip: str, key: str) -> str:
+        return f'<button class="chip {cls}" data-chip="{key}" title="{tip}"><span class="k">{label}</span> {value}</button>'
 
-    ev_chip = _chip("EVENT", "ON" if event_mode else "OFF", "warn" if event_mode else "neu",
-                    "EVENT MODE = macro risk window (recent major releases or upcoming events).")
-    tr_chip = _chip("TRUMP", ("FLAG" if (trump_enabled and trump_flag) else ("ON" if trump_enabled else "OFF")),
+    # --- SWITCHBOARD labels (human)
+    risk_val = "HIGH" if event_mode else "LOW"
+    ev_chip = _chip("RISK", risk_val, "warn" if event_mode else "neu",
+                    "Macro-risk window (recent major releases or upcoming events). Click for details.", "risk")
+
+    head_val = ("HOT" if (trump_enabled and trump_flag) else ("ON" if trump_enabled else "OFF"))
+    tr_chip = _chip("HEADLINES", head_val,
                     "warn" if (trump_enabled and trump_flag) else "neu",
-                    "TRUMP FLAG = Trump-related headlines detected in last 12h.")
+                    "Trump/White House headline monitor. HOT=hits in last 12h. Click for details.", "headlines")
+
     fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
                     "ok" if feeds_ok else "no",
-                    "FEEDS OK ratio = share of RSS feeds successfully parsed.")
-    fr_chip = _chip("FRED", ("ON" if fred_on else "OFF"), "neu", "FRED OFF reason: " + fred_why)
-    rn_chip = _chip("RUN", ("TOKEN" if token_required else "OPEN"), "neu", "RUN = refresh pipeline. " + token_why)
+                    "RSS parsing health. DEGRADED means bias/quality less reliable. Click for details.", "feeds")
+
+    fr_chip = _chip("MACRO", ("ON" if fred_on else "OFF"), "neu",
+                    "Macro drivers (FRED). OFF reason: " + fred_why + ". Click for details.", "macro")
+
+    rn_chip = _chip("RUN", ("LOCKED" if token_required else "OPEN"), "neu",
+                    "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
+
+    # DIAG stays as a link (opens HTML page)
     dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
 
     def row(asset: str) -> str:
@@ -1788,12 +1796,18 @@ def dashboard():
     .metaLine .k{color:var(--muted);}
     .metaLine .v{color:var(--text); font-weight:900;}
     .chips{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; align-items:center;}
+
     .chip{font-family:var(--mono); font-size:12px; font-weight:900; padding:8px 10px; border-radius:14px; border:1px solid var(--line); background:var(--pillbg); display:inline-flex; gap:10px; align-items:center;}
     .chip .k{color:var(--muted); font-weight:900;}
     .chip.ok{color:var(--ok); border-color:rgba(0,255,106,.25);}
     .chip.no{color:var(--no); border-color:rgba(255,59,59,.25);}
     .chip.warn{color:var(--warn); border-color:rgba(255,176,0,.25);}
     .chip.neu{color:#b8c3da;}
+
+    /* Chips as buttons */
+    button.chip{cursor:pointer; appearance:none; -webkit-appearance:none;}
+    button.chip:active{transform:translateY(1px);}
+
     .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
@@ -1813,6 +1827,10 @@ def dashboard():
     .sym{color:var(--amber); font-weight:900;}
     .why{color:var(--text); overflow-wrap:anywhere; word-break:break-word;}
     .act{text-align:right; white-space:nowrap;}
+
+    /* === SUMMARY TABLE overflow fix === */
+    .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch;}
+    .panel table .btn{padding:8px 10px; border-radius:10px; font-size:12px; line-height:1; box-sizing:border-box;}
 
     .muted{color:var(--muted);}
     .tvwrap{margin-top:12px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
@@ -1858,21 +1876,6 @@ def dashboard():
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
-    /* === SUMMARY TABLE: fix misalignment / overflow === */
-.tablewrap{
-  overflow-x:auto;
-  -webkit-overflow-scrolling:touch;
-}
-
-/* Make the last column stable and prevent the View button from overflowing */
-.panel table .btn{
-  padding: 8px 10px;
-  border-radius: 10px;
-  font-size: 12px;
-  line-height: 1;
-  box-sizing: border-box;
-}
-
   </style>
 </head>
 <body>
@@ -1900,7 +1903,6 @@ def dashboard():
           <span style="color:var(--text);font-weight:900;">__NEXT_EVENT__</span>
           <span class="muted" style="font-weight:900;">__NEXT_EVENT_SRC__</span>
         </span>
-
       </div>
     </div>
 
@@ -1910,6 +1912,7 @@ def dashboard():
       <div class="chips">
         __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __DIAG_CHIP__
       </div>
+      <div class="kz" style="margin-top:8px;">Tip: chips are clickable — tap to see what they mean + current details.</div>
     </div>
 
     <!-- ACTIONS -->
@@ -1939,9 +1942,10 @@ def dashboard():
 
     <!-- TICKERS -->
     <div class="block">
-      <div class="blockTitle">TICKERS | HEADLINES (latest)</div>
+      <div class="blockTitle">TICKERS</div>
       <div class="tickerstack">
         <div>
+          <div class="ticklabel">HEADLINES (latest)</div>
           <div class="tickerline marquee"><div class="marqueeInner" id="marqueeNews"></div></div>
         </div>
         <div>
@@ -1954,25 +1958,25 @@ def dashboard():
   </div>
 
   <div class="panel">
-  <div class="blockTitle">SUMMARY TABLE</div>
+    <div class="blockTitle">SUMMARY TABLE</div>
 
-  <div class="tablewrap">
-    <table>
-      <colgroup>
-        <col style="width:90px">
-        <col style="width:140px">
-        <col style="width:140px">
-        <col>
-        <col style="width:112px">
-      </colgroup>
-      <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (short)</th><th></th></tr></thead>
-      <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
-    </table>
+    <div class="tablewrap">
+      <table>
+        <colgroup>
+          <col style="width:90px">
+          <col style="width:140px">
+          <col style="width:140px">
+          <col>
+          <col style="width:112px">
+        </colgroup>
+        <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (short)</th><th></th></tr></thead>
+        <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
+      </table>
+    </div>
+
+    <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.</div>
   </div>
-
-  <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.</div>
 </div>
-
 
 <div class="modal" id="modal">
   <div class="box">
@@ -2075,6 +2079,97 @@ def dashboard():
     $('marqueeStatus').innerHTML = line + ' <span class="muted">•</span> ' + line;
   }
 
+  // --- CHIP EXPLAIN (clickable switchboard)
+  function explainChip(key){
+    const ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
+    const meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
+    const feeds = (meta.feeds_status || {});
+    const fred = (meta.fred || {});
+    const trump = (meta.trump || {});
+    const tokenReq = !!meta.run_token_required;
+
+    let title = 'INFO';
+    let body = '';
+
+    if(key === 'risk'){
+      title = 'RISK (Event Mode)';
+      body =
+        '<div class="panel"><div class="h2">What it means</div><div class="list">'
+        + '<div class="item"><div class="t">HIGH</div><div class="m">Macro-risk window: recent major releases or upcoming events.</div></div>'
+        + '<div class="item"><div class="t">LOW</div><div class="m">No macro triggers in your configured horizon.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">event_mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + '</div></div>'
+        + '<div class="item"><div class="t">reason</div><div class="m">' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
+        + '<div class="item"><div class="t">lookahead</div><div class="m">' + escapeHtml(String(ev.lookahead_hours||'')) + 'h</div></div>'
+        + '<div class="item"><div class="t">recent</div><div class="m">' + escapeHtml(String(ev.recent_hours||'')) + 'h</div></div>'
+        + '</div></div>';
+    }
+
+    if(key === 'headlines'){
+      title = 'HEADLINES (Trump filter)';
+      body =
+        '<div class="panel"><div class="h2">What it means</div><div class="list">'
+        + '<div class="item"><div class="t">HOT</div><div class="m">Detected Trump/White House headlines in last 12h.</div></div>'
+        + '<div class="item"><div class="t">ON</div><div class="m">Monitoring enabled, no hits.</div></div>'
+        + '<div class="item"><div class="t">OFF</div><div class="m">Monitoring disabled.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">enabled</div><div class="m">' + escapeHtml(trump.enabled ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">flag</div><div class="m">' + escapeHtml(trump.flag ? 'true' : 'false') + '</div></div>'
+        + '</div></div>';
+    }
+
+    if(key === 'feeds'){
+      title = 'FEEDS (RSS health)';
+      body =
+        '<div class="panel"><div class="h2">What it means</div><div class="list">'
+        + '<div class="item"><div class="t">OK</div><div class="m">Most feeds parsed successfully.</div></div>'
+        + '<div class="item"><div class="t">DEGRADED</div><div class="m">Many feeds failing → bias/quality less reliable.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">feeds tracked</div><div class="m">' + escapeHtml(String(Object.keys(feeds||{}).length)) + '</div></div>'
+        + '<div class="item"><div class="t">Tip</div><div class="m">Open DIAG to inspect feed errors.</div></div>'
+        + '</div></div>';
+    }
+
+    if(key === 'macro'){
+      title = 'MACRO (FRED drivers)';
+      body =
+        '<div class="panel"><div class="h2">What it means</div><div class="list">'
+        + '<div class="item"><div class="t">ON</div><div class="m">Bias includes macro drivers (yields/USD/VIX etc.).</div></div>'
+        + '<div class="item"><div class="t">OFF</div><div class="m">Only RSS evidence (more noise). Typical cause: missing FRED_API_KEY.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">enabled</div><div class="m">' + escapeHtml(fred.enabled ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">requests_present</div><div class="m">' + escapeHtml(fred.requests_present ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">Fix</div><div class="m">Set env: FRED_ENABLED=1 and FRED_API_KEY=...</div></div>'
+        + '</div></div>';
+    }
+
+    if(key === 'run'){
+      title = 'RUN (refresh access)';
+      body =
+        '<div class="panel"><div class="h2">What it means</div><div class="list">'
+        + '<div class="item"><div class="t">LOCKED</div><div class="m">/run requires token (prevents abuse).</div></div>'
+        + '<div class="item"><div class="t">OPEN</div><div class="m">/run is public.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">token_required</div><div class="m">' + escapeHtml(tokenReq ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">Tip</div><div class="m">If locked, Clear saved token then RUN and paste correct token.</div></div>'
+        + '</div></div>';
+    }
+
+    showModal(title, body || '<div class="panel"><div class="h2">—</div></div>');
+  }
+
+  document.addEventListener('click', function(e){
+    const el = e.target && e.target.closest ? e.target.closest('.chip[data-chip]') : null;
+    if(!el) return;
+    const key = el.getAttribute('data-chip') || '';
+    explainChip(key);
+  });
+
   function openView(sym){
     var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
     var gate = a.ui_gate || {};
@@ -2137,7 +2232,7 @@ def dashboard():
     var html =
       '<div class="panel"><div class="h2">Morning</div><div class="list">'
       + '<div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>'
-      + '<div class="item"><div class="t">Event mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
+      + '<div class="item"><div class="t">Risk mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
       + '</div></div>'
       + '<div class="panel"><div class="h2">Upcoming events</div><div class="list">'
       + (upcoming.length ? upcoming.map(evRow).join('') : '<div class="item"><div class="t">—</div></div>')

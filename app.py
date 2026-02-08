@@ -1656,7 +1656,7 @@ def dashboard():
     }
     .marquee:hover .marqueeInner{animation-play-state:paused;}
     
-    #marqueeNews{ animation-duration: 60s; }   /* HEADLINES в 2 раза медленнее */
+    #marqueeNews{ animation-duration: 120s; }   /* HEADLINES в 2 раза медленнее */
     
     @keyframes scroll{
       0%{transform:translateX(0);}

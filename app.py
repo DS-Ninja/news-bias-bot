@@ -1,8 +1,13 @@
 # app.py
-# NEWS BIAS // TERMINAL (Bloomberg-ish) — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# - UI FIX (Header): clean "Status Panel" grid + no ugly ellipsis + safe wrap/scroll on small widths
-# - UI FIX (Next event): shows countdown (T- / T+ hours) + separate reason line
-# - KEEP: pipeline, RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
+# NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
+# UI REWORK (User-friendly, minimal, fast):
+# - Replaces “cards with unclear meaning” -> one clean STATUS BAR with plain labels + short explanations
+# - “Next event” now prefers USD events (if available) + shows countdown
+# - Reason text made human-readable
+# - Removes heavy/technical columns from main table (keeps only what matters)
+# - Simplifies VIEW + MORNING into short, readable summaries
+# - Fixes marquee looping (no mid-line cut)
+# - TradingView tape uses ICMARKETS symbols (US500 should show if TV has them)
 
 import os
 import json
@@ -102,16 +107,17 @@ FRED_SERIES = {
 # Token for /run GET/POST (cron)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 
-# MyFXBook widget iframe (as requested)
+# MyFXBook widget iframe
 MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
 
-# TradingView ticker tape symbols (edit as you like)
+# TradingView ticker tape symbols
+# IMPORTANT: these are TradingView symbols; use ICMARKETS where possible to match your expectation.
 TV_TICKER_SYMBOLS = [
-    {"proName": "OANDA:XAUUSD", "title": "XAUUSD"},
-    {"proName": "OANDA:EURUSD", "title": "EURUSD"},
-    {"proName": "SP:SPX", "title": "US500"},
-    {"proName": "TVC:USOIL", "title": "WTI"},
-    {"proName": "OANDA:USDJPY", "title": "USDJPY"},
+    {"proName": "ICMARKETS:XAUUSD", "title": "XAUUSD"},
+    {"proName": "ICMARKETS:EURUSD", "title": "EURUSD"},
+    {"proName": "ICMARKETS:US500",  "title": "US500"},
+    {"proName": "ICMARKETS:USOIL",  "title": "WTI"},
+    {"proName": "ICMARKETS:USDJPY", "title": "USDJPY"},
 ]
 
 # RSS feeds
@@ -407,6 +413,56 @@ def _feeds_ok_ratio(feeds_status: dict) -> float:
         return 1.0
     return ok / total
 
+def _human_event_reason(reason_list: List[str]) -> str:
+    # convert internal tokens to readable line
+    if not reason_list:
+        return "No macro trigger"
+    out = []
+    for r in reason_list:
+        r = str(r)
+        if r.startswith("upcoming<="):
+            # upcoming<= 18h
+            hh = r.split("<=")[-1].strip()
+            out.append(f"Upcoming macro within {hh}")
+        elif r.startswith("recent_macro<="):
+            hh = r.split("<=")[-1].strip()
+            out.append(f"Recent macro within {hh}")
+        elif r == "calendar_time_unknown":
+            out.append("Calendar time unknown (RSS)")
+        elif r == "no_macro_no_upcoming":
+            out.append("No macro triggers")
+        elif r == "disabled":
+            out.append("Disabled")
+        else:
+            out.append(r)
+    return " | ".join(out)
+
+def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
+    # returns (on, explanation)
+    if not FRED_CFG.get("enabled", True):
+        return False, "Disabled by env (FRED_ENABLED=0)"
+    if requests is None:
+        return False, "requests package missing"
+    if not (FRED_CFG.get("api_key") or "").strip():
+        return False, "Missing FRED_API_KEY"
+    if not bool(meta_fred.get("enabled", False)):
+        return False, "Not active (check key/requests)"
+    return True, "OK"
+
+def _run_token_status() -> Tuple[bool, str]:
+    if not RUN_TOKEN:
+        return False, "Open (no token required)"
+    return True, "Protected (/run requires token)"
+
+def _fmt_hhmm_utc(ts: int) -> str:
+    return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+
+def _fmt_countdown(now_ts: int, future_ts: int) -> str:
+    dsec = int(future_ts - now_ts)
+    if dsec <= 0:
+        return "T+0.0h"
+    return f"T-{round(dsec/3600.0, 1)}h"
+
 # ============================================================
 # INGEST (NEWS)
 # ============================================================
@@ -464,10 +520,6 @@ _CC_PAT = re.compile(r"\b(US|EU|DE|FR|ES|UK|GB|JP|CN|AU|CA|CH|NZ)\b")
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
 
 def _parse_calendar_fields(title: str, summary: str) -> Dict[str, Optional[str]]:
-    """
-    Best-effort parsing from RSS title/summary.
-    Different calendars format differently; we keep it robust and allow Nones.
-    """
     t = (title or "").strip()
     s = (summary or "").strip()
     blob = (t + " " + s).strip()
@@ -588,7 +640,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT source, title, link, event_ts
+                SELECT source, title, link, event_ts, currency
                 FROM econ_events
                 WHERE event_ts IS NOT NULL AND event_ts BETWEEN %s AND %s
                 ORDER BY event_ts ASC
@@ -596,12 +648,13 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             """, (now_ts, horizon, int(EVENT_CFG["max_upcoming"])))
             rows = cur.fetchall()
 
-    for (source, title, link, ts) in rows:
+    for (source, title, link, ts, currency) in rows:
         out.append({
             "source": source,
             "title": title,
             "link": link,
             "ts": int(ts),
+            "currency": currency,
             "in_hours": round((int(ts) - now_ts) / 3600.0, 2),
         })
 
@@ -611,7 +664,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
-                SELECT source, title, link, event_ts
+                SELECT source, title, link, event_ts, currency
                 FROM econ_events
                 ORDER BY COALESCE(event_ts, 0) DESC, id DESC
                 LIMIT 2;
@@ -619,8 +672,8 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             rows2 = cur.fetchall()
 
     unknown = []
-    for (source, title, link, ts) in rows2:
-        unknown.append({"source": source, "title": title, "link": link, "ts": int(ts) if ts else None, "in_hours": None})
+    for (source, title, link, ts, currency) in rows2:
+        unknown.append({"source": source, "title": title, "link": link, "ts": int(ts) if ts else None, "currency": currency, "in_hours": None})
     return unknown[:2]
 
 def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours: float = 12.0) -> Dict[str, Any]:
@@ -994,8 +1047,8 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         )
         quality_v2 = int(max(0, min(100, round(raw_v2 * 100))))
 
-        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
         top3 = _top_drivers(contribs, topn=3)
+        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
         cons_by_src = _consensus_by_source(contribs)
         med_abs = _median_abs_contrib(contribs)
         flip = flip_metrics(score, th, bias, med_abs)
@@ -1170,32 +1223,32 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
     must = []
 
     if bias == "NEUTRAL" and not cfg.get("neutral_allow", False):
-        fail.append("Bias NEUTRAL")
-        fail_short.append("Bias=NEUTRAL")
-        must.append("bias must become BULLISH or BEARISH (cross ±th)")
+        fail.append("Bias is NEUTRAL")
+        fail_short.append("NEUTRAL")
+        must.append("Bias must become BULLISH or BEARISH")
     elif bias == "NEUTRAL" and cfg.get("neutral_allow", False):
         maxd = float(cfg.get("neutral_flip_dist_max", 0.20))
         if to_opp > maxd:
-            fail.append("Bias NEUTRAL not near flip")
+            fail.append("Neutral is far from flip")
             fail_short.append("Neutral far")
-            must.append(f"to_opposite ≤ {maxd}")
+            must.append(f"Move closer to flip (to_opposite ≤ {maxd})")
 
     qmin = int(cfg["quality_v2_min"])
     if q2 < qmin:
-        fail.append(f"Q2 too low ({q2} < {qmin})")
-        fail_short.append(f"Q2<{qmin}")
-        must.append(f"quality_v2 ≥ {qmin}")
+        fail.append(f"Quality too low (Q2 {q2} < {qmin})")
+        fail_short.append("Q2 low")
+        must.append(f"Q2 ≥ {qmin}")
 
     cmax = float(cfg["conflict_max"])
     if conflict > cmax:
-        fail.append(f"Conflict too high ({conflict} > {cmax})")
-        fail_short.append(f"Conflict>{cmax}")
-        must.append(f"conflict_index ≤ {cmax}")
+        fail.append(f"Conflict too high ({conflict:.3f} > {cmax})")
+        fail_short.append("Conflict high")
+        must.append(f"Conflict ≤ {cmax}")
 
     mind = float(cfg["min_opp_flip_dist"])
     if bias in ("BULLISH", "BEARISH") and to_opp < mind:
-        fail.append(f"Too close to opposite flip (to_opposite={round(to_opp,4)} < {mind})")
-        fail_short.append("Flip too close")
+        fail.append(f"Too close to opposite flip (to_opposite {to_opp:.3f} < {mind})")
+        fail_short.append("Flip close")
         must.append(f"to_opposite ≥ {mind}")
 
     if event_mode:
@@ -1203,7 +1256,7 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
             oq = int(cfg.get("event_override_quality", 70))
             oc = float(cfg.get("event_override_conflict", 0.45))
             if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
-                fail.append("Event mode ON")
+                fail.append("Event mode is ON (macro risk)")
                 fail_short.append("EVENT")
                 must.append(f"Wait OR require Q2≥{oq} & Conflict≤{oc} & bias!=NEUTRAL")
 
@@ -1216,8 +1269,8 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
         "ok": bool(ok),
         "label": "TRADE OK" if ok else "NO TRADE",
         "why": why_short[:3],
-        "fail_reasons": fail[:5],
-        "fail_short": fail_short[:4],
+        "fail_reasons": fail[:6],
+        "fail_short": fail_short[:3],
         "must_change": must[:4],
     }
 
@@ -1332,43 +1385,9 @@ def latest(limit: int = 40):
             rows = cur.fetchall()
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
-@app.get("/calendar_data")
-def calendar_data(limit: int = 120, hours_back: int = 12, hours_fwd: int = 48):
-    db_init()
-    now = int(time.time())
-    lo = now - int(hours_back * 3600)
-    hi = now + int(hours_fwd * 3600)
-    with db_conn() as conn:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source, title, country, currency, impact, actual, previous, consensus, forecast, event_ts, link
-                FROM econ_events
-                WHERE (event_ts IS NULL) OR (event_ts BETWEEN %s AND %s)
-                ORDER BY COALESCE(event_ts, 0) ASC, id DESC
-                LIMIT %s;
-            """, (lo, hi, limit))
-            rows = cur.fetchall()
-
-    items = []
-    for r in rows:
-        (source, title, country, currency, impact, actual, previous, consensus, forecast, event_ts, link) = r
-        items.append({
-            "source": source,
-            "title": title,
-            "country": country,
-            "currency": currency,
-            "impact": impact,
-            "actual": actual,
-            "previous": previous,
-            "consensus": consensus,
-            "forecast": forecast,
-            "event_ts": int(event_ts) if event_ts else None,
-            "link": link,
-        })
-    return {"now_ts": now, "items": items}
-
 @app.get("/morning_plan")
 def morning_plan():
+    # Kept for API compatibility, UI will show a simplified human view
     db_init()
     payload = load_bias()
     if not payload:
@@ -1387,13 +1406,9 @@ def morning_plan():
         return {
             "asset": asset,
             "bias": a.get("bias"),
-            "score": a.get("score"),
-            "th": a.get("threshold"),
             "quality_v2": a.get("quality_v2"),
-            "conflict": a.get("conflict_index"),
             "top_drivers": (a.get("top3_drivers", []) or [])[:3],
             "gate": gate,
-            "flip": a.get("flip", {}),
         }
 
     out = {
@@ -1428,7 +1443,7 @@ iframe{{border:0;width:100%;height:100%;}}
     return HTMLResponse(html)
 
 # ============================================================
-# UI — Terminal
+# UI — Terminal (User-friendly)
 # ============================================================
 
 def _pill_bias(b: str) -> str:
@@ -1447,24 +1462,21 @@ def _fmt(x: Any, n: int = 3) -> str:
     except Exception:
         return "—"
 
-def _fmt_updated_short(iso_utc: str) -> str:
-    # expects ISO like 2026-02-08T03:29:38.474340+00:00
-    try:
-        # keep YYYY-MM-DD HH:MM UTC
-        dt = datetime.fromisoformat(iso_utc.replace("Z", "+00:00"))
-        return dt.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-    except Exception:
-        return str(iso_utc)[:16] + " UTC"
-
-def _fmt_countdown_hours(now_ts: int, event_ts: int) -> str:
-    # T-3.2h or T+1.1h
-    try:
-        dh = (int(event_ts) - int(now_ts)) / 3600.0
-        if dh >= 0:
-            return f"T-{dh:.1f}h"
-        return f"T+{abs(dh):.1f}h"
-    except Exception:
-        return ""
+def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]]) -> Tuple[str, str]:
+    """
+    Prefer USD currency events first (your use-case), else earliest event.
+    Returns (line, source_hint).
+    """
+    if not upcoming:
+        return "No upcoming events in horizon", ""
+    timed = [x for x in upcoming if x.get("ts")]
+    if not timed:
+        u = upcoming[0]
+        return f"(time unknown) • {u.get('title','')}", str(u.get("source", ""))
+    usd = [x for x in timed if str(x.get("currency") or "").upper() == "USD"]
+    pick = usd[0] if usd else timed[0]
+    ts = int(pick["ts"])
+    return f"{_fmt_hhmm_utc(ts)} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1478,83 +1490,94 @@ def dashboard():
     event = payload.get("event", {}) or {}
     feeds_status = meta.get("feeds_status", {}) or {}
 
-    updated_iso = payload.get("updated_utc", "")
-    updated_short = _fmt_updated_short(str(updated_iso))
+    updated = payload.get("updated_utc", "")
     gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
     event_mode = bool(event.get("event_mode", False))
     upcoming = (event.get("upcoming_events", []) or [])[:6]
+    now_ts = int(time.time())
 
-    event_reason = [str(x) for x in (event.get("reason", []) or [])]
-    reason_txt = ", ".join(event_reason) if event_reason else "—"
+    # human readable reason + next event (prefer USD)
+    reason_txt = _human_event_reason([str(x) for x in (event.get("reason", []) or [])])
+    next_event_line, next_event_src = _pick_next_event(now_ts, upcoming)
 
+    # TRUMP status
     trump = meta.get("trump", {}) or {}
     trump_flag = bool(trump.get("flag", False))
     trump_enabled = bool(trump.get("enabled", False))
 
-    fred_on = bool(meta.get("fred", {}).get("enabled", False))
-
+    # FEEDS status
     feeds_ok_ratio = _feeds_ok_ratio(feeds_status) if feeds_status else 1.0
     feeds_ok = feeds_ok_ratio >= float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
 
-    ev_pill = '<span class="pill warn">EVENT MODE</span>' if event_mode else '<span class="pill neu">EVENT: off</span>'
-    if trump_enabled and trump_flag:
-        tr_pill = '<span class="pill warn">TRUMP: flag</span>'
-    elif trump_enabled:
-        tr_pill = '<span class="pill neu">TRUMP: on</span>'
-    else:
-        tr_pill = '<span class="pill neu">TRUMP: off</span>'
+    # FRED status + why
+    fred_on, fred_why = _fred_status(meta.get("fred", {}) or {})
 
-    feeds_pill = f'<span class="pill {"ok" if feeds_ok else "no"}">FEEDS: {"ok" if feeds_ok else "degraded"} ({feeds_ok_ratio:.2f})</span>'
-    fred_pill = '<span class="pill neu">FRED: on</span>' if fred_on else '<span class="pill neu">FRED: off</span>'
+    # RUN token
+    token_required, token_why = _run_token_status()
 
-    # Next event line (with countdown)
-    now_ts = int(time.time())
-    next_event_main = "—"
-    next_event_reason_line = reason_txt
+    # Build per-asset gate (for UI)
+    for sym in ASSETS:
+        a = assets.get(sym, {}) or {}
+        a["ui_gate"] = eval_trade_gate(a, event_mode, gate_profile)
+        assets[sym] = a
+    payload["assets"] = assets
 
-    if upcoming:
-        u = upcoming[0]
-        if u.get("ts"):
-            ets = int(u["ts"])
-            dt = datetime.fromtimestamp(ets, tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            cd = _fmt_countdown_hours(now_ts, ets)
-            next_event_main = f"{dt} • {u.get('title','')} ({cd})"
-        else:
-            next_event_main = f"(time unknown) • {u.get('title','')}"
+    def _chip(label: str, value: str, cls: str, tip: str) -> str:
+        return f'<span class="chip {cls}" title="{tip}"><span class="k">{label}</span> {value}</span>'
 
+    # status chips (plain meaning)
+    ev_chip = _chip(
+        "EVENT",
+        "ON" if event_mode else "OFF",
+        "warn" if event_mode else "neu",
+        "EVENT MODE = macro risk window (recent major releases or upcoming events)."
+    )
+    tr_chip = _chip(
+        "TRUMP",
+        ("FLAG" if (trump_enabled and trump_flag) else ("ON" if trump_enabled else "OFF")),
+        "warn" if (trump_enabled and trump_flag) else "neu",
+        "TRUMP FLAG = Trump-related headlines detected in last 12h."
+    )
+    fd_chip = _chip(
+        "FEEDS",
+        ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
+        "ok" if feeds_ok else "no",
+        "FEEDS OK ratio = share of RSS feeds successfully parsed."
+    )
+    fr_chip = _chip(
+        "FRED",
+        ("ON" if fred_on else "OFF"),
+        "neu",
+        "FRED = macro time-series drivers (yields/USD/VIX). OFF reason: " + fred_why
+    )
+    rn_chip = _chip(
+        "RUN",
+        ("TOKEN" if token_required else "OPEN"),
+        "neu",
+        "RUN = manual refresh pipeline. " + token_why
+    )
+    dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics: DB + env + counters">DIAG</a>'
+
+    # Simplified table row: SYM | BIAS | TRADE | WHY | VIEW
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
-        score = float(a.get("score", 0.0))
-        th = float(a.get("threshold", 1.0))
-        q2 = int(a.get("quality_v2", 0))
-        conflict = float(a.get("conflict_index", 1.0))
-        flip = a.get("flip", {}) or {}
-        to_neu = float(flip.get("to_neutral", 0.0))
-        to_opp = float(flip.get("to_opposite", 0.0))
-        approx = flip.get("approx_headlines_to_flip", None)
-
-        gate = eval_trade_gate(a, event_mode, gate_profile)
-        fail_short = " | ".join(gate.get("fail_short", []) or []) if not gate.get("ok") else ""
-
         top = (a.get("top3_drivers", []) or [])
         top_driver = top[0].get("why", "—") if top else "—"
-
-        approx_txt = f"{approx}" if approx is not None else "—"
-
+        gate = a.get("ui_gate", {}) or {}
+        ok = bool(gate.get("ok", False))
+        # short explanation: either top driver, or blocks
+        short = ""
+        if ok:
+            short = top_driver
+        else:
+            short = " | ".join((gate.get("fail_short", []) or [])[:3]) or "Blocked"
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
           <td>{_pill_bias(bias)}</td>
-          <td class="num">{_fmt(score,3)}</td>
-          <td class="num">{_fmt(th,3)}</td>
-          <td class="num">{q2}</td>
-          <td class="num">{_fmt(conflict,3)}</td>
-          <td class="num">{_fmt(to_neu,3)}</td>
-          <td class="num">{_fmt(to_opp,3)}</td>
-          <td class="num">{approx_txt}</td>
-          <td class="gate">{_pill_gate(bool(gate.get("ok")))} <span class="muted">{fail_short}</span></td>
-          <td class="why">{top_driver}</td>
+          <td>{_pill_gate(ok)}</td>
+          <td class="why">{short}</td>
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
         """
@@ -1571,247 +1594,131 @@ def dashboard():
   <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
   <title>NEWS BIAS // TERMINAL</title>
   <style>
-    :root {
-      --bg:#070a0f;
-      --panel:#0b111a;
-      --line:rgba(255,255,255,.08);
-      --text:#d7e2ff;
-      --muted:#7b8aa7;
-      --amber:#ffb000;
-      --cyan:#00e5ff;
-      --ok:#00ff6a;
-      --warn:#ffb000;
-      --no:#ff3b3b;
+    :root{
+      --bg:#070a0f; --panel:#0b111a; --line:rgba(255,255,255,.08);
+      --text:#d7e2ff; --muted:#7b8aa7;
+      --amber:#ffb000; --cyan:#00e5ff;
+      --ok:#00ff6a; --warn:#ffb000; --no:#ff3b3b;
       --pillbg:rgba(255,255,255,.03);
-      --btn:#0f1724;
-      --btn2:#162238;
+      --btn:#0f1724; --btn2:#162238;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
-      --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Arial, sans-serif;
     }
     html,body{height:100%; margin:0; background:var(--bg); color:var(--text);}
     body{padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
     a{color:var(--cyan); text-decoration:none;}
     a:hover{text-decoration:underline;}
     .wrap{max-width:1250px; margin:0 auto; padding:14px;}
-
     .hdr{border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px;}
-    .title{font-family:var(--mono); font-weight:900; letter-spacing:.8px;}
+    .title{font-family:var(--mono); font-weight:900; letter-spacing:.8px; display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
     .title b{color:var(--amber);}
-
-    /* ========= HEADER FIX ========= */
-    .statuspanel{
-      margin-top:10px;
-      background:linear-gradient(180deg, rgba(255,255,255,.02), rgba(255,255,255,.01));
-      border:1px solid var(--line);
-      border-radius:18px;
-      padding:12px;
-    }
-    .statusTop{
-      display:flex;
-      justify-content:space-between;
-      gap:10px;
-      align-items:flex-start;
-      flex-wrap:wrap;
-    }
-    .statusGrid{
-      display:grid;
-      grid-template-columns: repeat(6, minmax(160px, 1fr));
-      gap:10px;
-      margin-top:10px;
-    }
-    .kvb{
-      border:1px solid var(--line);
-      background:rgba(255,255,255,.02);
-      border-radius:14px;
-      padding:10px 10px;
-      min-width:0;
-    }
-    .kvb .k{
-      font-family:var(--mono);
-      font-size:11px;
-      letter-spacing:.6px;
-      color:var(--muted);
-      margin-bottom:6px;
-      text-transform:uppercase;
-    }
-    .kvb .v{
-      font-family:var(--mono);
-      font-size:13px;
-      font-weight:900;
-      min-width:0;
-      white-space:nowrap;
-      overflow:hidden;
-      text-overflow:ellipsis;
-    }
-    .kvb .v.wrap{
-      white-space:normal;
-      overflow:visible;
-      text-overflow:clip;
-      line-height:1.25;
-    }
-    .kvb .v .pill{
-      margin-right:8px;
-    }
-    .nextEventRow{
-      margin-top:10px;
-      border-top:1px solid var(--line);
-      padding-top:10px;
-      font-family:var(--mono);
-      font-size:12px;
-      color:var(--text);
-      line-height:1.35;
-    }
-    .nextEventRow .k{color:var(--muted); font-weight:900; margin-right:8px;}
-    .nextEventRow .reason{margin-top:6px; color:var(--muted);}
-
-    /* On smaller widths: reduce columns + allow horizontal scroll if needed */
-    @media(max-width: 1200px){
-      .statusGrid{grid-template-columns: repeat(3, minmax(180px, 1fr));}
-    }
-    @media(max-width: 780px){
-      .statusGrid{grid-template-columns: repeat(2, minmax(160px, 1fr));}
-    }
-    @media(max-width: 420px){
-      .statusGrid{grid-template-columns: 1fr;}
-    }
-
-    /* ========= COMMON ========= */
-    .bar{display:flex; gap:10px; flex-wrap:wrap; align-items:center; margin-top:10px;}
-    .pill{
-      font-family:var(--mono);
-      font-size:12px;
-      font-weight:900;
-      padding:6px 10px;
-      border-radius:999px;
-      border:1px solid var(--line);
-      background:var(--pillbg);
-      white-space:nowrap;              /* prevent weird wrap inside pills */
-      overflow:visible;                /* avoid ellipsis */
-      text-overflow:clip;
-      display:inline-flex;
-      align-items:center;
-      gap:6px;
-    }
+    .metaLine{font-family:var(--mono); color:var(--muted); font-size:12px; margin-top:8px; display:flex; gap:16px; flex-wrap:wrap; align-items:center;}
+    .metaLine .k{color:var(--muted);}
+    .metaLine .v{color:var(--text); font-weight:900;}
+    .chips{display:flex; gap:10px; flex-wrap:wrap; margin-top:12px; align-items:center;}
+    .chip{font-family:var(--mono); font-size:12px; font-weight:900; padding:8px 10px; border-radius:14px; border:1px solid var(--line); background:var(--pillbg); display:inline-flex; gap:10px; align-items:center;}
+    .chip .k{color:var(--muted); font-weight:900;}
+    .chip.ok{color:var(--ok); border-color:rgba(0,255,106,.25);}
+    .chip.no{color:var(--no); border-color:rgba(255,59,59,.25);}
+    .chip.warn{color:var(--warn); border-color:rgba(255,176,0,.25);}
+    .chip.neu{color:#b8c3da;}
+    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
     .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .no{color:var(--no); border-color: rgba(255,59,59,.25);}
     .warn{color:var(--warn); border-color: rgba(255,176,0,.25);}
-
-    .hotkeys{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px;}
     .btn{background:var(--btn); border:1px solid var(--line); color:var(--text); padding:9px 12px; border-radius:12px; cursor:pointer; font-family:var(--mono); font-weight:900;}
     .btn:hover{background:var(--btn2);}
-    .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
+    .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
     table{width:100%; border-collapse:collapse; font-family:var(--mono);}
-    th,td{border-top:1px solid var(--line); padding:10px 8px; font-size:12px; vertical-align:top;}
+    th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900;}
     .sym{color:var(--amber); font-weight:900;}
-    .num{text-align:right; white-space:nowrap;}
-    .gate{white-space:nowrap;}
-    .why{max-width:420px;}
+    .why{color:var(--text); max-width:760px;}
+    .act{text-align:right; white-space:nowrap;}
     .muted{color:var(--muted);}
-    .act{text-align:right;}
-    .row2{display:flex; gap:12px; flex-wrap:wrap;}
-    .card{flex:1; min-width:320px;}
-    .h2{font-family:var(--mono); font-weight:900; color:var(--muted); font-size:12px; margin-bottom:8px;}
-    .kv{display:grid; grid-template-columns: 160px 1fr; gap:8px; font-family:var(--mono); font-size:12px;}
-    .kv div{padding:6px 0; border-top:1px solid var(--line);}
-    .kv .k{color:var(--muted);}
-    .list{font-family:var(--mono); font-size:12px;}
-    .item{padding:10px 0; border-top:1px solid var(--line);}
-    .item .t{font-weight:900;}
-    .item .m{color:var(--muted); margin-top:4px;}
-    .item .lnk{margin-top:6px;}
-    .toastwrap{position:fixed; right:14px; top:14px; z-index:9999; display:flex; flex-direction:column; gap:8px; max-width:520px; padding-top: env(safe-area-inset-top);}
-    .toast{background:rgba(11,17,26,.95); border:1px solid var(--line); border-radius:14px; padding:10px 12px; font-family:var(--mono); font-size:12px;}
-    .toast .k{color:var(--cyan); font-weight:900;}
-    .toast.warn{border-color: rgba(255,176,0,.25);}
-    .toast.bad{border-color: rgba(255,59,59,.25);}
-    .tick{font-family:var(--mono); font-size:12px; color:var(--muted);}
-    .tick b{color:var(--amber);}
+    .tvwrap{margin-top:12px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+
+    /* Tickers */
+    .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
+    .ticklabel{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 6px 2px;}
+    .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
+    .marquee{position:relative; overflow:hidden;}
+    .marqueeInner{
+      display:inline-flex;
+      align-items:center;
+      gap:36px;
+      white-space:nowrap;
+      will-change:transform;
+      animation:scroll 30s linear infinite;
+    }
+    .marquee:hover .marqueeInner{animation-play-state:paused;}
+    @keyframes scroll{
+      0%{transform:translateX(0);}
+      100%{transform:translateX(-50%);}
+    }
+    .tick{font-family:var(--mono); font-size:12px; color:var(--text);}
     .tick .tag{color:var(--cyan); font-weight:900;}
-    .tvwrap{margin-top:10px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
-    .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.7); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
+    .tick b{color:var(--amber);}
+
+    /* Modal */
+    .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
                  display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
     .modal .body{padding:12px;}
+    .h2{font-family:var(--mono); font-weight:900; color:var(--muted); font-size:12px; margin-bottom:8px;}
+    .list{font-family:var(--mono); font-size:12px;}
+    .item{padding:10px 0; border-top:1px solid var(--line);}
+    .item .t{font-weight:900;}
+    .item .m{color:var(--muted); margin-top:4px;}
+    .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px; line-height:1.45;}
+
+    /* MYFX dark mode (filter) */
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
-
-    /* --- 3-tier tickers --- */
-    .tickerstack{margin-top:10px; display:flex; flex-direction:column; gap:8px;}
-    .tickerline{border-top:1px solid var(--line); border-bottom:1px solid var(--line); padding:8px 0; overflow:hidden;}
-    .marquee{display:flex; gap:40px; align-items:center; white-space:nowrap; will-change:transform;}
-    .marquee:hover{animation-play-state:paused;}
-    @keyframes scrollMid {0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-    @keyframes scrollFast{0%{transform:translateX(0)}100%{transform:translateX(-50%)}}
-    .marq-mid {animation:scrollMid  26s linear infinite;}
-    .marq-fast{animation:scrollFast 18s linear infinite;}
-
-    /* --- MYFX dark mode (filter) --- */
-    .iframebox.dark iframe{
-      filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);
-    }
-    .toggleRow{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;}
+    .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
 
     @media(max-width: 780px){
       .why{max-width:none;}
-      th:nth-child(11), td:nth-child(11) {display:none;}
-      .toastwrap{left:14px; right:14px; max-width:none;}
     }
   </style>
 </head>
 <body>
-<div class="toastwrap" id="toasts"></div>
-
 <div class="wrap">
   <div class="hdr">
-    <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
-
-    <!-- STATUS PANEL (clean + readable) -->
-    <div class="statuspanel">
-      <div class="statusTop">
-        <div class="tick"><span class="tag">Updated</span> <b>__UPDATED_SHORT__</b></div>
-        <div class="tick"><span class="tag">Profile</span> <b>__GATE_PROFILE__</b></div>
-      </div>
-
-      <div class="statusGrid">
-        <div class="kvb">
-          <div class="k">Event</div>
-          <div class="v wrap">__EV_PILL__</div>
-        </div>
-        <div class="kvb">
-          <div class="k">Trump</div>
-          <div class="v wrap">__TR_PILL__</div>
-        </div>
-        <div class="kvb">
-          <div class="k">Feeds</div>
-          <div class="v wrap">__FEEDS_PILL__</div>
-        </div>
-        <div class="kvb">
-          <div class="k">FRED</div>
-          <div class="v wrap">__FRED_PILL__</div>
-        </div>
-        <div class="kvb">
-          <div class="k">Diagnostics</div>
-          <div class="v"><a class="pill neu" href="/diag" target="_blank" rel="noopener">/diag</a></div>
-        </div>
-        <div class="kvb">
-          <div class="k">Run</div>
-          <div class="v wrap"><span class="pill neu">token_required=__RUN_TOKEN_REQUIRED__</span></div>
-        </div>
-      </div>
-
-      <div class="nextEventRow">
-        <div><span class="k">Next event</span> __NEXT_EVENT__</div>
-        <div class="reason"><span class="k">Reason</span> __EVENT_REASON__</div>
-      </div>
+    <div class="title">
+      <div><b>NEWS BIAS</b> // TERMINAL</div>
+      <div class="muted" style="font-family:var(--mono); font-size:12px;">Profile: <b style="color:var(--amber);">__GATE_PROFILE__</b></div>
     </div>
 
-    <!-- LIVE markets tape -->
+    <div class="metaLine">
+      <span class="k">Updated (UTC):</span> <span class="v">__UPDATED_SHORT__</span>
+      <span class="k">Event reason:</span> <span class="v">__EVENT_REASON_H__</span>
+    </div>
+
+    <div class="metaLine" style="margin-top:8px;">
+      <span class="k">Next event:</span> <span class="v">__NEXT_EVENT__</span>
+      <span class="muted">__NEXT_EVENT_SRC__</span>
+    </div>
+
+    <div class="chips">
+      __EV_CHIP__
+      __TR_CHIP__
+      __FEEDS_CHIP__
+      __FRED_CHIP__
+      __RUN_CHIP__
+      __DIAG_CHIP__
+    </div>
+
+    <div class="btnrow">
+      <button class="btn" onclick="runNow()">R RUN</button>
+      <button class="btn" onclick="openMorning()">M MORNING</button>
+      <button class="btn" onclick="openMyfx()">E MYFX CAL</button>
+    </div>
+
     <div class="tvwrap">
       <div class="tradingview-widget-container">
         <div class="tradingview-widget-container__widget"></div>
@@ -1828,25 +1735,16 @@ def dashboard():
       </div>
     </div>
 
-    <!-- Internal ticker stack: Headlines + Alerts/Bias -->
     <div class="tickerstack">
-      <div class="tickerline">
-        <div class="marquee marq-mid" id="marqueeNews"></div>
+      <div>
+        <div class="ticklabel">HEADLINES (latest)</div>
+        <div class="tickerline marquee"><div class="marqueeInner" id="marqueeNews"></div></div>
       </div>
-      <div class="tickerline">
-        <div class="marquee marq-fast" id="marqueeAB"></div>
+      <div>
+        <div class="ticklabel">STATUS (bias + trade gate)</div>
+        <div class="tickerline marquee"><div class="marqueeInner" id="marqueeStatus"></div></div>
       </div>
     </div>
-
-    <div class="btnrow">
-      <button class="btn" onclick="runNow()">R RUN</button>
-      <button class="btn" onclick="openMorning()">M MORNING</button>
-      <button class="btn" onclick="openCalendar()">C CAL (DB)</button>
-      <button class="btn" onclick="openMyfx()">E MYFX CAL</button>
-      <button class="btn" onclick="openJson()">J JSON</button>
-      <button class="btn" onclick="openAnalyst()">A ANALYST</button>
-    </div>
-    <div class="hotkeys">Hotkeys: 1/2/3 view • R run • M morning • C calendar • E myfx • J json • A analyst • Esc close</div>
   </div>
 
   <div class="panel">
@@ -1855,15 +1753,8 @@ def dashboard():
         <tr>
           <th>SYM</th>
           <th>BIAS</th>
-          <th class="num">SCORE</th>
-          <th class="num">TH</th>
-          <th class="num">Q2</th>
-          <th class="num">CONFLICT</th>
-          <th class="num">TO_NEU</th>
-          <th class="num">TO_OPP</th>
-          <th class="num">≈HEADLINES</th>
-          <th>GATE</th>
-          <th>TOP DRIVER</th>
+          <th>TRADE</th>
+          <th>WHY (short)</th>
           <th></th>
         </tr>
       </thead>
@@ -1873,11 +1764,8 @@ def dashboard():
         __ROW_WTI__
       </tbody>
     </table>
-
-    <div class="tick" style="margin-top:10px;">
-      Flip units: score-sum (weighted evidence), not % / not market points.
-      TO_NEU = ΔScore to return to Neutral band. TO_OPP = ΔScore to flip to opposite bias.
-      ≈HEADLINES = TO_OPP / median(|contrib|) (rough).
+    <div class="kz">
+      Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.
     </div>
   </div>
 </div>
@@ -1894,12 +1782,10 @@ def dashboard():
 
 <script>
   const PAYLOAD = __JS_PAYLOAD__;
-  const ALERTS = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.alerts) ? PAYLOAD.meta.alerts : [];
   const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
 
   function $(id){ return document.getElementById(id); }
 
-  // Safari-safe escape (no replaceAll)
   function escapeHtml(s){
     s = (s===undefined || s===null) ? '' : String(s);
     return s
@@ -1937,281 +1823,144 @@ def dashboard():
         showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
         return;
       }
-      setTimeout(function(){ location.reload(); }, 400);
+      setTimeout(function(){ location.reload(); }, 350);
     }catch(e){
       showModal('RUN ERROR', '<div class="panel"><div class="h2">Exception</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
   }
 
-  function toast(kind, msg, sev){
-    var w = $('toasts');
-    var div = document.createElement('div');
-    div.className = 'toast ' + ((String(sev||'').toLowerCase()==='warn') ? 'warn' : '');
-    div.innerHTML = '<div class="k">' + escapeHtml(kind) + '</div><div>' + escapeHtml(msg) + '</div>';
-    w.appendChild(div);
-    setTimeout(function(){ try{ div.remove(); }catch(e){} }, 9000);
-  }
-
-  function buildMarqueeAB(){
-    var parts = [];
-
-    (ALERTS || []).slice(0, 6).forEach(function(a){
-      parts.push('<span class="tick"><span class="tag">ALERT</span> <b>' + escapeHtml(a.kind) + '</b> • ' + escapeHtml(a.message) + '</span>');
-    });
-
-    var assets = PAYLOAD && PAYLOAD.assets ? PAYLOAD.assets : {};
-    ['XAU','US500','WTI'].forEach(function(sym){
-      var x = assets[sym] || {};
-      var b = x.bias || '—';
-      var q2 = (x.quality_v2!==undefined && x.quality_v2!==null) ? x.quality_v2 : '—';
-      var c = (x.conflict_index!==undefined && x.conflict_index!==null) ? x.conflict_index : '—';
-      var cTxt = (typeof c === 'number') ? c.toFixed(3) : String(c);
-      parts.push('<span class="tick"><span class="tag">' + sym + '</span> bias=<b>' + escapeHtml(b) + '</b> q2=<b>' + escapeHtml(q2) + '</b> conflict=' + escapeHtml(cTxt) + '</span>');
-    });
-
-    var line = parts.join(' <span class="tick muted">•</span> ');
-    $('marqueeAB').innerHTML = line + ' <span class="tick muted">•</span> ' + line;
-  }
-
-  async function buildMarqueeNews(){
-    try{
-      var resp = await fetch('/latest?limit=25');
-      var js = await resp.json();
+  function buildMarqueeNews(){
+    fetch('/latest?limit=30').then(function(r){ return r.json(); }).then(function(js){
       var items = js.items || [];
       var parts = [];
-
       items.slice(0, 18).forEach(function(it){
-        var src = it.source || '';
-        var t = it.title || '';
-        parts.push('<span class="tick"><span class="tag">NEWS</span> <b>' + escapeHtml(src) + '</b> • ' + escapeHtml(t) + '</span>');
+        parts.push('<span class="tick"><span class="tag">NEWS</span> <b>' + escapeHtml(it.source||'') + '</b> • ' + escapeHtml(it.title||'') + '</span>');
       });
-
-      if(!parts.length){
-        parts.push('<span class="tick"><span class="tag">NEWS</span> no headlines</span>');
-      }
-
-      var line = parts.join(' <span class="tick muted">•</span> ');
-      $('marqueeNews').innerHTML = line + ' <span class="tick muted">•</span> ' + line;
-    }catch(e){
+      if(!parts.length) parts.push('<span class="tick"><span class="tag">NEWS</span> no headlines</span>');
+      // duplicate line to make a true seamless loop
+      var line = parts.join(' <span class="muted">•</span> ');
+      $('marqueeNews').innerHTML = line + ' <span class="muted">•</span> ' + line;
+    }).catch(function(){
       $('marqueeNews').innerHTML = '<span class="tick"><span class="tag">NEWS</span> error loading headlines</span>';
-    }
+    });
   }
 
-  function openView(asset){
-    var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[asset] || {}) : {};
-    var ev = PAYLOAD && PAYLOAD.event ? PAYLOAD.event : {};
-    var meta = PAYLOAD && PAYLOAD.meta ? PAYLOAD.meta : {};
+  function buildMarqueeStatus(){
+    var a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
+    var parts = [];
+    ['XAU','US500','WTI'].forEach(function(sym){
+      var x = a[sym] || {};
+      var b = x.bias || '—';
+      var gate = x.ui_gate || {};
+      var trade = gate.ok ? 'TRADE OK' : 'NO TRADE';
+      var why = gate.ok ? ((gate.why||[])[0] || '') : ((gate.fail_short||[]).join(' | ') || 'Blocked');
+      parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b>' + (why ? (' • ' + escapeHtml(why)) : '') + '</span>');
+    });
+    if(!parts.length) parts.push('<span class="tick"><span class="tag">STATUS</span> —</span>');
+    var line = parts.join(' <span class="muted">•</span> ');
+    $('marqueeStatus').innerHTML = line + ' <span class="muted">•</span> ' + line;
+  }
 
-    var flip = a.flip || {};
-    var top3 = (a.top3_drivers || []);
+  function openView(sym){
+    var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
+    var gate = a.ui_gate || {};
+    var top = (a.top3_drivers || []);
     var why5 = (a.why_top5 || []);
 
-    var approx = (flip.approx_headlines_to_flip!==undefined && flip.approx_headlines_to_flip!==null) ? flip.approx_headlines_to_flip : '—';
-
-    var flipHtml =
-      '<div class="panel card">' +
-      '  <div class="h2">Flip</div>' +
-      '  <div class="kv">' +
-      '    <div class="k">state</div><div>' + escapeHtml(flip.state||'') + '</div>' +
-      '    <div class="k">to_bullish</div><div>' + escapeHtml(flip.to_bullish) + '</div>' +
-      '    <div class="k">to_bearish</div><div>' + escapeHtml(flip.to_bearish) + '</div>' +
-      '    <div class="k">to_neutral</div><div>' + escapeHtml(flip.to_neutral) + '</div>' +
-      '    <div class="k">to_opposite</div><div>' + escapeHtml(flip.to_opposite) + '</div>' +
-      '    <div class="k">median_abs</div><div>' + escapeHtml(flip.median_abs_contrib) + '</div>' +
-      '    <div class="k">≈headlines</div><div>' + escapeHtml(approx) + '</div>' +
+    var head =
+      '<div class="panel">' +
+      '  <div class="h2">' + escapeHtml(sym) + '</div>' +
+      '  <div class="list">' +
+      '    <div class="item"><div class="t">Bias</div><div class="m">' + escapeHtml(a.bias || '—') + '</div></div>' +
+      '    <div class="item"><div class="t">Trade decision</div><div class="m"><b>' + escapeHtml(gate.label || (gate.ok ? 'TRADE OK' : 'NO TRADE')) + '</b></div></div>' +
       '  </div>' +
-      '  <div class="tick" style="margin-top:10px;">' + escapeHtml(flip.note||'') + '</div>' +
       '</div>';
 
-    var topHtml =
-      '<div class="panel card">' +
-      '  <div class="h2">Top drivers</div>' +
+    var drivers =
+      '<div class="panel">' +
+      '  <div class="h2">Top drivers (why bias)</div>' +
       '  <div class="list">' +
-      (top3.length ? top3 : [{why:'—', abs_contrib_sum:''}]).map(function(x,i){
+      (top.length ? top : [{why:'—'}]).map(function(x,i){
+        return '<div class="item"><div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div></div>';
+      }).join('') +
+      '  </div>' +
+      '</div>';
+
+    var blocks =
+      '<div class="panel">' +
+      '  <div class="h2">If NO TRADE — blocks</div>' +
+      '  <div class="list">' +
+      ((gate.fail_reasons || []).length ? (gate.fail_reasons || []) : ['—']).map(function(x){
+        return '<div class="item"><div class="t">' + escapeHtml(x) + '</div></div>';
+      }).join('') +
+      '  </div>' +
+      '  <div class="kz"><b>What to wait for:</b><br>' +
+      ((gate.must_change || []).length ? (gate.must_change || []).map(function(x){ return '→ ' + escapeHtml(x); }).join('<br>') : '—') +
+      '</div>' +
+      '</div>';
+
+    // Optional sources (collapsed)
+    var src =
+      '<div class="panel">' +
+      '  <div class="h2">Sources (top 5 evidence, optional)</div>' +
+      '  <div class="list">' +
+      (why5.length ? why5 : [{title:'—'}]).slice(0,5).map(function(x,i){
+        var l = x.link || '';
         return '<div class="item">' +
-               '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why||'—') + '</div>' +
-               '<div class="m">abs=' + escapeHtml(x.abs_contrib_sum) + '</div>' +
+               '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div>' +
+               '<div class="m">' + escapeHtml(x.title || '') + '</div>' +
+               (l ? ('<div class="m"><a href="' + escapeHtml(l) + '" target="_blank" rel="noopener">Open source</a></div>') : '') +
                '</div>';
       }).join('') +
       '  </div>' +
       '</div>';
 
-    var whyHtml =
+    showModal('VIEW ' + sym, head + drivers + blocks + src);
+  }
+
+  function openMorning(){
+    // Human summary only
+    var a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
+    var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
+    var head =
       '<div class="panel">' +
-      '  <div class="h2">WHY top 5</div>' +
+      '  <div class="h2">Morning</div>' +
       '  <div class="list">' +
-      (why5.length ? why5 : [{why:'—'}]).map(function(x,i){
-        return '<div class="item">' +
-               '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why||'—') + '</div>' +
-               '<div class="m">src=' + escapeHtml(x.source||'') + ' • age=' + escapeHtml(x.age_min||0) + 'm • contrib=' + escapeHtml(x.contrib||'') + '</div>' +
-               '<div class="m">' + escapeHtml(x.title||'') + '</div>' +
-               '<div class="lnk"><a href="' + escapeHtml(x.link||'#') + '" target="_blank" rel="noopener">Open source</a></div>' +
-               '</div>';
-      }).join('') +
+      '    <div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>' +
+      '    <div class="item"><div class="t">Event mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>' +
       '  </div>' +
       '</div>';
 
-    var headHtml =
-      '<div class="tick" style="margin-bottom:10px;">' +
-      '  <span class="tag">' + escapeHtml(asset) + '</span> ' +
-      '  bias=<b>' + escapeHtml(a.bias||'') + '</b> ' +
-      '  score=<b>' + escapeHtml(a.score) + '</b> ' +
-      '  th=' + escapeHtml(a.threshold) + ' ' +
-      '  q2=<b>' + escapeHtml(a.quality_v2) + '</b> ' +
-      '  conflict=' + escapeHtml(a.conflict_index) +
-      '</div>';
-
-    var eventHtml =
-      '<div class="panel">' +
-      '  <div class="h2">Event</div>' +
-      '  <div class="kv">' +
-      '    <div class="k">event_mode</div><div>' + escapeHtml(ev.event_mode) + '</div>' +
-      '    <div class="k">reason</div><div>' + escapeHtml((ev.reason||[]).join(", ") || "—") + '</div>' +
-      '    <div class="k">lookahead_hours</div><div>' + escapeHtml(ev.lookahead_hours) + '</div>' +
-      '    <div class="k">recent_hours</div><div>' + escapeHtml(ev.recent_hours) + '</div>' +
-      '  </div>' +
-      '</div>';
-
-    var metaHtml =
-      '<div class="panel">' +
-      '  <div class="h2">Meta</div>' +
-      '  <div class="kv">' +
-      '    <div class="k">gate_profile</div><div>' + escapeHtml(meta.gate_profile||'') + '</div>' +
-      '    <div class="k">fred_enabled</div><div>' + escapeHtml(meta.fred && meta.fred.enabled) + '</div>' +
-      '    <div class="k">trump_flag</div><div>' + escapeHtml(meta.trump && meta.trump.flag) + '</div>' +
-      '    <div class="k">run_token_required</div><div>' + escapeHtml(meta.run_token_required) + '</div>' +
-      '  </div>' +
-      '</div>';
-
-    var html = headHtml + '<div class="row2">' + flipHtml + topHtml + '</div>' + whyHtml + eventHtml + metaHtml;
-    showModal('VIEW ' + asset, html);
-  }
-
-  async function openMorning(){
-    try{
-      var resp = await fetch('/morning_plan');
-      var js = await resp.json();
-
-      function pillGate(ok){
-        return ok ? '<span class="pill ok">TRADE OK</span>' : '<span class="pill no">NO TRADE</span>';
-      }
-      function pillBias(b){
-        if(b==='BULLISH') return '<span class="pill bull">BULLISH</span>';
-        if(b==='BEARISH') return '<span class="pill bear">BEARISH</span>';
-        return '<span class="pill neu">NEUTRAL</span>';
-      }
-      function card(p){
-        var gate = p.gate || {};
-        var drivers = p.top_drivers || [];
-        var why = drivers.map(function(x){ return x.why || ''; }).filter(Boolean).slice(0,3);
-
-        var fails = (gate.fail_reasons || []).slice(0,4).map(function(x){ return '<div class="m">• ' + escapeHtml(x) + '</div>'; }).join('');
-        var must = (gate.must_change || []).slice(0,3).map(function(x){ return '<div class="m">→ ' + escapeHtml(x) + '</div>'; }).join('');
-
-        var flip = p.flip || {};
-        var approx = (flip.approx_headlines_to_flip!==undefined && flip.approx_headlines_to_flip!==null) ? flip.approx_headlines_to_flip : '—';
-
-        return ''
-          + '<div class="panel card">'
-          + '  <div class="tick"><span class="tag">' + escapeHtml(p.asset) + '</span> '
-          +    pillBias(p.bias) + ' '
-          +    '<span class="muted">score=' + escapeHtml(p.score) + ' th=' + escapeHtml(p.th) + '</span> '
-          +    '<b>Q2=' + escapeHtml(p.quality_v2) + '</b> <span class="muted">conflict=' + escapeHtml(p.conflict) + '</span>'
-          + '  </div>'
-          + '  <div style="margin-top:10px;">' + pillGate(!!gate.ok) + '</div>'
-          + '  <div class="tick" style="margin-top:10px;"><b>Drivers:</b> ' + escapeHtml(why.join(' | ') || '—') + '</div>'
-          + '  <div class="tick" style="margin-top:10px;"><b>Flip:</b> to_neu=' + escapeHtml(flip.to_neutral) + ' • to_opp=' + escapeHtml(flip.to_opposite) + ' • ≈headlines=' + escapeHtml(approx) + '</div>'
-          + (fails ? ('<div class="tick" style="margin-top:10px;"><b>Blocks:</b>' + fails + '</div>') : '')
-          + (must ? ('<div class="tick" style="margin-top:10px;"><b>Must change:</b>' + must + '</div>') : '')
-          + '</div>';
-      }
-
-      var plan = js.plan || {};
-      var xau = plan.XAU || {};
-      var us5 = plan.US500 || {};
-      var wti = plan.WTI || {};
-
-      var head = ''
-        + '<div class="panel">'
-        + '  <div class="h2">Morning plan</div>'
-        + '  <div class="kv">'
-        + '    <div class="k">updated_utc</div><div>' + escapeHtml(js.updated_utc || '') + '</div>'
-        + '    <div class="k">gate_profile</div><div>' + escapeHtml(js.gate_profile || '') + '</div>'
-        + '    <div class="k">event_mode</div><div>' + escapeHtml(String(js.event_mode)) + '</div>'
-        + '    <div class="k">event_reason</div><div>' + escapeHtml((js.event_reason || []).join(", ") || '—') + '</div>'
-        + '  </div>'
-        + '</div>';
-
-      var body = head + '<div class="row2">' + card(xau) + card(us5) + '</div>' + card(wti);
-      showModal('M MORNING', body);
-    }catch(e){
-      showModal('M MORNING', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
-    }
-  }
-
-  async function openCalendar(){
-    try{
-      var resp = await fetch('/calendar_data?limit=160&hours_back=12&hours_fwd=48');
-      var js = await resp.json();
-      var items = js.items || [];
-
-      function fmtTs(ts){
-        if(!ts) return '(time unknown)';
-        var d = new Date(ts*1000);
-        return d.toISOString().slice(0,16).replace('T',' ') + ' UTC';
-      }
-
-      var table =
+    function card(sym){
+      var x = a[sym] || {};
+      var gate = x.ui_gate || {};
+      var top = (x.top3_drivers || []).map(function(d){ return d.why; }).filter(Boolean).slice(0,2);
+      var why = top.join(' | ') || '—';
+      var blocks = (gate.fail_short || []).join(' | ') || '—';
+      return '' +
         '<div class="panel">' +
-        '  <div class="h2">ECON CALENDAR (DB, best-effort from RSS)</div>' +
-        '  <table>' +
-        '    <thead>' +
-        '      <tr>' +
-        '        <th>TIME (UTC)</th><th>SRC</th><th>CC</th><th>CUR</th><th>IMPACT</th>' +
-        '        <th>EVENT</th><th class="num">ACT</th><th class="num">PREV</th><th class="num">CONS</th><th class="num">FCST</th>' +
-        '      </tr>' +
-        '    </thead>' +
-        '    <tbody>' +
-        items.map(function(x){
-          return '<tr>' +
-            '<td>' + escapeHtml(fmtTs(x.event_ts)) + '</td>' +
-            '<td class="muted">' + escapeHtml(x.source||'') + '</td>' +
-            '<td>' + escapeHtml(x.country||'—') + '</td>' +
-            '<td>' + escapeHtml(x.currency||'—') + '</td>' +
-            '<td>' + escapeHtml(x.impact||'—') + '</td>' +
-            '<td>' + escapeHtml(x.title||'') +
-              (x.link ? ('<div class="lnk"><a href="' + escapeHtml(x.link) + '" target="_blank" rel="noopener">open</a></div>') : '') +
-            '</td>' +
-            '<td class="num">' + escapeHtml(x.actual||'—') + '</td>' +
-            '<td class="num">' + escapeHtml(x.previous||'—') + '</td>' +
-            '<td class="num">' + escapeHtml(x.consensus||'—') + '</td>' +
-            '<td class="num">' + escapeHtml(x.forecast||'—') + '</td>' +
-          '</tr>';
-        }).join('') +
-        '    </tbody>' +
-        '  </table>' +
-        '  <div class="tick" style="margin-top:10px;">Note: RSS calendars often don’t provide Actual/Forecast/Previous consistently. Fields remain blank when unavailable.</div>' +
+        '  <div class="h2">' + escapeHtml(sym) + '</div>' +
+        '  <div class="list">' +
+        '    <div class="item"><div class="t">Bias</div><div class="m"><b>' + escapeHtml(x.bias || '—') + '</b></div></div>' +
+        '    <div class="item"><div class="t">Decision</div><div class="m"><b>' + escapeHtml(gate.label || (gate.ok ? 'TRADE OK' : 'NO TRADE')) + '</b></div></div>' +
+        '    <div class="item"><div class="t">Why</div><div class="m">' + escapeHtml(gate.ok ? why : blocks) + '</div></div>' +
+        '  </div>' +
         '</div>';
-
-      showModal('C CAL (DB)', table);
-    }catch(e){
-      showModal('C CAL (DB)', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
     }
+
+    showModal('M MORNING', head + card('XAU') + card('US500') + card('WTI'));
   }
 
   function openMyfx(){
     var html = ''
       + '<div class="panel">'
       + '  <div class="h2">MyFXBook Economic Calendar</div>'
-      + '  <div class="toggleRow">'
+      + '  <div class="btnrow">'
       + '    <button class="btn" onclick="toggleMyfxDark()">Toggle Dark</button>'
-      + '    <span class="muted">Widget is white by default; dark mode uses CSS filter.</span>'
+      + '    <span class="muted" style="font-family:var(--mono); font-size:12px;">Widget is white by default; dark mode uses CSS filter.</span>'
       + '  </div>'
-      + '  <div class="iframebox dark" id="myfxBox">'
-      + '    <iframe src="/myfx_calendar" loading="lazy"></iframe>'
-      + '  </div>'
-      + '  <div class="tick" style="margin-top:10px;">If blocked, open /myfx_calendar in a new tab.</div>' +
-      '</div>';
+      + '  <div class="iframebox dark" id="myfxBox"><iframe src="/myfx_calendar" loading="lazy"></iframe></div>'
+      + '</div>';
     showModal('E MYFX CAL', html);
   }
 
@@ -2222,84 +1971,12 @@ def dashboard():
     else box.classList.add('dark');
   }
 
-  async function openJson(){
-    try{
-      var resp = await fetch('/bias');
-      var js = await resp.json();
-
-      var a = js.assets || {};
-      function line(sym){
-        var x = a[sym] || {};
-        return '<div class="item"><div class="t">' + escapeHtml(sym) + ' • ' + escapeHtml(x.bias||'—') + '</div>'
-          + '<div class="m">score=' + escapeHtml(x.score) + ' th=' + escapeHtml(x.threshold) + ' q2=' + escapeHtml(x.quality_v2) + ' conflict=' + escapeHtml(x.conflict_index) + '</div></div>';
-      }
-
-      var html = ''
-        + '<div class="panel"><div class="h2">Snapshot</div><div class="list">'
-        + line('XAU') + line('US500') + line('WTI')
-        + '</div>'
-        + '<div class="toggleRow">'
-        + '<button class="btn" onclick="document.getElementById(\\'rawBias\\').style.display=\\'block\\'">Show raw JSON</button>'
-        + '</div>'
-        + '<div class="item" id="rawBias" style="display:none;"><pre style="margin:0; white-space:pre-wrap; font-family:var(--mono); font-size:12px;">'
-        + escapeHtml(JSON.stringify(js,null,2))
-        + '</pre></div>'
-        + '</div>';
-
-      showModal('J JSON', html);
-    }catch(e){
-      showModal('J JSON', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(String(e)) + '</div></div></div></div>');
-    }
-  }
-
-  function openAnalyst(){
-    var a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
-    var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
-    var meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
-    var gp = meta.gate_profile || '';
-
-    function one(sym){
-      var x = a[sym] || {};
-      var flip = x.flip || {};
-      return ''
-        + '<div class="panel card">'
-        + '<div class="h2">' + escapeHtml(sym) + '</div>'
-        + '<div class="kv">'
-        + '<div class="k">bias</div><div>' + escapeHtml(x.bias||'—') + '</div>'
-        + '<div class="k">score/th</div><div>' + escapeHtml(String(x.score)) + ' / ' + escapeHtml(String(x.threshold)) + '</div>'
-        + '<div class="k">q2/conflict</div><div>' + escapeHtml(String(x.quality_v2)) + ' / ' + escapeHtml(String(x.conflict_index)) + '</div>'
-        + '<div class="k">to_neu/to_opp</div><div>' + escapeHtml(String(flip.to_neutral)) + ' / ' + escapeHtml(String(flip.to_opposite)) + '</div>'
-        + '</div></div>';
-    }
-
-    var alerts = (meta.alerts || []).slice(0,8).map(function(x){
-      return '<div class="item"><div class="t">' + escapeHtml(x.kind||'ALERT') + '</div><div class="m">' + escapeHtml(x.message||'') + '</div></div>';
-    }).join('');
-
-    var html = ''
-      + '<div class="panel"><div class="h2">Analyst</div>'
-      + '<div class="kv">'
-      + '<div class="k">updated_utc</div><div>' + escapeHtml(PAYLOAD.updated_utc||'') + '</div>'
-      + '<div class="k">gate_profile</div><div>' + escapeHtml(gp) + '</div>'
-      + '<div class="k">event_mode</div><div>' + escapeHtml(String(ev.event_mode)) + '</div>'
-      + '<div class="k">event_reason</div><div>' + escapeHtml((ev.reason||[]).join(", ") || '—') + '</div>'
-      + '</div></div>'
-      + '<div class="row2">' + one('XAU') + one('US500') + '</div>'
-      + one('WTI')
-      + '<div class="panel"><div class="h2">Recent alerts</div><div class="list">' + (alerts || '<div class="item"><div class="t">—</div></div>') + '</div></div>';
-
-    showModal('A ANALYST', html);
-  }
-
   document.addEventListener('keydown', function(e){
     var k = String(e.key||'').toLowerCase();
     if(k === 'escape') closeModal();
     if(k === 'r') runNow();
     if(k === 'm') openMorning();
-    if(k === 'c') openCalendar();
     if(k === 'e') openMyfx();
-    if(k === 'j') openJson();
-    if(k === 'a') openAnalyst();
     if(k === '1') openView('XAU');
     if(k === '2') openView('US500');
     if(k === '3') openView('WTI');
@@ -2309,28 +1986,30 @@ def dashboard():
     if(e.target && e.target.id === 'modal') closeModal();
   });
 
-  buildMarqueeAB();
   buildMarqueeNews();
+  buildMarqueeStatus();
   setInterval(buildMarqueeNews, 120000);
-
-  (ALERTS||[]).slice(0,6).forEach(function(a){
-    toast(a.kind, a.message, a.severity || 'WARN');
-  });
 </script>
 </body>
 </html>
 """
 
+    updated_short = updated.replace("T", " ").replace("+00:00", " UTC")
+    if len(updated_short) > 22:
+        updated_short = updated_short[:22].strip()
+
     html = (TEMPLATE
         .replace("__UPDATED_SHORT__", str(updated_short))
         .replace("__GATE_PROFILE__", str(gate_profile))
-        .replace("__NEXT_EVENT__", str(next_event_main))
-        .replace("__EVENT_REASON__", str(next_event_reason_line))
-        .replace("__EV_PILL__", ev_pill)
-        .replace("__TR_PILL__", tr_pill)
-        .replace("__FEEDS_PILL__", feeds_pill)
-        .replace("__FRED_PILL__", fred_pill)
-        .replace("__RUN_TOKEN_REQUIRED__", "true" if bool(meta.get("run_token_required", False)) else "false")
+        .replace("__EVENT_REASON_H__", str(reason_txt))
+        .replace("__NEXT_EVENT__", str(next_event_line))
+        .replace("__NEXT_EVENT_SRC__", (f"source={next_event_src}" if next_event_src else ""))
+        .replace("__EV_CHIP__", ev_chip)
+        .replace("__TR_CHIP__", tr_chip)
+        .replace("__FEEDS_CHIP__", fd_chip)
+        .replace("__FRED_CHIP__", fr_chip)
+        .replace("__RUN_CHIP__", rn_chip)
+        .replace("__DIAG_CHIP__", dg_chip)
         .replace("__ROW_XAU__", row("XAU"))
         .replace("__ROW_US500__", row("US500"))
         .replace("__ROW_WTI__", row("WTI"))

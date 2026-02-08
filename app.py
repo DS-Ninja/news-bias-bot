@@ -661,6 +661,7 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
 def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     """
     Extract currency/impact/values from entry fields and text blob.
+    Handles MYFXBook/FF quirks: currency often lives in tags/categories.
     """
     title = (e.get("title") or "").strip()
     summary = (e.get("summary") or e.get("description") or "").strip()
@@ -669,6 +670,23 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     # Direct tags (best)
     currency = _get_entry_field(e, ["currency", "ccy", "cur", "ff_currency"])
     impact = _get_entry_field(e, ["impact", "importance", "ff_impact", "volatility"])
+
+    # --- NEW: read tags/categories (MYFXBook часто кладёт валюту туда)
+    if not currency:
+        tags = e.get("tags") or e.get("categories") or []
+        try:
+            for tg in tags:
+                term = ""
+                if isinstance(tg, dict):
+                    term = str(tg.get("term") or tg.get("label") or tg.get("name") or "")
+                else:
+                    term = str(tg)
+                m = _CUR_PAT.search(term)
+                if m:
+                    currency = m.group(1).upper()
+                    break
+        except Exception:
+            pass
 
     # Text fallback
     if not currency:
@@ -694,7 +712,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     consensus = pick(r"\bcons(?:ensus)?[:=]\s*([^\s|,;]+)")
     forecast = pick(r"\bfore(?:cast)?[:=]\s*([^\s|,;]+)")
 
-    # Country is messy in RSS; try direct, else infer from currency
     country = _get_entry_field(e, ["country", "ff_country"])
     if not country and currency:
         country = {"USD": "US", "EUR": "EU", "GBP": "UK", "JPY": "JP"}.get(currency.upper())
@@ -1634,48 +1651,37 @@ def _pill_impact(imp: Optional[str]) -> str:
         return '<span class="pill neu">LOW</span>'
     return '<span class="pill neu">—</span>'
 
-def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]]) -> Tuple[str, str]:
+def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str]:
     """
-    Prefer USD events first.
-    If USD exists without ts, show USD "(time unknown)" instead of switching to other currency.
-    Shows impact.
+    STRICT: Next event should be only prefer_ccy (default USD).
+    If no prefer_ccy events exist -> show explicit message.
     """
     if not upcoming:
         return "No upcoming events in horizon", ""
 
-    # First: any USD with ts?
-    usd_timed = [x for x in upcoming if x.get("ts") and str(x.get("currency") or "").upper() == "USD"]
-    if usd_timed:
-        usd_timed.sort(key=lambda x: int(x.get("ts") or 0))
-        pick = usd_timed[0]
-        ts = int(pick["ts"])
-        imp = _impact_norm(pick.get("impact"))
-        ccy = (pick.get("currency") or "—")
-        return f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
+    prefer_ccy = (prefer_ccy or "USD").upper()
 
-    # Second: USD exists but time unknown?
-    usd_unknown = [x for x in upcoming if (not x.get("ts")) and str(x.get("currency") or "").upper() == "USD"]
-    if usd_unknown:
-        u = usd_unknown[0]
-        imp = _impact_norm(u.get("impact"))
-        ccy = (u.get("currency") or "USD")
-        return f"(time unknown) • {ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", ""))
+    # Keep only prefer_ccy events (both timed and unknown-time)
+    pref = [x for x in upcoming if str(x.get("currency") or "").upper() == prefer_ccy]
+    if not pref:
+        return f"No {prefer_ccy} events in horizon", ""
 
-    # Else: earliest timed event
-    timed = [x for x in upcoming if x.get("ts")]
+    # First: timed
+    timed = [x for x in pref if x.get("ts")]
     if timed:
         timed.sort(key=lambda x: int(x.get("ts") or 0))
         pick = timed[0]
         ts = int(pick["ts"])
         imp = _impact_norm(pick.get("impact"))
-        ccy = (pick.get("currency") or "—")
-        return f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
+        return (
+            f"{_fmt_hhmm_utc(ts)} • {prefer_ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
+            str(pick.get("source", "")),
+        )
 
-    # last fallback: time unknown first row
-    u = upcoming[0]
+    # Else: unknown time
+    u = pref[0]
     imp = _impact_norm(u.get("impact"))
-    ccy = (u.get("currency") or "—")
-    return f"(time unknown) • {ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", ""))
+    return (f"(time unknown) • {prefer_ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", "")))
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1696,7 +1702,7 @@ def dashboard():
     now_ts = int(time.time())
 
     reason_txt = _human_event_reason([str(x) for x in (event.get("reason", []) or [])])
-    next_event_line, next_event_src = _pick_next_event(now_ts, upcoming)
+    next_event_line, next_event_src = _pick_next_event(now_ts, upcoming, prefer_ccy="USD")
 
     trump = meta.get("trump", {}) or {}
     trump_flag = bool(trump.get("flag", False))
@@ -1874,8 +1880,12 @@ def dashboard():
         <span class="k">Event reason:</span> <span class="v">__EVENT_REASON_H__</span>
       </div>
       <div class="metaLine" style="margin-top:8px;">
-        <span class="k">Next event:</span> <span class="v">__NEXT_EVENT__</span>
-        <span class="muted">__NEXT_EVENT_SRC__</span>
+        <span class="k">Next event:</span>
+        <span class="pill neu" style="display:inline-flex;gap:10px;align-items:center;">
+          <span style="color:var(--text);font-weight:900;">__NEXT_EVENT__</span>
+          <span class="muted" style="font-weight:900;">__NEXT_EVENT_SRC__</span>
+        </span>
+
       </div>
     </div>
 

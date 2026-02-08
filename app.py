@@ -116,7 +116,7 @@ TV_TICKER_SYMBOLS = [
     {"proName": "ICMARKETS:XAUUSD", "title": "XAUUSD"},
     {"proName": "ICMARKETS:EURUSD", "title": "EURUSD"},
     {"proName": "ICMARKETS:US500",  "title": "US500"},
-    {"proName": "ICMARKETS:USOIL",  "title": "WTI"},
+    {"proName": "ICMARKETS:XTIUSD",  "title": "WTI"},
     {"proName": "ICMARKETS:USDJPY", "title": "USDJPY"},
 ]
 

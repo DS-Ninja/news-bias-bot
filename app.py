@@ -1732,7 +1732,7 @@ def dashboard():
     .marquee{position:relative; overflow:hidden;}
     .marqueeInner{display:inline-flex; align-items:center; gap:36px; white-space:nowrap; will-change:transform; animation:scroll 30s linear infinite;}
     .marquee:hover .marqueeInner{animation-play-state:paused;}
-    #marqueeNews{ animation-duration: 170s; }
+    #marqueeNews{ animation-duration: 190s; }
     @keyframes scroll{ 0%{transform:translateX(0);} 100%{transform:translateX(-50%);} }
     .tick{font-family:var(--mono); font-size:12px; color:var(--text);}
     .tick .tag{color:var(--cyan); font-weight:900;}

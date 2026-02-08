@@ -1,11 +1,14 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# FIXES v2026-02-08:
+# FIXES v2026-02-08b:
+# - UI: named blocks (META / SWITCHBOARD / ACTIONS / MARKET TAPE / TICKERS / SUMMARY TABLE)
+# - UI: table stability (fixed layout + colgroup + wrap) to prevent “pushing/misalignment”
+# - Calendar: stronger parsing for MYFX_CAL + generic blob datetime parse (prevents USD events missing ts)
+# - Next event: prefers USD; if USD exists but has no ts, shows USD "(time unknown)" instead of switching to JPY
+# - Calendar: impact normalization LOW/MED/HIGH displayed everywhere
 # - RUN token: supports RUN_TOKENS (comma-separated) + better mismatch UX + clear saved token
-# - Calendar: stronger parsing for currency/impact/event_ts, stores impact and shows LOW/MED/HIGH
-# - Next event: prefers USD, shows impact
 # - /diag: shows run_token_hashes (safe) to debug token mismatch
-# - VIEW: keeps existing evidence view, but now calendar fields are cleaner
+# - VIEW: keeps existing evidence view; calendar fields cleaner
 
 import os
 import json
@@ -14,7 +17,7 @@ import re
 import hashlib
 import math
 import calendar as pycalendar
-from datetime import datetime, timezone, date, time as dtime
+from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
 import feedparser
@@ -112,6 +115,7 @@ if RUN_TOKEN:
     RUN_TOKENS.append(RUN_TOKEN)
 if RUN_TOKENS_RAW:
     RUN_TOKENS.extend([x.strip() for x in RUN_TOKENS_RAW.split(",") if x.strip()])
+
 # de-dup while preserving order
 _seen = set()
 RUN_TOKENS = [t for t in RUN_TOKENS if not (t in _seen or _seen.add(t))]
@@ -129,7 +133,7 @@ TV_TICKER_SYMBOLS = [
     {"proName": "ICMARKETS:XAUUSD", "title": "XAUUSD"},
     {"proName": "ICMARKETS:EURUSD", "title": "EURUSD"},
     {"proName": "ICMARKETS:US500",  "title": "US500"},
-    {"proName": "ICMARKETS:XTIUSD",  "title": "WTI"},
+    {"proName": "ICMARKETS:XTIUSD", "title": "WTI"},
     {"proName": "ICMARKETS:USDJPY", "title": "USDJPY"},
 ]
 
@@ -548,6 +552,11 @@ def ingest_news_once(limit_per_feed: int = 40) -> int:
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
 _IMPACT_PAT = re.compile(r"\b(high|medium|low)\b", re.I)
 
+_MONTHS = {
+    "jan": 1, "feb": 2, "mar": 3, "apr": 4, "may": 5, "jun": 6,
+    "jul": 7, "aug": 8, "sep": 9, "oct": 10, "nov": 11, "dec": 12,
+}
+
 def _get_entry_field(e: dict, keys: List[str]) -> Optional[str]:
     for k in keys:
         v = e.get(k)
@@ -566,12 +575,10 @@ def _try_parse_ff_datetime(e: dict) -> Optional[int]:
     ForexFactory xml often has custom tags: date, time, datetime, etc.
     We try several keys and patterns. If we cannot parse, return None.
     """
-    # Candidates that sometimes exist in FF xml
     d_raw = _get_entry_field(e, ["date", "event_date", "ff_date", "ev_date"])
     t_raw = _get_entry_field(e, ["time", "event_time", "ff_time", "ev_time"])
 
     if d_raw and t_raw:
-        # common FF date format: "02-08-2026" or "2026-02-08"
         d_raw2 = d_raw.strip()
         t_raw2 = t_raw.strip()
 
@@ -579,21 +586,18 @@ def _try_parse_ff_datetime(e: dict) -> Optional[int]:
         if not re.search(r"\d", t_raw2):
             return None
 
-        # Normalize time: HH:MM
         tm = re.search(r"(\d{1,2}):(\d{2})", t_raw2)
         if not tm:
             return None
         hh = int(tm.group(1))
         mm = int(tm.group(2))
 
-        # Date parsing
         y = m = dd = None
         if re.match(r"^\d{4}-\d{2}-\d{2}$", d_raw2):
             y, m, dd = [int(x) for x in d_raw2.split("-")]
         elif re.match(r"^\d{2}-\d{2}-\d{4}$", d_raw2):
             m, dd, y = [int(x) for x in d_raw2.split("-")]
         else:
-            # last attempt: find digits
             m2 = re.search(r"(\d{4})-(\d{2})-(\d{2})", d_raw2)
             if m2:
                 y, m, dd = int(m2.group(1)), int(m2.group(2)), int(m2.group(3))
@@ -604,15 +608,53 @@ def _try_parse_ff_datetime(e: dict) -> Optional[int]:
         dt = datetime(y, m, dd, hh, mm, tzinfo=timezone.utc)
         return int(dt.timestamp())
 
-    # Sometimes FF provides a single datetime-like field
     dt_raw = _get_entry_field(e, ["datetime", "event_datetime", "ff_datetime"])
     if dt_raw:
-        # try ISO-ish
         m = re.search(r"(\d{4})-(\d{2})-(\d{2}).*?(\d{1,2}):(\d{2})", dt_raw)
         if m:
             y, mo, da, hh, mm = [int(m.group(i)) for i in range(1, 6)]
             dt = datetime(y, mo, da, hh, mm, tzinfo=timezone.utc)
             return int(dt.timestamp())
+
+    return None
+
+def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
+    """
+    Generic fallback: parse common datetime patterns from title/summary blob.
+    Returns UTC ts or None.
+    """
+    if not blob:
+        return None
+    s = " ".join(str(blob).split())
+
+    # 1) ISO: 2026-02-08 23:30
+    m = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})", s)
+    if m:
+        y, mo, da, hh, mm = [int(m.group(i)) for i in range(1, 6)]
+        return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
+
+    # 2) US-ish: Feb 8, 2026 23:30
+    m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
+    if m:
+        mon = _MONTHS.get(m.group(1).lower()[:3])
+        da = int(m.group(2)); y = int(m.group(3)); hh = int(m.group(4)); mm = int(m.group(5))
+        if mon:
+            return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
+
+    # 3) EU-ish: 08 Feb 2026 23:30
+    m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
+    if m:
+        da = int(m.group(1)); mon = _MONTHS.get(m.group(2).lower()[:3]); y = int(m.group(3))
+        hh = int(m.group(4)); mm = int(m.group(5))
+        if mon:
+            return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
+
+    # 4) DD/MM/YYYY HH:MM
+    m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
+    if m:
+        da, mo, y, hh, mm = [int(m.group(i)) for i in range(1, 6)]
+        if 1 <= mo <= 12 and 1 <= da <= 31:
+            return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
     return None
 
@@ -655,7 +697,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     # Country is messy in RSS; try direct, else infer from currency
     country = _get_entry_field(e, ["country", "ff_country"])
     if not country and currency:
-        # lightweight inference for display only
         country = {"USD": "US", "EUR": "EU", "GBP": "UK", "JPY": "JP"}.get(currency.upper())
 
     return {
@@ -670,7 +711,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
 
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
     inserted = 0
-    now = int(time.time())
 
     with db_conn() as conn:
         with conn.cursor() as cur:
@@ -693,9 +733,6 @@ def ingest_calendar_once(limit_per_feed: int = 250) -> int:
                     if not title:
                         continue
 
-                    # event timestamp:
-                    # - ForexFactory: prefer custom date+time tags
-                    # - MyFX: fall back to published_parsed if nothing else
                     event_ts: Optional[int] = None
                     if src == "FOREXFACTORY_CALENDAR":
                         event_ts = _try_parse_ff_datetime(e)
@@ -707,6 +744,11 @@ def ingest_calendar_once(limit_per_feed: int = 250) -> int:
                                 event_ts = int(pycalendar.timegm(pp))
                             except Exception:
                                 event_ts = None
+
+                    # NEW: generic blob parse (helps MYFX_CAL / messy feeds)
+                    if event_ts is None:
+                        blob = ((e.get("title") or "") + " " + (e.get("summary") or e.get("description") or "")).strip()
+                        event_ts = _try_parse_any_datetime_from_blob(blob)
 
                     fields = _parse_calendar_fields(src, e)
 
@@ -786,14 +828,14 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
-    # fallback: show latest rows even if ts missing
+    # fallback: show latest rows even if ts missing (for diagnostics/morning modal)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
                 SELECT source, title, link, event_ts, currency, impact, country
                 FROM econ_events
                 ORDER BY COALESCE(event_ts, 0) DESC, id DESC
-                LIMIT 5;
+                LIMIT 12;
             """)
             rows2 = cur.fetchall()
 
@@ -809,7 +851,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             "country": (country or None),
             "in_hours": None
         })
-    return unknown[:5]
+    return unknown[:12]
 
 def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours: float = 12.0) -> Dict[str, Any]:
     cutoff = now_ts - int(hours * 3600)
@@ -1159,7 +1201,6 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         ev_term = min(1.0, evidence_count / 18.0)
         div_term = min(1.0, src_div / 7.0)
 
-        # freshness score (approx)
         fresh_total = sum(int(v) for v in freshness.values())
         fresh02 = freshness["0-2h"]
         fresh28 = freshness["2-8h"]
@@ -1269,10 +1310,14 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     p_ev = bool((prev.get("event", {}) or {}).get("event_mode", False))
     c_ev = bool((cur.get("event", {}) or {}).get("event_mode", False))
     if p_ev != c_ev:
-        push("event_mode_flip", f"EVENT MODE {'ON' if c_ev else 'OFF'}", asset=None, severity="WARN",
-             extra={"prev": p_ev, "cur": c_ev, "reason": (cur.get("event", {}) or {}).get("reason", [])})
+        push(
+            "event_mode_flip",
+            f"EVENT MODE {'ON' if c_ev else 'OFF'}",
+            asset=None,
+            severity="WARN",
+            extra={"prev": p_ev, "cur": c_ev, "reason": (cur.get("event", {}) or {}).get("reason", [])}
+        )
 
-    # Per-asset diffs
     q2_drop_th = int(ALERT_CFG.get("q2_drop", 12))
     conflict_spike_th = float(ALERT_CFG.get("conflict_spike", 0.18))
 
@@ -1283,20 +1328,35 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
         pb = str(pa.get("bias", "NEUTRAL"))
         cb = str(ca.get("bias", "NEUTRAL"))
         if pb != cb:
-            push("bias_flip", f"{a} bias flip: {pb} → {cb}", asset=a, severity="WARN",
-                 extra={"prev": pb, "cur": cb, "score": ca.get("score"), "q2": ca.get("quality_v2"), "conflict": ca.get("conflict_index")})
+            push(
+                "bias_flip",
+                f"{a} bias flip: {pb} → {cb}",
+                asset=a,
+                severity="WARN",
+                extra={"prev": pb, "cur": cb, "score": ca.get("score"), "q2": ca.get("quality_v2"), "conflict": ca.get("conflict_index")}
+            )
 
         pq2 = int(pa.get("quality_v2", 0))
         cq2 = int(ca.get("quality_v2", 0))
         if (pq2 - cq2) >= q2_drop_th:
-            push("q2_drop", f"{a} Q2 drop: {pq2} → {cq2} (Δ={pq2-cq2})", asset=a, severity="WARN",
-                 extra={"prev": pq2, "cur": cq2})
+            push(
+                "q2_drop",
+                f"{a} Q2 drop: {pq2} → {cq2} (Δ={pq2-cq2})",
+                asset=a,
+                severity="WARN",
+                extra={"prev": pq2, "cur": cq2}
+            )
 
         pc = float(pa.get("conflict_index", 0.0))
         cc = float(ca.get("conflict_index", 0.0))
         if (cc - pc) >= conflict_spike_th:
-            push("conflict_spike", f"{a} conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})", asset=a, severity="WARN",
-                 extra={"prev": pc, "cur": cc})
+            push(
+                "conflict_spike",
+                f"{a} conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})",
+                asset=a,
+                severity="WARN",
+                extra={"prev": pc, "cur": cc}
+            )
 
     # Feeds degraded flip based on ratio
     p_meta = (prev.get("meta", {}) or {})
@@ -1308,8 +1368,13 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
         cr = _feeds_ok_ratio(c_fs)
         thr = float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
         if pr >= thr and cr < thr:
-            push("feeds_degraded", f"FEEDS degraded: ok_ratio {pr:.2f} → {cr:.2f}", asset=None, severity="WARN",
-                 extra={"prev_ratio": pr, "cur_ratio": cr})
+            push(
+                "feeds_degraded",
+                f"FEEDS degraded: ok_ratio {pr:.2f} → {cr:.2f}",
+                asset=None,
+                severity="WARN",
+                extra={"prev_ratio": pr, "cur_ratio": cr}
+            )
 
     return alerts
 
@@ -1571,28 +1636,46 @@ def _pill_impact(imp: Optional[str]) -> str:
 
 def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]]) -> Tuple[str, str]:
     """
-    Prefer USD events first, else earliest.
+    Prefer USD events first.
+    If USD exists without ts, show USD "(time unknown)" instead of switching to other currency.
     Shows impact.
     """
     if not upcoming:
         return "No upcoming events in horizon", ""
 
-    timed = [x for x in upcoming if x.get("ts")]
-    if not timed:
-        u = upcoming[0]
+    # First: any USD with ts?
+    usd_timed = [x for x in upcoming if x.get("ts") and str(x.get("currency") or "").upper() == "USD"]
+    if usd_timed:
+        usd_timed.sort(key=lambda x: int(x.get("ts") or 0))
+        pick = usd_timed[0]
+        ts = int(pick["ts"])
+        imp = _impact_norm(pick.get("impact"))
+        ccy = (pick.get("currency") or "—")
+        return f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
+
+    # Second: USD exists but time unknown?
+    usd_unknown = [x for x in upcoming if (not x.get("ts")) and str(x.get("currency") or "").upper() == "USD"]
+    if usd_unknown:
+        u = usd_unknown[0]
         imp = _impact_norm(u.get("impact"))
-        ccy = (u.get("currency") or "—")
-        return f"(time unknown) • {ccy} {_pill_impact(imp)} • {u.get('title','')}", str(u.get("source", ""))
+        ccy = (u.get("currency") or "USD")
+        return f"(time unknown) • {ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", ""))
 
-    # sort by time
-    timed.sort(key=lambda x: int(x.get("ts") or 0))
+    # Else: earliest timed event
+    timed = [x for x in upcoming if x.get("ts")]
+    if timed:
+        timed.sort(key=lambda x: int(x.get("ts") or 0))
+        pick = timed[0]
+        ts = int(pick["ts"])
+        imp = _impact_norm(pick.get("impact"))
+        ccy = (pick.get("currency") or "—")
+        return f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
 
-    usd = [x for x in timed if str(x.get("currency") or "").upper() == "USD"]
-    pick = usd[0] if usd else timed[0]
-    ts = int(pick["ts"])
-    imp = _impact_norm(pick.get("impact"))
-    ccy = (pick.get("currency") or "—")
-    return f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})", str(pick.get("source", ""))
+    # last fallback: time unknown first row
+    u = upcoming[0]
+    imp = _impact_norm(u.get("impact"))
+    ccy = (u.get("currency") or "—")
+    return f"(time unknown) • {ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", ""))
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1716,14 +1799,29 @@ def dashboard():
     .btn:hover{background:var(--btn2);}
     .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
-    table{width:100%; border-collapse:collapse; font-family:var(--mono);}
+
+    /* Table stability */
+    table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900;}
     .sym{color:var(--amber); font-weight:900;}
-    .why{color:var(--text); max-width:760px;}
+    .why{color:var(--text); overflow-wrap:anywhere; word-break:break-word;}
     .act{text-align:right; white-space:nowrap;}
+
     .muted{color:var(--muted);}
     .tvwrap{margin-top:12px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
+
+    /* Blocks */
+    .block{margin-top:12px;}
+    .block:first-child{margin-top:0;}
+    .blockTitle{
+      font-family:var(--mono);
+      font-size:12px;
+      font-weight:900;
+      color:var(--muted);
+      letter-spacing:.6px;
+      margin:0 0 8px 2px;
+    }
 
     /* Tickers */
     .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
@@ -1759,56 +1857,88 @@ def dashboard():
 <body>
 <div class="wrap">
   <div class="hdr">
-    <div class="title">
-      <div><b>NEWS BIAS</b> // TERMINAL</div>
-      <div class="muted" style="font-family:var(--mono); font-size:12px;">Profile: <b style="color:var(--amber);">__GATE_PROFILE__</b></div>
-    </div>
 
-    <div class="metaLine">
-      <span class="k">Updated (UTC):</span> <span class="v">__UPDATED_SHORT__</span>
-      <span class="k">Event reason:</span> <span class="v">__EVENT_REASON_H__</span>
-    </div>
-
-    <div class="metaLine" style="margin-top:8px;">
-      <span class="k">Next event:</span> <span class="v">__NEXT_EVENT__</span>
-      <span class="muted">__NEXT_EVENT_SRC__</span>
-    </div>
-
-    <div class="chips">
-      __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __DIAG_CHIP__
-    </div>
-
-    <div class="btnrow">
-      <button class="btn" onclick="runNow()">R RUN</button>
-      <button class="btn" onclick="openMorning()">M MORNING</button>
-      <button class="btn" onclick="openMyfx()">E MYFX CAL</button>
-      <button class="btn" onclick="clearSavedToken()">Clear saved token</button>
-    </div>
-
-    <div class="tvwrap">
-      <div class="tradingview-widget-container">
-        <div class="tradingview-widget-container__widget"></div>
-        <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
-        { "symbols": __TV_SYMBOLS__, "showSymbolLogo": true, "isTransparent": true, "displayMode": "adaptive",
-          "colorTheme": "dark", "locale": "en" }
-        </script>
+    <!-- HEADER -->
+    <div class="block">
+      <div class="title">
+        <div><b>NEWS BIAS</b> // TERMINAL</div>
+        <div class="muted" style="font-family:var(--mono); font-size:12px;">Profile: <b style="color:var(--amber);">__GATE_PROFILE__</b></div>
       </div>
     </div>
 
-    <div class="tickerstack">
-      <div>
-        <div class="ticklabel">HEADLINES (latest)</div>
-        <div class="tickerline marquee"><div class="marqueeInner" id="marqueeNews"></div></div>
+    <!-- META -->
+    <div class="block">
+      <div class="blockTitle">META</div>
+      <div class="metaLine">
+        <span class="k">Updated (UTC):</span> <span class="v">__UPDATED_SHORT__</span>
+        <span class="k">Event reason:</span> <span class="v">__EVENT_REASON_H__</span>
       </div>
-      <div>
-        <div class="ticklabel">STATUS (bias + trade gate)</div>
-        <div class="tickerline marquee"><div class="marqueeInner" id="marqueeStatus"></div></div>
+      <div class="metaLine" style="margin-top:8px;">
+        <span class="k">Next event:</span> <span class="v">__NEXT_EVENT__</span>
+        <span class="muted">__NEXT_EVENT_SRC__</span>
       </div>
     </div>
+
+    <!-- SWITCHBOARD -->
+    <div class="block">
+      <div class="blockTitle">SWITCHBOARD</div>
+      <div class="chips">
+        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __DIAG_CHIP__
+      </div>
+    </div>
+
+    <!-- ACTIONS -->
+    <div class="block">
+      <div class="blockTitle">ACTIONS</div>
+      <div class="btnrow">
+        <button class="btn" onclick="runNow()">R RUN</button>
+        <button class="btn" onclick="openMorning()">M MORNING</button>
+        <button class="btn" onclick="openMyfx()">E MYFX CAL</button>
+        <button class="btn" onclick="clearSavedToken()">Clear saved token</button>
+      </div>
+    </div>
+
+    <!-- MARKET TAPE -->
+    <div class="block">
+      <div class="blockTitle">MARKET TAPE</div>
+      <div class="tvwrap">
+        <div class="tradingview-widget-container">
+          <div class="tradingview-widget-container__widget"></div>
+          <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
+          { "symbols": __TV_SYMBOLS__, "showSymbolLogo": true, "isTransparent": true, "displayMode": "adaptive",
+            "colorTheme": "dark", "locale": "en" }
+          </script>
+        </div>
+      </div>
+    </div>
+
+    <!-- TICKERS -->
+    <div class="block">
+      <div class="blockTitle">TICKERS</div>
+      <div class="tickerstack">
+        <div>
+          <div class="ticklabel">HEADLINES (latest)</div>
+          <div class="tickerline marquee"><div class="marqueeInner" id="marqueeNews"></div></div>
+        </div>
+        <div>
+          <div class="ticklabel">STATUS (bias + trade gate)</div>
+          <div class="tickerline marquee"><div class="marqueeInner" id="marqueeStatus"></div></div>
+        </div>
+      </div>
+    </div>
+
   </div>
 
   <div class="panel">
+    <div class="blockTitle">SUMMARY TABLE</div>
     <table>
+      <colgroup>
+        <col style="width:90px">
+        <col style="width:140px">
+        <col style="width:140px">
+        <col>
+        <col style="width:92px">
+      </colgroup>
       <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (short)</th><th></th></tr></thead>
       <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
     </table>
@@ -1868,7 +1998,6 @@ def dashboard():
       var resp = await fetch(url, { method:'POST' });
       var js = await resp.json();
       if(resp.status === 401){
-        // mismatch: show hashes and suggest clearing saved token
         showModal('RUN UNAUTHORIZED', ''
           + '<div class="panel">'
           + '<div class="h2">Token mismatch</div>'

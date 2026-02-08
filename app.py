@@ -4,6 +4,7 @@
 # - FIX: MYFX calendar in modal uses dark filter + toggle
 # - FIX: M/J/A open readable cards (not raw code only), raw JSON available via button
 # - FIX: Safari-safe JS (no replaceAll / ?? / optional chaining)
+# - FIX (UI): Clean terminal header (no "vinegret"): status grid + next event + event reason
 # - KEEP: pipeline, RSS ingest, calendar ingest/store, alerts diff engine, event mode logic
 
 import os
@@ -81,8 +82,8 @@ EVENT_CFG = {
 # Alerts thresholds (server diff)
 ALERT_CFG = {
     "enabled": True,
-    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),              # points
-    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")),  # delta
+    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),                   # points
+    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")), # delta
     "feeds_degraded_ratio": float(os.environ.get("ALERT_FEEDS_DEGRADED_RATIO", "0.80")),  # ok share
 }
 
@@ -997,11 +998,12 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         )
         quality_v2 = int(max(0, min(100, round(raw_v2 * 100))))
 
-        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
         top3 = _top_drivers(contribs, topn=3)
         cons_by_src = _consensus_by_source(contribs)
         med_abs = _median_abs_contrib(contribs)
         flip = flip_metrics(score, th, bias, med_abs)
+
+        why_top5 = sorted(contribs, key=lambda x: abs(float(x["contrib"])), reverse=True)[:5]
 
         assets_out[asset] = {
             "bias": bias,
@@ -1490,14 +1492,38 @@ def dashboard():
     feeds_pill = f'<span class="pill {"ok" if feeds_ok else "no"}">FEEDS: {"ok" if feeds_ok else "degraded"} ({feeds_ok_ratio:.2f})</span>'
     fred_pill = '<span class="pill neu">FRED: on</span>' if fred_on else '<span class="pill neu">FRED: off</span>'
 
-    next_event = "—"
+    # ---------------------------
+    # Header formatting (clean top)
+    # ---------------------------
+    updated_pretty = updated
+    try:
+        dt_u = datetime.fromisoformat(str(updated).replace("Z", "+00:00"))
+        updated_pretty = dt_u.astimezone(timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+    except Exception:
+        pass
+
+    next_event_pretty = "—"
+    next_event_tminus = "—"
     if upcoming:
-        u = upcoming[0]
-        if u.get("ts"):
-            dt = datetime.fromtimestamp(int(u["ts"]), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
-            next_event = f"{dt} • {u.get('title','')}"
+        u0 = upcoming[0]
+        ts0 = u0.get("ts")
+        ih = u0.get("in_hours")
+        if ih is not None:
+            try:
+                next_event_tminus = f"T-{float(ih):.1f}h"
+            except Exception:
+                next_event_tminus = "T-?h"
+
+        if ts0:
+            try:
+                dt0 = datetime.fromtimestamp(int(ts0), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
+                next_event_pretty = f"{dt0} • {u0.get('title','')}"
+            except Exception:
+                next_event_pretty = f"(UTC) • {u0.get('title','')}"
         else:
-            next_event = f"(time unknown) • {u.get('title','')}"
+            next_event_pretty = f"(time unknown) • {u0.get('title','')}"
+
+    reason_pretty = " • ".join(event_reason) if event_reason else "—"
 
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
@@ -1641,6 +1667,46 @@ def dashboard():
     }
     .toggleRow{display:flex; gap:10px; align-items:center; flex-wrap:wrap; margin-top:10px;}
 
+    /* --- Clean terminal header --- */
+    .statusbox{
+      margin-top:10px;
+      padding:10px 12px;
+      border:1px solid var(--line);
+      border-radius:14px;
+      background:rgba(255,255,255,.02);
+    }
+    .statusgrid{
+      display:grid;
+      grid-template-columns: 170px 140px 140px 140px 160px 120px;
+      gap:8px 10px;
+      align-items:center;
+      font-family:var(--mono);
+      font-size:12px;
+    }
+    .kvp{display:flex; gap:8px; align-items:center; white-space:nowrap; overflow:hidden;}
+    .kvp .k{color:var(--muted); font-weight:900;}
+    .kvp .v{overflow:hidden; text-overflow:ellipsis;}
+    .line2{
+      margin-top:10px;
+      font-family:var(--mono);
+      font-size:12px;
+      display:flex;
+      gap:10px;
+      flex-wrap:wrap;
+      align-items:center;
+    }
+    .line2 .k{color:var(--muted); font-weight:900;}
+    .line2 .v{color:var(--text);}
+    .line3{
+      margin-top:6px;
+      font-family:var(--mono);
+      font-size:12px;
+      color:var(--muted);
+    }
+    @media(max-width: 980px){
+      .statusgrid{grid-template-columns: 1fr 1fr;}
+    }
+
     @media(max-width: 780px){
       .why{max-width:none;}
       th:nth-child(11), td:nth-child(11) {display:none;}
@@ -1654,11 +1720,26 @@ def dashboard():
 <div class="wrap">
   <div class="hdr">
     <div class="title"><b>NEWS BIAS</b> // TERMINAL</div>
-    <div class="sub">updated_utc=__UPDATED__ • gate_profile=__GATE_PROFILE__ • event_mode=__EVENT_MODE__ • trump=__TRUMP__</div>
 
-    <div class="tick">
-      <span class="tag">Next event:</span> __NEXT_EVENT__
-      <span class="muted">• event_reason: __EVENT_REASON__</span>
+    <div class="statusbox">
+      <div class="statusgrid">
+        <div class="kvp"><span class="k">Updated (UTC)</span><span class="v">__UPDATED_PRETTY__</span></div>
+        <div class="kvp"><span class="k">Gate</span><span class="v">__GATE_PROFILE__</span></div>
+        <div class="kvp"><span class="k">Event</span><span class="v">__EV_PILL__</span></div>
+        <div class="kvp"><span class="k">Trump</span><span class="v">__TR_PILL__</span></div>
+        <div class="kvp"><span class="k">Feeds</span><span class="v">__FEEDS_PILL__</span></div>
+        <div class="kvp"><span class="k">FRED</span><span class="v">__FRED_PILL__</span></div>
+      </div>
+
+      <div class="line2">
+        <span class="k">Next event</span>
+        <span class="v">__NEXT_EVENT_PRETTY__</span>
+        <span class="muted">(__NEXT_EVENT_TMINUS__)</span>
+      </div>
+
+      <div class="line3">
+        <span class="k">Event reason:</span> __EVENT_REASON_PRETTY__
+      </div>
     </div>
 
     <!-- LIVE markets tape -->
@@ -1688,12 +1769,8 @@ def dashboard():
       </div>
     </div>
 
-    <div class="bar">
-      __EV_PILL__
-      __TR_PILL__
-      __FEEDS_PILL__
-      __FRED_PILL__
-      <a class="pill neu" href="/diag" target="_blank" rel="noopener">/diag</a>
+    <div class="btnrow">
+      <a class="btn" href="/diag" target="_blank" rel="noopener">/diag</a>
     </div>
 
     <div class="btnrow">
@@ -2180,16 +2257,15 @@ def dashboard():
 """
 
     html = (TEMPLATE
-        .replace("__UPDATED__", str(updated))
+        .replace("__UPDATED_PRETTY__", str(updated_pretty))
         .replace("__GATE_PROFILE__", str(gate_profile))
-        .replace("__EVENT_MODE__", str(event_mode).lower())
-        .replace("__TRUMP__", ("on" if trump_enabled else "off"))
-        .replace("__NEXT_EVENT__", str(next_event))
-        .replace("__EVENT_REASON__", str(reason_txt))
         .replace("__EV_PILL__", ev_pill)
         .replace("__TR_PILL__", tr_pill)
         .replace("__FEEDS_PILL__", feeds_pill)
         .replace("__FRED_PILL__", fred_pill)
+        .replace("__NEXT_EVENT_PRETTY__", str(next_event_pretty))
+        .replace("__NEXT_EVENT_TMINUS__", str(next_event_tminus))
+        .replace("__EVENT_REASON_PRETTY__", str(reason_pretty))
         .replace("__ROW_XAU__", row("XAU"))
         .replace("__ROW_US500__", row("US500"))
         .replace("__ROW_WTI__", row("WTI"))

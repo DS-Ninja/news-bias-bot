@@ -1942,10 +1942,9 @@ def dashboard():
 
     <!-- TICKERS -->
     <div class="block">
-      <div class="blockTitle">TICKERS</div>
+      <div class="blockTitle">TICKERS | HEADLINES</div>
       <div class="tickerstack">
         <div>
-          <div class="ticklabel">HEADLINES (latest)</div>
           <div class="tickerline marquee"><div class="marqueeInner" id="marqueeNews"></div></div>
         </div>
         <div>

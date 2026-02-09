@@ -1,11 +1,9 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# FIXES v2026-02-08c:
-# - UI: SUMMARY TABLE overflow fix (tablewrap + wider action col + table-only button override)
-# - SWITCHBOARD: renamed + clickable chips -> modal explanations (mobile friendly)
-# - DIAG: /diag is now HTML page, /diag.json is raw JSON
-# - RUN: label now OPEN/LOCKED
-# - MACRO: label now MACRO ON/OFF (FRED drivers)
+# UPDATED v2026-02-09a:
+# ✅ SUMMARY TABLE: TH alignment fix + more informative WHY (numeric Q2/Conflict/Score/Threshold + RISK)
+# ✅ VIEW: decision banner (big NO TRADE / TRADE OK) + key metrics + blockers highlighted + evidence shows contrib/age/source
+# ✅ FEEDS/FITS: click FEEDS chip now shows GOOD/BAD per feed (ok/bozo/entries/error) + totals (fix "I can't check fits" problem)
 
 import os
 import json
@@ -1458,6 +1456,16 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
         "fail_reasons": fail[:6],
         "fail_short": fail_short[:3],
         "must_change": must[:4],
+
+        # numeric context for UI (summary + view)
+        "bias": bias,
+        "q2": q2, "q2_min": qmin,
+        "conflict": conflict, "conflict_max": cmax,
+        "score": float(asset_obj.get("score", 0.0)),
+        "th": float(asset_obj.get("threshold", 0.0)),
+        "to_opposite": to_opp, "min_opp_flip_dist": mind,
+        "event_mode": bool(event_mode),
+        "profile": str(profile),
     }
 
 # ============================================================
@@ -1732,7 +1740,7 @@ def dashboard():
 
     fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
                     "ok" if feeds_ok else "no",
-                    "RSS parsing health. DEGRADED means bias/quality less reliable. Click for details.", "feeds")
+                    "RSS parsing health. Click to see GOOD/BAD feeds.", "feeds")
 
     fr_chip = _chip("MACRO", ("ON" if fred_on else "OFF"), "neu",
                     "Macro drivers (FRED). OFF reason: " + fred_why + ". Click for details.", "macro")
@@ -1748,7 +1756,27 @@ def dashboard():
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
         ok = bool(gate.get("ok", False))
-        short = (" | ".join((gate.get("fail_short", []) or [])[:3]) if not ok else ((gate.get("why", []) or ["—"])[0]))
+
+        q2 = int(gate.get("q2", 0)); q2min = int(gate.get("q2_min", 0))
+        c = float(gate.get("conflict", 1.0)); cmax = float(gate.get("conflict_max", 1.0))
+        score = float(gate.get("score", 0.0)); th = float(gate.get("th", 0.0))
+        to_opp = float(gate.get("to_opposite", 999.0)); mind = float(gate.get("min_opp_flip_dist", 0.0))
+
+        evc = int(a.get("evidence_count", 0))
+        fr = a.get("freshness", {}) or {}
+        f02 = int(fr.get("0-2h", 0)); f28 = int(fr.get("2-8h", 0))
+
+        if ok:
+            short = f"score {score:.2f}/{th:.2f} | C {c:.2f} | ev {evc} | 0-2h {f02}"
+        else:
+            short = f"Q2 {q2}/{q2min} | C {c:.2f}/{cmax:.2f} | score {score:.2f}/{th:.2f}"
+            if bias in ("BULLISH","BEARISH") and to_opp < mind:
+                short += f" | flip {to_opp:.2f}<{mind:.2f}"
+            if gate.get("event_mode"):
+                short += " | RISK"
+            if bias == "NEUTRAL":
+                short = "NEUTRAL | " + short
+
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
@@ -1823,7 +1851,8 @@ def dashboard():
     /* Table stability */
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
-    th{color:var(--muted); font-weight:900;}
+    th{color:var(--muted); font-weight:900; text-align:left;} /* ✅ FIX: prevent centered headers */
+    thead th:last-child{ text-align:right; } /* action column */
     .sym{color:var(--amber); font-weight:900;}
     .why{color:var(--text); overflow-wrap:anywhere; word-break:break-word;}
     .act{text-align:right; white-space:nowrap;}
@@ -1876,6 +1905,17 @@ def dashboard():
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
+
+    /* View emphasis */
+    .banner{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
+    .bannerTop{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
+    .big{font-family:var(--mono); font-weight:900; letter-spacing:.8px; font-size:14px;}
+    .big .ok{color:var(--ok);}
+    .big .no{color:var(--no);}
+    .grid2{display:grid; grid-template-columns: 1fr 1fr; gap:12px;}
+    @media(max-width:820px){ .grid2{grid-template-columns:1fr;} }
+    .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
+    .mini .pill{font-size:11px; padding:5px 9px;}
   </style>
 </head>
 <body>
@@ -1973,7 +2013,7 @@ def dashboard():
       </table>
     </div>
 
-    <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>.</div>
+    <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>. Hotkeys: R/M/E • 1/2/3 • Esc.</div>
   </div>
 </div>
 
@@ -2071,7 +2111,8 @@ def dashboard():
       var b = x.bias || '—';
       var gate = x.ui_gate || {};
       var trade = gate.ok ? 'TRADE OK' : 'NO TRADE';
-      var why = gate.ok ? ((gate.why||[])[0] || '') : ((gate.fail_short||[]).join(' | ') || 'Blocked');
+      var why = gate.ok ? ('score ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
+                        : ((gate.fail_short||[]).join(' | ') || 'Blocked');
       parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b>' + (why ? (' • ' + escapeHtml(why)) : '') + '</span>');
     });
     var line = parts.join(' <span class="muted">•</span> ');
@@ -2120,16 +2161,42 @@ def dashboard():
     }
 
     if(key === 'feeds'){
-      title = 'FEEDS (RSS health)';
-      body =
-        '<div class="panel"><div class="h2">What it means</div><div class="list">'
-        + '<div class="item"><div class="t">OK</div><div class="m">Most feeds parsed successfully.</div></div>'
-        + '<div class="item"><div class="t">DEGRADED</div><div class="m">Many feeds failing → bias/quality less reliable.</div></div>'
-        + '</div></div>'
-        + '<div class="panel"><div class="h2">Now</div><div class="list">'
-        + '<div class="item"><div class="t">feeds tracked</div><div class="m">' + escapeHtml(String(Object.keys(feeds||{}).length)) + '</div></div>'
-        + '<div class="item"><div class="t">Tip</div><div class="m">Open DIAG to inspect feed errors.</div></div>'
+      title = 'FEEDS (GOOD/BAD)';
+      // Classify feeds into GOOD/WARN/BAD/SKIP
+      let keys = Object.keys(feeds || {});
+      let good=0, warn=0, bad=0, skip=0;
+      let rows = [];
+      keys.sort();
+      keys.forEach(function(k){
+        const o = feeds[k] || {};
+        if(o.skipped){ skip++; rows.push({k:k, st:'SKIP', m:'skipped', cls:'neu'}); return; }
+        if(!o.ok){ bad++; rows.push({k:k, st:'BAD', m:(o.error||'error'), cls:'bear'}); return; }
+        const bozo = (o.bozo||0);
+        const en = (o.entries||0);
+        if(bozo===0 && en>0){ good++; rows.push({k:k, st:'GOOD', m:('entries='+en), cls:'bull'}); return; }
+        warn++; rows.push({k:k, st:'WARN', m:('bozo='+bozo+' entries='+en), cls:'warn'});
+      });
+
+      const head =
+        '<div class="panel"><div class="h2">Summary</div><div class="list">'
+        + '<div class="item"><div class="t">Tracked</div><div class="m">' + escapeHtml(String(keys.length)) + '</div></div>'
+        + '<div class="item"><div class="t">GOOD / WARN / BAD / SKIP</div><div class="m">'
+        + escapeHtml(good + ' / ' + warn + ' / ' + bad + ' / ' + skip) + '</div></div>'
+        + '<div class="item"><div class="t">Rule</div><div class="m">GOOD = ok & bozo=0 & entries>0 • WARN = ok but bozo=1 or entries=0 • BAD = not ok</div></div>'
         + '</div></div>';
+
+      const list =
+        '<div class="panel"><div class="h2">Per feed</div><div class="list">'
+        + rows.map(function(r){
+            return '<div class="item">'
+              + '<div class="t"><span class="pill ' + (r.cls==='bull'?'bull':(r.cls==='bear'?'bear':(r.cls==='warn'?'warn':'neu'))) + '">' + escapeHtml(r.st) + '</span> '
+              + '<b style="color:var(--amber)">' + escapeHtml(r.k) + '</b></div>'
+              + '<div class="m">' + escapeHtml(r.m) + '</div>'
+              + '</div>';
+          }).join('')
+        + '</div></div>';
+
+      body = head + list + '<div class="kz"><b>Tip:</b> if BAD spikes, bias/quality becomes noisy. Open DIAG for DB/env too.</div>';
     }
 
     if(key === 'macro'){
@@ -2174,11 +2241,54 @@ def dashboard():
     var gate = a.ui_gate || {};
     var top = (a.top3_drivers || []);
     var why5 = (a.why_top5 || []);
+    var fr = a.freshness || {};
 
-    var head =
-      '<div class="panel"><div class="h2">' + escapeHtml(sym) + '</div><div class="list">'
-      + '<div class="item"><div class="t">Bias</div><div class="m">' + escapeHtml(a.bias || '—') + '</div></div>'
-      + '<div class="item"><div class="t">Trade decision</div><div class="m"><b>' + escapeHtml(gate.label || (gate.ok ? 'TRADE OK' : 'NO TRADE')) + '</b></div></div>'
+    var ok = !!gate.ok;
+    var badge = ok ? '<span class="pill ok">TRADE OK</span>' : '<span class="pill no">NO TRADE</span>';
+    var big = ok ? '<span class="ok">TRADE OK</span>' : '<span class="no">NO TRADE</span>';
+
+    // key metrics
+    var q2 = (gate.q2||0), q2min = (gate.q2_min||0);
+    var c = (gate.conflict||0), cmax = (gate.conflict_max||0);
+    var score = (gate.score||0), th = (gate.th||0);
+    var toopp = (gate.to_opposite||0), mind = (gate.min_opp_flip_dist||0);
+    var evc = (a.evidence_count||0), div = (a.source_diversity||0);
+
+    var banner =
+      '<div class="banner">'
+      + '<div class="bannerTop">'
+      + '  <div class="big">' + escapeHtml(sym) + ' • ' + big + '</div>'
+      + '  <div>' + badge + ' ' + '<span class="pill neu">Bias ' + escapeHtml(a.bias||'—') + '</span>' + '</div>'
+      + '</div>'
+      + '<div class="mini">'
+      + '<span class="pill neu">score ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
+      + '<span class="pill neu">Q2 ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
+      + '<span class="pill neu">Conflict ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
+      + '<span class="pill neu">Flip ' + toopp.toFixed(3) + ' (min ' + mind.toFixed(3) + ')</span>'
+      + '<span class="pill neu">ev ' + escapeHtml(String(evc)) + ' • div ' + escapeHtml(String(div)) + '</span>'
+      + '<span class="pill neu">fresh 0-2h ' + escapeHtml(String(fr["0-2h"]||0)) + ' • 2-8h ' + escapeHtml(String(fr["2-8h"]||0)) + '</span>'
+      + (gate.event_mode ? '<span class="pill warn">RISK ON</span>' : '<span class="pill neu">RISK OFF</span>')
+      + '</div>'
+      + '</div>';
+
+    // blockers + wait conditions (emphasis: top 3)
+    var fails = (gate.fail_reasons || []);
+    var must = (gate.must_change || []);
+
+    var blockers =
+      '<div class="panel"><div class="h2">BLOCKERS (now)</div><div class="list">'
+      + (fails.length ? fails.slice(0,6).map(function(x,i){
+          var hot = (i<3) ? 'style="color:var(--no)"' : '';
+          return '<div class="item"><div class="t" ' + hot + '>' + escapeHtml(x) + '</div></div>';
+        }).join('') : '<div class="item"><div class="t">—</div></div>')
+      + '</div></div>';
+
+    var waitfor =
+      '<div class="panel"><div class="h2">TO UNBLOCK (what to wait for)</div><div class="list">'
+      + (must.length ? must.map(function(x,i){
+          var hot = (i<3) ? 'style="color:var(--ok)"' : '';
+          return '<div class="item"><div class="t" ' + hot + '>' + escapeHtml(x) + '</div></div>';
+        }).join('') : '<div class="item"><div class="t">—</div></div>')
       + '</div></div>';
 
     var drivers =
@@ -2188,29 +2298,32 @@ def dashboard():
       }).join('')
       + '</div></div>';
 
-    var blocks =
-      '<div class="panel"><div class="h2">If NO TRADE — blocks</div><div class="list">'
-      + (((gate.fail_reasons || []).length ? (gate.fail_reasons || []) : ['—']).map(function(x){
-        return '<div class="item"><div class="t">' + escapeHtml(x) + '</div></div>';
-      }).join(''))
-      + '</div>'
-      + '<div class="kz"><b>What to wait for:</b><br>'
-      + (((gate.must_change || []).length ? (gate.must_change || []).map(function(x){ return '→ ' + escapeHtml(x); }).join('<br>') : '—'))
-      + '</div></div>';
-
     var src =
-      '<div class="panel"><div class="h2">Sources (top 5 evidence, optional)</div><div class="list">'
+      '<div class="panel"><div class="h2">Evidence (top 5, weighted)</div><div class="list">'
       + (why5.length ? why5 : [{title:'—'}]).slice(0,5).map(function(x,i){
         var l = x.link || '';
+        var contrib = (x.contrib!==undefined && x.contrib!==null) ? Number(x.contrib).toFixed(4) : '';
+        var age = (x.age_min!==undefined && x.age_min!==null) ? (escapeHtml(String(x.age_min)) + 'm') : '';
+        var src = x.source || '';
         return '<div class="item">'
                + '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div>'
+               + '<div class="m">'
+               +   '<span class="pill neu">contrib ' + escapeHtml(contrib) + '</span> '
+               +   '<span class="pill neu">age ' + age + '</span> '
+               +   '<span class="pill neu">src ' + escapeHtml(src) + '</span>'
+               + '</div>'
                + '<div class="m">' + escapeHtml(x.title || '') + '</div>'
                + (l ? ('<div class="m"><a href="' + escapeHtml(l) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
                + '</div>';
       }).join('')
       + '</div></div>';
 
-    showModal('VIEW ' + sym, head + drivers + blocks + src);
+    // layout: banner + 2-col grid (blockers/wait) + drivers + evidence
+    var html = banner
+      + '<div class="grid2" style="margin-top:12px;">' + blockers + waitfor + '</div>'
+      + drivers + src;
+
+    showModal('VIEW ' + sym, html);
   }
 
   function openMorning(){

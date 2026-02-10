@@ -1,15 +1,16 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-10e (FULL FIX — SINGLE FILE):
-# ✅ FIXED: db_put() implemented (no NameError)
-# ✅ FIXED: duplicate db_conn() removed; pooled + fallback direct conn + safe return/close
-# ✅ FIXED: db_init() is init-once per process (prevents repeated DDL)
-# ✅ FIXED: ingest_news_once() and ingest_calendar_once() are NETWORK-FIRST then DB batch (no pool starvation)
-# ✅ Keeps: /run auth (open if no token; constant-time compare if locked)
-# ✅ Keeps: /run rejects BEFORE heavy pipeline_run()
-# ✅ Keeps: shutdown hook closes pool
-# ✅ Keeps: XSS-safe payload injection (</ -> <\/)
-# ✅ Keeps: UI template unchanged
+# UPDATED v2026-02-10f (FULL FIX — SINGLE FILE, DROP-IN):
+# ✅ FIXED: RUN token logic is DYNAMIC (no stale env / no multi-worker mismatch)
+# ✅ FIXED: UI token prompt no longer depends on old DB payload (dashboard overrides meta.run_token_*)
+# ✅ FIXED: /health, /run, UI now agree 1:1 about token required
+# ✅ Added: robust /run JS parsing (shows non-JSON proxy errors instead of “silent”)
+# ✅ Keeps: pooled + fallback DB conn, init-once, network-first ingest, shutdown hook, XSS-safe JSON injection
+# ✅ Keeps: UI template + chips + views unchanged (except safe /run parsing)
+#
+# Notes:
+# - RUN_TOKEN (single) and RUN_TOKENS (csv) are supported.
+# - If you change env tokens, restart ALL workers/containers (still recommended), but code is resilient even if not.
 
 import os
 import json
@@ -113,25 +114,40 @@ FRED_SERIES = {
     "BAA10Y":   {"name": "BAA-10Y Spread", "freq": "d"},
 }
 
-# RUN token
-# - RUN_TOKEN: single token (legacy)
-# - RUN_TOKENS: comma-separated list (new)
-RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
-RUN_TOKENS_RAW = os.environ.get("RUN_TOKENS", "").strip()
-RUN_TOKENS: List[str] = []
-if RUN_TOKEN:
-    RUN_TOKENS.append(RUN_TOKEN)
-if RUN_TOKENS_RAW:
-    RUN_TOKENS.extend([x.strip() for x in RUN_TOKENS_RAW.split(",") if x.strip()])
+# ============================================================
+# RUN token (DYNAMIC — fixes multi-worker / stale env)
+# ============================================================
 
-# de-dup while preserving order
-_seen = set()
-RUN_TOKENS = [t for t in RUN_TOKENS if not (t in _seen or _seen.add(t))]
+def get_run_tokens() -> List[str]:
+    """
+    Reads env each call.
+    RUN_TOKEN: single token (legacy)
+    RUN_TOKENS: comma-separated list (new)
+    """
+    rt = os.environ.get("RUN_TOKEN", "").strip()
+    rts = os.environ.get("RUN_TOKENS", "").strip()
+
+    toks: List[str] = []
+    if rt:
+        toks.append(rt)
+    if rts:
+        toks.extend([x.strip() for x in rts.split(",") if x.strip()])
+
+    # de-dup while preserving order
+    seen = set()
+    out: List[str] = []
+    for t in toks:
+        if t in seen:
+            continue
+        seen.add(t)
+        out.append(t)
+    return out
 
 def _token_hash(t: str) -> str:
     return hashlib.sha1((t or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
 
-RUN_TOKEN_HASHES = [_token_hash(t) for t in RUN_TOKENS]
+def get_run_token_hashes() -> List[str]:
+    return [_token_hash(t) for t in get_run_tokens()]
 
 # MyFXBook widget iframe
 MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
@@ -275,7 +291,7 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 }
 
 # ============================================================
-# DB (FIXED: no-POOL connection leak + graceful shutdown + init-once)
+# DB (pooled + fallback direct conn + safe return/close + init-once)
 # ============================================================
 
 from psycopg2.pool import PoolError  # keep near imports
@@ -602,9 +618,10 @@ def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
     return True, "OK"
 
 def _run_token_status() -> Tuple[bool, str]:
-    if not RUN_TOKENS:
+    toks = get_run_tokens()
+    if not toks:
         return False, "Open (no token required)"
-    return True, f"Locked (token required). expected_hash={','.join(RUN_TOKEN_HASHES) or '—'}"
+    return True, f"Locked (token required). expected_hash={','.join(get_run_token_hashes()) or '—'}"
 
 def _fmt_hhmm_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -634,7 +651,7 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
     return s[:8]
 
 # ============================================================
-# INGEST (NEWS) — FIXED: network-first then DB batch
+# INGEST (NEWS) — network-first then DB batch
 # ============================================================
 
 def ingest_news_once(limit_per_feed: int = 40) -> int:
@@ -692,7 +709,7 @@ def ingest_news_once(limit_per_feed: int = 40) -> int:
     return inserted
 
 # ============================================================
-# INGEST (CALENDAR) — FIXED: network-first then DB batch
+# INGEST (CALENDAR) — network-first then DB upsert batch
 # ============================================================
 
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
@@ -855,7 +872,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
     """
     Counts ONLY true inserts (not updates) using RETURNING (xmax=0).
-    FIX: network-first then DB upsert batch.
     """
     inserted = 0
     batch: List[Tuple[str, str, str, Optional[int], Dict[str, Optional[str]], str]] = []
@@ -1453,8 +1469,9 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
                 "requests_present": bool(requests is not None),
             },
             "trump": trump,
-            "run_token_required": bool(RUN_TOKENS),
-            "run_token_hashes": RUN_TOKEN_HASHES,
+            # IMPORTANT: dynamic token meta
+            "run_token_required": bool(get_run_tokens()),
+            "run_token_hashes": get_run_token_hashes(),
         },
         "event": {
             "enabled": bool(EVENT_CFG["enabled"]),
@@ -1596,6 +1613,10 @@ def pipeline_run():
     alerts = compute_alerts(prev, payload)
     payload["meta"]["alerts"] = alerts[:25]
 
+    # IMPORTANT: ensure meta.run_token_* always equals CURRENT env (even if DB had old payload)
+    payload["meta"]["run_token_required"] = bool(get_run_tokens())
+    payload["meta"]["run_token_hashes"] = get_run_token_hashes()
+
     save_bias(payload)
     return payload
 
@@ -1694,14 +1715,15 @@ def root():
 
 @app.get("/health")
 def health(pretty: int = 0):
+    toks = get_run_tokens()
     out = {
         "ok": True,
         "gate_profile": GATE_PROFILE,
         "trump_enabled": bool(TRUMP_ENABLED),
         "fred_enabled": bool(FRED_CFG.get("enabled") and bool(FRED_CFG.get("api_key")) and requests is not None),
         "calendar_sources": list(CALENDAR_FEEDS),
-        "run_token_required": bool(RUN_TOKENS),
-        "run_token_hashes": RUN_TOKEN_HASHES,
+        "run_token_required": bool(toks),
+        "run_token_hashes": [_token_hash(t) for t in toks],
         "db_pooling": bool(_get_pool() is not None),
     }
     if pretty:
@@ -1711,13 +1733,14 @@ def health(pretty: int = 0):
 @app.get("/diag.json")
 def diag_json():
     db_init()
+    toks = get_run_tokens()
     env = {
         "has_DATABASE_URL": bool(os.environ.get("DATABASE_URL", "").strip()),
         "PGSSLMODE": os.environ.get("PGSSLMODE", "prefer"),
         "FRED_enabled": bool(FRED_CFG["enabled"]),
         "requests_present": bool(requests is not None),
-        "RUN_token_required": bool(RUN_TOKENS),
-        "RUN_token_hashes": RUN_TOKEN_HASHES,
+        "RUN_token_required": bool(toks),
+        "RUN_token_hashes": [_token_hash(t) for t in toks],
         "db_pooling": bool(_get_pool() is not None),
         "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "10"),
     }
@@ -1793,7 +1816,7 @@ def bias(pretty: int = 0):
     return JSONResponse(state)
 
 # ---------------------------
-# RUN auth (FIXED)
+# RUN auth (DYNAMIC)
 # ---------------------------
 
 def _pick_token(query_token: str, header_token: Optional[str]) -> str:
@@ -1804,22 +1827,23 @@ def _pick_token(query_token: str, header_token: Optional[str]) -> str:
 
 def _auth_run(token: str) -> bool:
     """
-    If RUN_TOKENS empty -> open.
+    If tokens empty -> open.
     Else token must match any allowed token, using constant-time compare.
     """
-    if not RUN_TOKENS:
+    toks = get_run_tokens()
+    if not toks:
         return True
     t = (token or "").strip()
     if not t:
         return False
-    for allowed in RUN_TOKENS:
+    for allowed in toks:
         if hmac.compare_digest(t, allowed):
             return True
     return False
 
 def _unauth_response():
     return JSONResponse(
-        {"ok": False, "error": "unauthorized", "expected_hash": RUN_TOKEN_HASHES},
+        {"ok": False, "error": "unauthorized", "expected_hash": get_run_token_hashes()},
         status_code=401
     )
 
@@ -1955,6 +1979,11 @@ def dashboard():
     payload = load_bias()
     if not payload:
         payload = pipeline_run()
+
+    # IMPORTANT: UI must reflect CURRENT env token state, not old DB payload
+    payload["meta"] = (payload.get("meta", {}) or {})
+    payload["meta"]["run_token_required"] = bool(get_run_tokens())
+    payload["meta"]["run_token_hashes"] = get_run_token_hashes()
 
     assets = payload.get("assets", {}) or {}
     meta = payload.get("meta", {}) or {}
@@ -2322,7 +2351,6 @@ def dashboard():
 <script>
   const PAYLOAD = JSON.parse(document.getElementById('payloadJson').textContent || '{}');
   const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
-
   const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
 
   function $(id){ return document.getElementById(id); }
@@ -2360,7 +2388,12 @@ def dashboard():
       var token = getRunToken();
       var headers = token ? { 'X-Run-Token': token } : {};
       var resp = await fetch('/run', { method:'POST', headers: headers });
-      var js = await resp.json();
+
+      // Robust parse (handles proxy 502 HTML etc.)
+      let txt = await resp.text();
+      let js = {};
+      try { js = JSON.parse(txt || '{}'); }
+      catch(e){ js = { ok:false, error: 'Non-JSON response: ' + String(txt||'').slice(0,240) }; }
 
       if(resp.status === 401){
         showModal('RUN UNAUTHORIZED', ''

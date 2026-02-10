@@ -1,13 +1,15 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-10d (FULL FIX):
-# ✅ FIXED: DB connection leak when pool is unavailable (db_put now closes non-pooled conns)
-# ✅ FIXED: /run GET/POST indentation + duplicate lines
-# ✅ FIXED: /run auth implemented (open if no token; constant-time compare if locked)
-# ✅ FIXED: /run rejects BEFORE heavy pipeline_run()
-# ✅ Added shutdown hook to close pool
-# ✅ Keeps XSS-safe payload injection (</script> hardened)
-# ✅ /run POST returns meta-only (lighter + consistent)
+# UPDATED v2026-02-10e (FULL FIX — SINGLE FILE):
+# ✅ FIXED: db_put() implemented (no NameError)
+# ✅ FIXED: duplicate db_conn() removed; pooled + fallback direct conn + safe return/close
+# ✅ FIXED: db_init() is init-once per process (prevents repeated DDL)
+# ✅ FIXED: ingest_news_once() and ingest_calendar_once() are NETWORK-FIRST then DB batch (no pool starvation)
+# ✅ Keeps: /run auth (open if no token; constant-time compare if locked)
+# ✅ Keeps: /run rejects BEFORE heavy pipeline_run()
+# ✅ Keeps: shutdown hook closes pool
+# ✅ Keeps: XSS-safe payload injection (</ -> <\/)
+# ✅ Keeps: UI template unchanged
 
 import os
 import json
@@ -25,9 +27,9 @@ import psycopg2
 
 # Optional DB pool
 try:
-    from psycopg2.pool import SimpleConnectionPool
+    from psycopg2.pool import ThreadedConnectionPool
 except Exception:
-    SimpleConnectionPool = None  # type: ignore
+    ThreadedConnectionPool = None  # type: ignore
 
 # Optional dependency: requests (only if FRED enabled + key present)
 try:
@@ -273,10 +275,13 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 }
 
 # ============================================================
-# DB (FIXED: no-POOL connection leak + graceful shutdown)
+# DB (FIXED: no-POOL connection leak + graceful shutdown + init-once)
 # ============================================================
 
+from psycopg2.pool import PoolError  # keep near imports
+
 _DB_POOL: Optional[Any] = None
+_DB_READY = False
 
 def _make_dsn() -> str:
     db_url = os.environ.get("DATABASE_URL", "").strip()
@@ -288,23 +293,23 @@ def _make_dsn() -> str:
     db = os.environ.get("PGDATABASE", "postgres")
     user = os.environ.get("PGUSER", "postgres")
     pwd = os.environ.get("PGPASSWORD", "")
-    return f"host={host} port={port} dbname={db} user={user} password={pwd}"
+    return f"host={host} port={port} dbname={db} user={user} password={pwd} connect_timeout=5"
 
 def _get_pool():
     global _DB_POOL
     if _DB_POOL is not None:
         return _DB_POOL
 
-    if SimpleConnectionPool is None:
+    if ThreadedConnectionPool is None:
         _DB_POOL = None
         return None
 
     dsn = _make_dsn()
-    maxconn = int(os.environ.get("PGPOOL_MAXCONN", "6"))
+    maxconn = int(os.environ.get("PGPOOL_MAXCONN", "10"))
     minconn = int(os.environ.get("PGPOOL_MINCONN", "1"))
 
     try:
-        _DB_POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=dsn)
+        _DB_POOL = ThreadedConnectionPool(minconn=minconn, maxconn=maxconn, dsn=dsn)
     except Exception:
         _DB_POOL = None
     return _DB_POOL
@@ -312,31 +317,50 @@ def _get_pool():
 def db_conn():
     pool = _get_pool()
     if pool is not None:
-        return pool.getconn()
-    return psycopg2.connect(_make_dsn())
-
-def db_put(conn):
-    """
-    IMPORTANT:
-    - if pooled: return to pool
-    - if not pooled: CLOSE connection (fixes leak)
-    """
-    if conn is None:
-        return
-    pool = _get_pool()
-    if pool is not None:
         try:
-            pool.putconn(conn)
-        except Exception:
+            conn = pool.getconn()
             try:
-                conn.close()
+                setattr(conn, "_from_pool", True)
             except Exception:
                 pass
-    else:
+            return conn
+        except PoolError:
+            conn = psycopg2.connect(_make_dsn())
+            try:
+                setattr(conn, "_from_pool", False)
+            except Exception:
+                pass
+            return conn
+
+    conn = psycopg2.connect(_make_dsn())
+    try:
+        setattr(conn, "_from_pool", False)
+    except Exception:
+        pass
+    return conn
+
+def db_put(conn):
+    if conn is None:
+        return
+
+    pool = _get_pool()
+    from_pool = False
+    try:
+        from_pool = bool(getattr(conn, "_from_pool", False))
+    except Exception:
+        from_pool = False
+
+    if pool is not None and from_pool:
         try:
-            conn.close()
+            pool.putconn(conn)
+            return
         except Exception:
             pass
+
+    try:
+        conn.close()
+    except Exception:
+        pass
 
 def db_close_pool():
     global _DB_POOL
@@ -349,6 +373,10 @@ def db_close_pool():
             pass
 
 def db_init():
+    global _DB_READY
+    if _DB_READY:
+        return
+
     conn = db_conn()
     try:
         with conn:
@@ -416,6 +444,8 @@ def db_init():
                 );
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_log_created_ts ON alerts_log(created_ts DESC);")
+
+        _DB_READY = True
     finally:
         db_put(conn)
 
@@ -604,58 +634,65 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
     return s[:8]
 
 # ============================================================
-# INGEST (NEWS)
+# INGEST (NEWS) — FIXED: network-first then DB batch
 # ============================================================
 
 def ingest_news_once(limit_per_feed: int = 40) -> int:
     inserted = 0
     now = int(time.time())
 
+    batch: List[Tuple[str, str, str, int, str]] = []
+
+    for src, url in RSS_FEEDS.items():
+        if src in CALENDAR_FEEDS:
+            continue
+        if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
+            continue
+
+        try:
+            d = feedparser.parse(url)
+        except Exception:
+            continue
+
+        entries = getattr(d, "entries", []) or []
+        if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
+            continue
+
+        for e in entries[:limit_per_feed]:
+            title = (e.get("title") or "").strip()
+            link = (e.get("link") or "").strip()
+            if not title or not link:
+                continue
+
+            published_ts = _ts_from_entry(e, now)
+            fp = fingerprint(title, link)
+            batch.append((src, title, link, int(published_ts), fp))
+
+    if not batch:
+        return 0
+
     conn = db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                for src, url in RSS_FEEDS.items():
-                    if src in CALENDAR_FEEDS:
-                        continue
-                    if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
-                        continue
-
+                for (src, title, link, published_ts, fp) in batch:
                     try:
-                        d = feedparser.parse(url)
+                        cur.execute("""
+                            INSERT INTO news_items(source, title, link, published_ts, fingerprint)
+                            VALUES (%s, %s, %s, %s, %s)
+                            ON CONFLICT (fingerprint) DO NOTHING;
+                        """, (src, title, link, int(published_ts), fp))
+                        if cur.rowcount == 1:
+                            inserted += 1
                     except Exception:
-                        continue
-
-                    entries = getattr(d, "entries", []) or []
-                    if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
-                        continue
-
-                    for e in entries[:limit_per_feed]:
-                        title = (e.get("title") or "").strip()
-                        link = (e.get("link") or "").strip()
-                        if not title or not link:
-                            continue
-
-                        published_ts = _ts_from_entry(e, now)
-                        fp = fingerprint(title, link)
-
-                        try:
-                            cur.execute("""
-                                INSERT INTO news_items(source, title, link, published_ts, fingerprint)
-                                VALUES (%s, %s, %s, %s, %s)
-                                ON CONFLICT (fingerprint) DO NOTHING;
-                            """, (src, title, link, int(published_ts), fp))
-                            if cur.rowcount == 1:
-                                inserted += 1
-                        except Exception:
-                            pass
+                        pass
     finally:
         db_put(conn)
 
     return inserted
 
 # ============================================================
-# INGEST (CALENDAR)
+# INGEST (CALENDAR) — FIXED: network-first then DB batch
 # ============================================================
 
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
@@ -818,80 +855,88 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
     """
     Counts ONLY true inserts (not updates) using RETURNING (xmax=0).
+    FIX: network-first then DB upsert batch.
     """
     inserted = 0
+    batch: List[Tuple[str, str, str, Optional[int], Dict[str, Optional[str]], str]] = []
+
+    for src in CALENDAR_FEEDS:
+        url = RSS_FEEDS.get(src)
+        if not url:
+            continue
+        try:
+            d = feedparser.parse(url)
+        except Exception:
+            continue
+
+        entries = getattr(d, "entries", []) or []
+        if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
+            continue
+
+        for e in entries[:limit_per_feed]:
+            title = (e.get("title") or "").strip()
+            link = (e.get("link") or "").strip()
+            if not title:
+                continue
+
+            event_ts: Optional[int] = None
+            if src == "FOREXFACTORY_CALENDAR":
+                event_ts = _try_parse_ff_datetime(e)
+
+            if event_ts is None:
+                pp = e.get("published_parsed") or e.get("updated_parsed")
+                if pp:
+                    try:
+                        event_ts = int(pycalendar.timegm(pp))
+                    except Exception:
+                        event_ts = None
+
+            if event_ts is None:
+                blob = ((e.get("title") or "") + " " + (e.get("summary") or e.get("description") or "")).strip()
+                event_ts = _try_parse_any_datetime_from_blob(blob)
+
+            fields = _parse_calendar_fields(src, e)
+            fp = fingerprint(f"{src}||{title}", link or title)
+            batch.append((src, title, link, event_ts, fields, fp))
+
+    if not batch:
+        return 0
+
     conn = db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                for src in CALENDAR_FEEDS:
-                    url = RSS_FEEDS.get(src)
-                    if not url:
-                        continue
+                for (src, title, link, event_ts, fields, fp) in batch:
                     try:
-                        d = feedparser.parse(url)
+                        cur.execute("""
+                            INSERT INTO econ_events(
+                                source, title, country, currency, impact,
+                                actual, previous, consensus, forecast,
+                                event_ts, link, fingerprint
+                            )
+                            VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
+                            ON CONFLICT (fingerprint) DO UPDATE SET
+                                country=EXCLUDED.country,
+                                currency=EXCLUDED.currency,
+                                impact=EXCLUDED.impact,
+                                actual=EXCLUDED.actual,
+                                previous=EXCLUDED.previous,
+                                consensus=EXCLUDED.consensus,
+                                forecast=EXCLUDED.forecast,
+                                event_ts=COALESCE(EXCLUDED.event_ts, econ_events.event_ts),
+                                link=COALESCE(NULLIF(EXCLUDED.link,''), econ_events.link)
+                            RETURNING (xmax = 0) AS inserted;
+                        """, (
+                            src, title,
+                            fields.get("country"), fields.get("currency"), fields.get("impact"),
+                            fields.get("actual"), fields.get("previous"), fields.get("consensus"), fields.get("forecast"),
+                            event_ts, link, fp
+                        ))
+                        row = cur.fetchone()
+                        if row and bool(row[0]):
+                            inserted += 1
                     except Exception:
-                        continue
-
-                    entries = getattr(d, "entries", []) or []
-                    if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
-                        continue
-
-                    for e in entries[:limit_per_feed]:
-                        title = (e.get("title") or "").strip()
-                        link = (e.get("link") or "").strip()
-                        if not title:
-                            continue
-
-                        event_ts: Optional[int] = None
-                        if src == "FOREXFACTORY_CALENDAR":
-                            event_ts = _try_parse_ff_datetime(e)
-
-                        if event_ts is None:
-                            pp = e.get("published_parsed") or e.get("updated_parsed")
-                            if pp:
-                                try:
-                                    event_ts = int(pycalendar.timegm(pp))
-                                except Exception:
-                                    event_ts = None
-
-                        if event_ts is None:
-                            blob = ((e.get("title") or "") + " " + (e.get("summary") or e.get("description") or "")).strip()
-                            event_ts = _try_parse_any_datetime_from_blob(blob)
-
-                        fields = _parse_calendar_fields(src, e)
-                        fp = fingerprint(f"{src}||{title}", link or title)
-
-                        try:
-                            cur.execute("""
-                                INSERT INTO econ_events(
-                                    source, title, country, currency, impact,
-                                    actual, previous, consensus, forecast,
-                                    event_ts, link, fingerprint
-                                )
-                                VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)
-                                ON CONFLICT (fingerprint) DO UPDATE SET
-                                    country=EXCLUDED.country,
-                                    currency=EXCLUDED.currency,
-                                    impact=EXCLUDED.impact,
-                                    actual=EXCLUDED.actual,
-                                    previous=EXCLUDED.previous,
-                                    consensus=EXCLUDED.consensus,
-                                    forecast=EXCLUDED.forecast,
-                                    event_ts=COALESCE(EXCLUDED.event_ts, econ_events.event_ts),
-                                    link=COALESCE(NULLIF(EXCLUDED.link,''), econ_events.link)
-                                RETURNING (xmax = 0) AS inserted;
-                            """, (
-                                src, title,
-                                fields.get("country"), fields.get("currency"), fields.get("impact"),
-                                fields.get("actual"), fields.get("previous"), fields.get("consensus"), fields.get("forecast"),
-                                event_ts, link, fp
-                            ))
-                            row = cur.fetchone()
-                            if row and bool(row[0]):
-                                inserted += 1
-                        except Exception:
-                            pass
+                        pass
     finally:
         db_put(conn)
 
@@ -1674,7 +1719,7 @@ def diag_json():
         "RUN_token_required": bool(RUN_TOKENS),
         "RUN_token_hashes": RUN_TOKEN_HASHES,
         "db_pooling": bool(_get_pool() is not None),
-        "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "6"),
+        "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "10"),
     }
     ok = True
     news_items = 0

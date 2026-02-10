@@ -1,9 +1,11 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-09a:
-# ✅ SUMMARY TABLE: TH alignment fix + more informative WHY (numeric Q2/Conflict/Score/Threshold + RISK)
-# ✅ VIEW: decision banner (big NO TRADE / TRADE OK) + key metrics + blockers highlighted + evidence shows contrib/age/source
-# ✅ FEEDS/FITS: click FEEDS chip now shows GOOD/BAD per feed (ok/bozo/entries/error) + totals (fix "I can't check fits" problem)
+# UPDATED v2026-02-10 (UI/Calendar + iPhone-friendly):
+# ✅ Calendar parsing: supports dates WITHOUT year (e.g., "Feb 10, 15:15"), strips HTML from summaries
+# ✅ Next event: if no USD events found, falls back to earliest timed ANY-currency event (better UX)
+# ✅ SUMMARY: WHY becomes compact pills (Quality/Disagree/Bias/Risk) instead of cryptic text
+# ✅ iPhone-friendly: on small screens table hides; renders clean card list (tap View)
+# ✅ VIEW: Simple/Quant toggle; Simple hides contrib/age/src clutter by default + de-dup reasons
 
 import os
 import json
@@ -101,8 +103,6 @@ FRED_SERIES = {
 }
 
 # RUN token
-# - RUN_TOKEN: single token (legacy)
-# - RUN_TOKENS: comma-separated list (new)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 RUN_TOKENS_RAW = os.environ.get("RUN_TOKENS", "").strip()
 RUN_TOKENS: List[str] = []
@@ -610,11 +610,13 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         return None
     s = " ".join(str(blob).split())
 
+    # YYYY-MM-DD HH:MM
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})", s)
     if m:
         y, mo, da, hh, mm = [int(m.group(i)) for i in range(1, 6)]
         return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
+    # "Feb 10, 2026 15:15"
     m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         mon = _MONTHS.get(m.group(1).lower()[:3])
@@ -622,6 +624,7 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
+    # "10 Feb 2026 15:15"
     m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da = int(m.group(1)); mon = _MONTHS.get(m.group(2).lower()[:3]); y = int(m.group(3))
@@ -629,18 +632,33 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
+    # "MM/DD/YYYY HH:MM"
     m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da, mo, y, hh, mm = [int(m.group(i)) for i in range(1, 6)]
         if 1 <= mo <= 12 and 1 <= da <= 31:
             return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
+    # NEW: "Feb 10, 15:15" (no year) -> assume current UTC year
+    m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})\b", s)
+    if m:
+        mon = _MONTHS.get(m.group(1).lower()[:3])
+        da = int(m.group(2))
+        hh = int(m.group(3))
+        mm = int(m.group(4))
+        if mon:
+            y = datetime.now(timezone.utc).year
+            return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
+
     return None
 
 def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     title = (e.get("title") or "").strip()
     summary = (e.get("summary") or e.get("description") or "").strip()
-    blob = (title + " " + summary).strip()
+
+    # NEW: strip html tags (MyFX often embeds)
+    summary_plain = re.sub(r"<[^>]+>", " ", summary)
+    blob = (title + " " + summary_plain).strip()
 
     currency = _get_entry_field(e, ["currency", "ccy", "cur", "ff_currency"])
     impact = _get_entry_field(e, ["impact", "importance", "ff_impact", "volatility"])
@@ -660,6 +678,12 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
                     break
         except Exception:
             pass
+
+    # Try currency in title first (usually clean)
+    if not currency:
+        m = _CUR_PAT.search(title)
+        if m:
+            currency = m.group(1).upper()
 
     if not currency:
         m = _CUR_PAT.search(blob)
@@ -816,6 +840,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
+    # fallback if timed events absent: show last known items (some may have unknown time)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -1327,7 +1352,7 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
         if (pq2 - cq2) >= q2_drop_th:
             push(
                 "q2_drop",
-                f"{a} Q2 drop: {pq2} → {cq2} (Δ={pq2-cq2})",
+                f"{a} Quality drop: {pq2} → {cq2} (Δ={pq2-cq2})",
                 asset=a,
                 severity="WARN",
                 extra={"prev": pq2, "cur": cq2}
@@ -1338,7 +1363,7 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
         if (cc - pc) >= conflict_spike_th:
             push(
                 "conflict_spike",
-                f"{a} conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})",
+                f"{a} disagreement spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})",
                 asset=a,
                 severity="WARN",
                 extra={"prev": pc, "cur": cc}
@@ -1419,30 +1444,30 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
 
     qmin = int(cfg["quality_v2_min"])
     if q2 < qmin:
-        fail.append(f"Quality too low (Q2 {q2} < {qmin})")
-        fail_short.append("Q2 low")
-        must.append(f"Q2 ≥ {qmin}")
+        fail.append(f"Quality too low (Quality {q2} < {qmin})")
+        fail_short.append("Quality low")
+        must.append(f"Quality ≥ {qmin}")
 
     cmax = float(cfg["conflict_max"])
     if conflict > cmax:
-        fail.append(f"Conflict too high ({conflict:.3f} > {cmax})")
-        fail_short.append("Conflict high")
-        must.append(f"Conflict ≤ {cmax}")
+        fail.append(f"Disagreement too high ({conflict:.3f} > {cmax})")
+        fail_short.append("Disagree high")
+        must.append(f"Disagreement ≤ {cmax}")
 
     mind = float(cfg["min_opp_flip_dist"])
     if bias in ("BULLISH", "BEARISH") and to_opp < mind:
-        fail.append(f"Too close to opposite flip (to_opposite {to_opp:.3f} < {mind})")
+        fail.append(f"Too close to opposite flip (flip {to_opp:.3f} < {mind})")
         fail_short.append("Flip close")
-        must.append(f"to_opposite ≥ {mind}")
+        must.append(f"flip ≥ {mind}")
 
     if event_mode:
         if cfg.get("event_mode_block", True):
             oq = int(cfg.get("event_override_quality", 70))
             oc = float(cfg.get("event_override_conflict", 0.45))
             if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
-                fail.append("Event mode is ON (macro risk)")
+                fail.append("Macro risk window is ON (RISK)")
                 fail_short.append("RISK")
-                must.append(f"Wait OR require Q2≥{oq} & Conflict≤{oc} & bias!=NEUTRAL")
+                must.append(f"Wait OR require Quality≥{oq} & Disagreement≤{oc} & bias!=NEUTRAL")
 
     ok = (len(fail) == 0)
 
@@ -1493,7 +1518,6 @@ def health(pretty: int = 0):
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
     return out
 
-# ---- RAW JSON DIAG (for you)
 @app.get("/diag.json")
 def diag_json():
     db_init()
@@ -1526,7 +1550,6 @@ def diag_json():
 
     return {"db": {"ok": ok, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events}, "env": env}
 
-# ---- HTML DIAG PAGE (human)
 @app.get("/diag", response_class=HTMLResponse)
 def diag_page():
     d = diag_json()
@@ -1619,7 +1642,6 @@ def latest(limit: int = 40):
             rows = cur.fetchall()
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
-# MyFXBook calendar page (standalone)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
 def myfx_calendar():
     html = f"""<!doctype html>
@@ -1668,10 +1690,22 @@ def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: st
         return "No upcoming events in horizon", ""
 
     prefer_ccy = (prefer_ccy or "USD").upper()
-
     pref = [x for x in upcoming if str(x.get("currency") or "").upper() == prefer_ccy]
+
+    # NEW: fallback to earliest timed ANY-currency event (user-friendly)
     if not pref:
-        return f"No {prefer_ccy} events in horizon", ""
+        timed_any = [x for x in upcoming if x.get("ts")]
+        if timed_any:
+            timed_any.sort(key=lambda x: int(x.get("ts") or 0))
+            pick = timed_any[0]
+            ts = int(pick["ts"])
+            ccy = (pick.get("currency") or "—")
+            imp = _impact_norm(pick.get("impact"))
+            return (
+                f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
+                str(pick.get("source", "")),
+            )
+        return "Upcoming events exist but time/currency unclear (RSS)", ""
 
     timed = [x for x in pref if x.get("ts")]
     if timed:
@@ -1728,7 +1762,6 @@ def dashboard():
     def _chip(label: str, value: str, cls: str, tip: str, key: str) -> str:
         return f'<button class="chip {cls}" data-chip="{key}" title="{tip}"><span class="k">{label}</span> {value}</button>'
 
-    # --- SWITCHBOARD labels (human)
     risk_val = "HIGH" if event_mode else "LOW"
     ev_chip = _chip("RISK", risk_val, "warn" if event_mode else "neu",
                     "Macro-risk window (recent major releases or upcoming events). Click for details.", "risk")
@@ -1748,8 +1781,28 @@ def dashboard():
     rn_chip = _chip("RUN", ("LOCKED" if token_required else "OPEN"), "neu",
                     "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
 
-    # DIAG stays as a link (opens HTML page)
+    # NEW: legend chip to explain metrics in plain words
+    lg_chip = _chip("HELP", "LEGEND", "neu",
+                    "Explains Quality/Disagreement/Bias score in simple language.", "legend")
+
     dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
+
+    def _why_pills(asset: str, a: dict) -> str:
+        gate = a.get("ui_gate", {}) or {}
+        q2 = int(gate.get("q2", 0)); q2min = int(gate.get("q2_min", 0))
+        c = float(gate.get("conflict", 1.0)); cmax = float(gate.get("conflict_max", 1.0))
+        score = float(gate.get("score", 0.0)); th = float(gate.get("th", 0.0))
+        bias = str(gate.get("bias", a.get("bias", "NEUTRAL")))
+        # compact: Quality / Disagree / BiasScore / Risk
+        parts = []
+        parts.append(f'<span class="pill neu" title="Signal reliability">Quality {q2}/{q2min}</span>')
+        parts.append(f'<span class="pill neu" title="News disagreement (lower is better)">Disagree {c:.2f}/{cmax:.2f}</span>')
+        parts.append(f'<span class="pill neu" title="Bias score vs threshold">Bias {score:.2f}/{th:.2f}</span>')
+        if bias == "NEUTRAL":
+            parts.append('<span class="pill warn" title="Bias is neutral (no clear direction)">NEUTRAL</span>')
+        if gate.get("event_mode"):
+            parts.append('<span class="pill warn" title="Macro risk window">RISK</span>')
+        return '<div class="whyPills">' + " ".join(parts) + "</div>"
 
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
@@ -1757,32 +1810,14 @@ def dashboard():
         gate = a.get("ui_gate", {}) or {}
         ok = bool(gate.get("ok", False))
 
-        q2 = int(gate.get("q2", 0)); q2min = int(gate.get("q2_min", 0))
-        c = float(gate.get("conflict", 1.0)); cmax = float(gate.get("conflict_max", 1.0))
-        score = float(gate.get("score", 0.0)); th = float(gate.get("th", 0.0))
-        to_opp = float(gate.get("to_opposite", 999.0)); mind = float(gate.get("min_opp_flip_dist", 0.0))
-
-        evc = int(a.get("evidence_count", 0))
-        fr = a.get("freshness", {}) or {}
-        f02 = int(fr.get("0-2h", 0)); f28 = int(fr.get("2-8h", 0))
-
-        if ok:
-            short = f"score {score:.2f}/{th:.2f} | C {c:.2f} | ev {evc} | 0-2h {f02}"
-        else:
-            short = f"Q2 {q2}/{q2min} | C {c:.2f}/{cmax:.2f} | score {score:.2f}/{th:.2f}"
-            if bias in ("BULLISH","BEARISH") and to_opp < mind:
-                short += f" | flip {to_opp:.2f}<{mind:.2f}"
-            if gate.get("event_mode"):
-                short += " | RISK"
-            if bias == "NEUTRAL":
-                short = "NEUTRAL | " + short
+        why_html = _why_pills(asset, a)
 
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
           <td>{_pill_bias(bias)}</td>
           <td>{_pill_gate(ok)}</td>
-          <td class="why">{short or "—"}</td>
+          <td class="why">{why_html}</td>
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
         """
@@ -1832,11 +1867,10 @@ def dashboard():
     .chip.warn{color:var(--warn); border-color:rgba(255,176,0,.25);}
     .chip.neu{color:#b8c3da;}
 
-    /* Chips as buttons */
     button.chip{cursor:pointer; appearance:none; -webkit-appearance:none;}
     button.chip:active{transform:translateY(1px);}
 
-    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
+    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg); display:inline-flex; align-items:center; gap:6px;}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
@@ -1848,23 +1882,19 @@ def dashboard():
     .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
 
-    /* Table stability */
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
-    th{color:var(--muted); font-weight:900; text-align:left;} /* ✅ FIX: prevent centered headers */
-    thead th:last-child{ text-align:right; } /* action column */
+    th{color:var(--muted); font-weight:900; text-align:left;}
+    thead th:last-child{ text-align:right; }
     .sym{color:var(--amber); font-weight:900;}
     .why{color:var(--text); overflow-wrap:anywhere; word-break:break-word;}
     .act{text-align:right; white-space:nowrap;}
 
-    /* === SUMMARY TABLE overflow fix === */
     .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch;}
     .panel table .btn{padding:8px 10px; border-radius:10px; font-size:12px; line-height:1; box-sizing:border-box;}
-
     .muted{color:var(--muted);}
     .tvwrap{margin-top:12px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
 
-    /* Blocks */
     .block{margin-top:12px;}
     .block:first-child{margin-top:0;}
     .blockTitle{
@@ -1876,7 +1906,6 @@ def dashboard():
       margin:0 0 8px 2px;
     }
 
-    /* Tickers */
     .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
     .ticklabel{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 6px 2px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -1889,11 +1918,10 @@ def dashboard():
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
 
-    /* Modal */
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
-                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
+                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line); gap:10px; flex-wrap:wrap;}
     .modal .body{padding:12px;}
     .h2{font-family:var(--mono); font-weight:900; color:var(--muted); font-size:12px; margin-bottom:8px;}
     .list{font-family:var(--mono); font-size:12px;}
@@ -1906,7 +1934,6 @@ def dashboard():
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
 
-    /* View emphasis */
     .banner{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
     .bannerTop{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
     .big{font-family:var(--mono); font-weight:900; letter-spacing:.8px; font-size:14px;}
@@ -1916,13 +1943,27 @@ def dashboard():
     @media(max-width:820px){ .grid2{grid-template-columns:1fr;} }
     .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
     .mini .pill{font-size:11px; padding:5px 9px;}
+
+    /* WHY pills layout */
+    .whyPills{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+
+    /* Mobile: replace table with cards */
+    .cards{display:none; gap:10px; flex-direction:column;}
+    .card{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
+    .cardTop{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;}
+    .cardSym{font-family:var(--mono); font-weight:900; letter-spacing:.6px; color:var(--amber);}
+    .cardMid{margin-top:10px; display:flex; flex-wrap:wrap; gap:8px;}
+    .cardActions{margin-top:10px; display:flex; justify-content:flex-end;}
+    @media(max-width:560px){
+      .tablewrap{display:none;}
+      .cards{display:flex;}
+    }
   </style>
 </head>
 <body>
 <div class="wrap">
   <div class="hdr">
 
-    <!-- HEADER -->
     <div class="block">
       <div class="title">
         <div><b>NEWS BIAS</b> // TERMINAL</div>
@@ -1930,7 +1971,6 @@ def dashboard():
       </div>
     </div>
 
-    <!-- META -->
     <div class="block">
       <div class="blockTitle">META</div>
       <div class="metaLine">
@@ -1939,23 +1979,21 @@ def dashboard():
       </div>
       <div class="metaLine" style="margin-top:8px;">
         <span class="k">Next event:</span>
-        <span class="pill neu" style="display:inline-flex;gap:10px;align-items:center;">
+        <span class="pill neu" style="display:inline-flex;gap:10px;align-items:center; flex-wrap:wrap;">
           <span style="color:var(--text);font-weight:900;">__NEXT_EVENT__</span>
           <span class="muted" style="font-weight:900;">__NEXT_EVENT_SRC__</span>
         </span>
       </div>
     </div>
 
-    <!-- SWITCHBOARD -->
     <div class="block">
       <div class="blockTitle">SWITCHBOARD</div>
       <div class="chips">
-        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __DIAG_CHIP__
+        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __LG_CHIP__ __DIAG_CHIP__
       </div>
       <div class="kz" style="margin-top:8px;">Tip: chips are clickable — tap to see what they mean + current details.</div>
     </div>
 
-    <!-- ACTIONS -->
     <div class="block">
       <div class="blockTitle">ACTIONS</div>
       <div class="btnrow">
@@ -1966,7 +2004,6 @@ def dashboard():
       </div>
     </div>
 
-    <!-- MARKET TAPE -->
     <div class="block">
       <div class="blockTitle">MARKET TAPE</div>
       <div class="tvwrap">
@@ -1980,7 +2017,6 @@ def dashboard():
       </div>
     </div>
 
-    <!-- TICKERS -->
     <div class="block">
       <div class="blockTitle">TICKERS | HEADLINES</div>
       <div class="tickerstack">
@@ -1997,8 +2033,9 @@ def dashboard():
   </div>
 
   <div class="panel">
-    <div class="blockTitle">SUMMARY TABLE</div>
+    <div class="blockTitle">SUMMARY</div>
 
+    <!-- Desktop table -->
     <div class="tablewrap">
       <table>
         <colgroup>
@@ -2008,12 +2045,15 @@ def dashboard():
           <col>
           <col style="width:112px">
         </colgroup>
-        <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (short)</th><th></th></tr></thead>
+        <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (simple)</th><th></th></tr></thead>
         <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
       </table>
     </div>
 
-    <div class="kz">Goal: fast read. If you need deep math (score/Q2/conflict/flip), open <b>View</b>. Hotkeys: R/M/E • 1/2/3 • Esc.</div>
+    <!-- Mobile cards -->
+    <div class="cards" id="cards"></div>
+
+    <div class="kz">Goal: fast read. Tap <b>View</b> for details. Hotkeys: R/M/E • 1/2/3 • Esc.</div>
   </div>
 </div>
 
@@ -2021,7 +2061,10 @@ def dashboard():
   <div class="box">
     <div class="head">
       <div class="title" id="mt">VIEW</div>
-      <button class="btn" onclick="closeModal()">Esc</button>
+      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
+        <button class="btn" id="modeBtn" onclick="toggleViewMode()">Mode: SIMPLE</button>
+        <button class="btn" onclick="closeModal()">Esc</button>
+      </div>
     </div>
     <div class="body" id="mb"></div>
   </div>
@@ -2031,6 +2074,8 @@ def dashboard():
   const PAYLOAD = __JS_PAYLOAD__;
   const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
   const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
+  let VIEW_MODE = 'SIMPLE'; // SIMPLE | QUANT
+  let LAST_VIEW_SYM = null;
 
   function $(id){ return document.getElementById(id); }
   function escapeHtml(s){
@@ -2042,8 +2087,15 @@ def dashboard():
     $('mt').innerText = title;
     $('mb').innerHTML = html;
     $('modal').style.display = 'block';
+    $('modeBtn').innerText = 'Mode: ' + VIEW_MODE;
   }
   function closeModal(){ $('modal').style.display = 'none'; }
+
+  function toggleViewMode(){
+    VIEW_MODE = (VIEW_MODE === 'SIMPLE') ? 'QUANT' : 'SIMPLE';
+    $('modeBtn').innerText = 'Mode: ' + VIEW_MODE;
+    if(LAST_VIEW_SYM) openView(LAST_VIEW_SYM);
+  }
 
   function clearSavedToken(){
     localStorage.removeItem('run_token');
@@ -2111,7 +2163,7 @@ def dashboard():
       var b = x.bias || '—';
       var gate = x.ui_gate || {};
       var trade = gate.ok ? 'TRADE OK' : 'NO TRADE';
-      var why = gate.ok ? ('score ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
+      var why = gate.ok ? ('Bias ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
                         : ((gate.fail_short||[]).join(' | ') || 'Blocked');
       parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b>' + (why ? (' • ' + escapeHtml(why)) : '') + '</span>');
     });
@@ -2119,7 +2171,6 @@ def dashboard():
     $('marqueeStatus').innerHTML = line + ' <span class="muted">•</span> ' + line;
   }
 
-  // --- CHIP EXPLAIN (clickable switchboard)
   function explainChip(key){
     const ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
     const meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
@@ -2130,6 +2181,17 @@ def dashboard():
 
     let title = 'INFO';
     let body = '';
+
+    if(key === 'legend'){
+      title = 'LEGEND (simple)';
+      body =
+        '<div class="panel"><div class="h2">What you see in SUMMARY</div><div class="list">'
+        + '<div class="item"><div class="t">Quality</div><div class="m">Reliability of the bias. Higher = cleaner signal (more evidence, more sources, fresher, less disagreement, no event penalty).</div></div>'
+        + '<div class="item"><div class="t">Disagree</div><div class="m">How much news contradict each other. Lower is better. 0 = all aligned, 1 = chaos.</div></div>'
+        + '<div class="item"><div class="t">Bias</div><div class="m">Bias score vs threshold. If score ≥ +th → BULLISH, if score ≤ −th → BEARISH, else NEUTRAL.</div></div>'
+        + '<div class="item"><div class="t">RISK</div><div class="m">Macro risk window (upcoming/very recent high-impact releases). In STRICT mode it blocks unless Quality is high and Disagree is low.</div></div>'
+        + '</div></div>';
+    }
 
     if(key === 'risk'){
       title = 'RISK (Event Mode)';
@@ -2162,7 +2224,6 @@ def dashboard():
 
     if(key === 'feeds'){
       title = 'FEEDS (GOOD/BAD)';
-      // Classify feeds into GOOD/WARN/BAD/SKIP
       let keys = Object.keys(feeds || {});
       let good=0, warn=0, bad=0, skip=0;
       let rows = [];
@@ -2236,7 +2297,43 @@ def dashboard():
     explainChip(key);
   });
 
+  function renderMobileCards(){
+    const a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
+    const cards = $('cards');
+    if(!cards) return;
+    const order = ['XAU','US500','WTI'];
+    cards.innerHTML = order.map(function(sym){
+      const x = a[sym] || {};
+      const gate = x.ui_gate || {};
+      const ok = !!gate.ok;
+      const bias = x.bias || 'NEUTRAL';
+      const q2 = gate.q2||0, q2min = gate.q2_min||0;
+      const c = gate.conflict||0, cmax = gate.conflict_max||0;
+      const score = gate.score||0, th = gate.th||0;
+      const risk = gate.event_mode ? '<span class="pill warn">RISK</span>' : '<span class="pill neu">RISK OFF</span>';
+
+      return ''
+        + '<div class="card">'
+        + '  <div class="cardTop">'
+        + '    <div class="cardSym">' + escapeHtml(sym) + '</div>'
+        + '    <div style="display:flex; gap:8px; flex-wrap:wrap;">'
+        + '      <span class="pill ' + (bias==='BULLISH'?'bull':(bias==='BEARISH'?'bear':'neu')) + '">' + escapeHtml(bias) + '</span>'
+        + '      <span class="pill ' + (ok?'ok':'no') + '">' + (ok?'TRADE OK':'NO TRADE') + '</span>'
+        + '    </div>'
+        + '  </div>'
+        + '  <div class="cardMid">'
+        + '    <span class="pill neu">Quality ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
+        + '    <span class="pill neu">Disagree ' + Number(c).toFixed(2) + '/' + Number(cmax).toFixed(2) + '</span>'
+        + '    <span class="pill neu">Bias ' + Number(score).toFixed(2) + '/' + Number(th).toFixed(2) + '</span>'
+        +      risk
+        + '  </div>'
+        + '  <div class="cardActions"><button class="btn" onclick="openView(\\'' + escapeHtml(sym) + '\\')">View</button></div>'
+        + '</div>';
+    }).join('');
+  }
+
   function openView(sym){
+    LAST_VIEW_SYM = sym;
     var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
     var gate = a.ui_gate || {};
     var top = (a.top3_drivers || []);
@@ -2247,7 +2344,6 @@ def dashboard():
     var badge = ok ? '<span class="pill ok">TRADE OK</span>' : '<span class="pill no">NO TRADE</span>';
     var big = ok ? '<span class="ok">TRADE OK</span>' : '<span class="no">NO TRADE</span>';
 
-    // key metrics
     var q2 = (gate.q2||0), q2min = (gate.q2_min||0);
     var c = (gate.conflict||0), cmax = (gate.conflict_max||0);
     var score = (gate.score||0), th = (gate.th||0);
@@ -2261,9 +2357,9 @@ def dashboard():
       + '  <div>' + badge + ' ' + '<span class="pill neu">Bias ' + escapeHtml(a.bias||'—') + '</span>' + '</div>'
       + '</div>'
       + '<div class="mini">'
-      + '<span class="pill neu">score ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
-      + '<span class="pill neu">Q2 ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
-      + '<span class="pill neu">Conflict ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
+      + '<span class="pill neu">Bias ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
+      + '<span class="pill neu">Quality ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
+      + '<span class="pill neu">Disagree ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
       + '<span class="pill neu">Flip ' + toopp.toFixed(3) + ' (min ' + mind.toFixed(3) + ')</span>'
       + '<span class="pill neu">ev ' + escapeHtml(String(evc)) + ' • div ' + escapeHtml(String(div)) + '</span>'
       + '<span class="pill neu">fresh 0-2h ' + escapeHtml(String(fr["0-2h"]||0)) + ' • 2-8h ' + escapeHtml(String(fr["2-8h"]||0)) + '</span>'
@@ -2271,7 +2367,6 @@ def dashboard():
       + '</div>'
       + '</div>';
 
-    // blockers + wait conditions (emphasis: top 3)
     var fails = (gate.fail_reasons || []);
     var must = (gate.must_change || []);
 
@@ -2298,27 +2393,47 @@ def dashboard():
       }).join('')
       + '</div></div>';
 
+    // De-dup evidence by "why" (simple grouping)
+    function groupEvidence(items){
+      const map = {};
+      items.forEach(function(it){
+        const k = (it.why || '—');
+        if(!map[k]) map[k] = {why:k, items:[], net:0};
+        map[k].items.push(it);
+        map[k].net += Number(it.contrib || 0);
+      });
+      const arr = Object.keys(map).map(k=>map[k]);
+      arr.sort((a,b)=>Math.abs(b.net)-Math.abs(a.net));
+      return arr;
+    }
+    const grouped = groupEvidence((why5||[]).slice(0,8));
+
     var src =
-      '<div class="panel"><div class="h2">Evidence (top 5, weighted)</div><div class="list">'
-      + (why5.length ? why5 : [{title:'—'}]).slice(0,5).map(function(x,i){
-        var l = x.link || '';
-        var contrib = (x.contrib!==undefined && x.contrib!==null) ? Number(x.contrib).toFixed(4) : '';
-        var age = (x.age_min!==undefined && x.age_min!==null) ? (escapeHtml(String(x.age_min)) + 'm') : '';
-        var src = x.source || '';
-        return '<div class="item">'
-               + '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div>'
-               + '<div class="m">'
-               +   '<span class="pill neu">contrib ' + escapeHtml(contrib) + '</span> '
-               +   '<span class="pill neu">age ' + age + '</span> '
-               +   '<span class="pill neu">src ' + escapeHtml(src) + '</span>'
-               + '</div>'
-               + '<div class="m">' + escapeHtml(x.title || '') + '</div>'
-               + (l ? ('<div class="m"><a href="' + escapeHtml(l) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
-               + '</div>';
-      }).join('')
+      '<div class="panel"><div class="h2">Evidence (simple)</div><div class="list">'
+      + (grouped.length ? grouped.slice(0,5).map(function(g,gi){
+          const ex = g.items[0] || {};
+          const age = (ex.age_min!==undefined && ex.age_min!==null) ? (escapeHtml(String(ex.age_min)) + 'm') : '—';
+          const source = ex.source || '—';
+          const title = ex.title || '';
+          const link = ex.link || '';
+          const cnt = g.items.length;
+          if(VIEW_MODE === 'QUANT'){
+            return '<div class="item">'
+              + '<div class="t">' + (gi+1) + '. ' + escapeHtml(g.why) + ' <span class="pill neu">net ' + Number(g.net).toFixed(4) + '</span> <span class="pill neu">n ' + cnt + '</span></div>'
+              + '<div class="m"><span class="pill neu">src ' + escapeHtml(source) + '</span> <span class="pill neu">age ' + age + '</span> <span class="pill neu">contrib ' + escapeHtml(String(ex.contrib||0)) + '</span></div>'
+              + '<div class="m">' + escapeHtml(title) + '</div>'
+              + (link ? ('<div class="m"><a href="' + escapeHtml(link) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
+              + '</div>';
+          }
+          return '<div class="item">'
+            + '<div class="t">' + (gi+1) + '. ' + escapeHtml(g.why) + ' <span class="pill neu">n ' + cnt + '</span></div>'
+            + '<div class="m">' + escapeHtml(source) + ' • ' + age + ' ago</div>'
+            + '<div class="m">' + escapeHtml(title) + '</div>'
+            + (link ? ('<div class="m"><a href="' + escapeHtml(link) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
+            + '</div>';
+        }).join('') : '<div class="item"><div class="t">—</div></div>')
       + '</div></div>';
 
-    // layout: banner + 2-col grid (blockers/wait) + drivers + evidence
     var html = banner
       + '<div class="grid2" style="margin-top:12px;">' + blockers + waitfor + '</div>'
       + drivers + src;
@@ -2390,6 +2505,7 @@ def dashboard():
 
   buildMarqueeNews();
   buildMarqueeStatus();
+  renderMobileCards();
   setInterval(buildMarqueeNews, 120000);
 </script>
 </body>
@@ -2407,6 +2523,7 @@ def dashboard():
         .replace("__FEEDS_CHIP__", fd_chip)
         .replace("__FRED_CHIP__", fr_chip)
         .replace("__RUN_CHIP__", rn_chip)
+        .replace("__LG_CHIP__", lg_chip)
         .replace("__DIAG_CHIP__", dg_chip)
         .replace("__ROW_XAU__", row("XAU"))
         .replace("__ROW_US500__", row("US500"))

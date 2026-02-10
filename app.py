@@ -1,11 +1,12 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-10 (UI/Calendar + iPhone-friendly):
-# ✅ Calendar parsing: supports dates WITHOUT year (e.g., "Feb 10, 15:15"), strips HTML from summaries
-# ✅ Next event: if no USD events found, falls back to earliest timed ANY-currency event (better UX)
-# ✅ SUMMARY: WHY becomes compact pills (Quality/Disagree/Bias/Risk) instead of cryptic text
-# ✅ iPhone-friendly: on small screens table hides; renders clean card list (tap View)
-# ✅ VIEW: Simple/Quant toggle; Simple hides contrib/age/src clutter by default + de-dup reasons
+# UPDATED v2026-02-10b:
+# ✅ iPhone-friendly: SUMMARY becomes cards on narrow screens; WHY never “vertical spaghetti”
+# ✅ Human labels: Q2->Quality, C->Conflict, score->BiasScore, th->Threshold, flip->FlipDist
+# ✅ Next event FIX: smart fallback if USD currency not parsed; shows best timed event anyway
+# ✅ Calendar parse health: shows USD-count + unknown-currency count; improves trust
+# ✅ VIEW evidence cleaned: less noise, better spacing, fewer repeated badges
+# ✅ Added extra RSS feeds (S&P DJI, Nasdaq, WSJ, InvestingLive, Feedburner)
 
 import os
 import json
@@ -82,8 +83,8 @@ EVENT_CFG = {
 # Alerts thresholds (server diff)
 ALERT_CFG = {
     "enabled": True,
-    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),              # points
-    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")),  # delta
+    "q2_drop": int(os.environ.get("ALERT_Q2_DROP", "12")),                   # points
+    "conflict_spike": float(os.environ.get("ALERT_CONFLICT_SPIKE", "0.18")), # delta
     "feeds_degraded_ratio": float(os.environ.get("ALERT_FEEDS_DEGRADED_RATIO", "0.80")),  # ok share
 }
 
@@ -103,6 +104,8 @@ FRED_SERIES = {
 }
 
 # RUN token
+# - RUN_TOKEN: single token (legacy)
+# - RUN_TOKENS: comma-separated list (new)
 RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
 RUN_TOKENS_RAW = os.environ.get("RUN_TOKENS", "").strip()
 RUN_TOKENS: List[str] = []
@@ -165,25 +168,25 @@ RSS_FEEDS: Dict[str, str] = {
     "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
     "MYFX_CAL": "https://www.myfxbook.com/rss/forex-economic-calendar-events",
 
-    # ───────────── US500 extra (S&P DJI + Nasdaq + Investing + WSJ/DJ Markets) ─────────────
-    "SPDJI_METHODOLOGIES": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=methodologies",
-    "SPDJI_PERFORMANCE":   "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=performance-reports",
-
-    "NASDAQ_STOCKS":   "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
-    "NASDAQ_EARNINGS": "https://www.nasdaq.com/feed/rssoutbound?category=Earnings",
-    "NASDAQ_ORIGINAL": "https://www.nasdaq.com/feed/nasdaq-original/rss.xml",
-    "NASDAQ_AI":       "https://www.nasdaq.com/feed/rssoutbound?category=Artificial+Intelligence",
-
-    "FEEDBURNER_INVESTING": "https://feeds.feedburner.com/InvestingRss",
-    "FEEDBURNER_ECONOMY":   "https://feeds.feedburner.com/EconomyRss",
-    "INVESTINGLIVE":        "https://investinglive.com/feed",
-
-    "DJ_WSJ_US_BUSINESS":   "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
-    "DJ_MARKETS_MAIN":      "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
-    
     # Myfxbook news/community
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "MYFX_COMM": "https://www.myfxbook.com/rss/forex-community-recent-topics",
+
+    # === Added feeds for US500 / broader macro ===
+    "SPDJI_METHOD": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=methodologies",
+    "SPDJI_PERF": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=performance-reports",
+
+    "NASDAQ_STOCKS": "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
+    "NASDAQ_EARN": "https://www.nasdaq.com/feed/rssoutbound?category=Earnings",
+    "NASDAQ_ORIG": "https://www.nasdaq.com/feed/nasdaq-original/rss.xml",
+    "NASDAQ_AI": "https://www.nasdaq.com/feed/rssoutbound?category=Artificial+Intelligence",
+
+    "FEEDBURNER_INV": "https://feeds.feedburner.com/InvestingRss",
+    "FEEDBURNER_ECON": "https://feeds.feedburner.com/EconomyRss",
+    "INVESTINGLIVE": "https://investinglive.com/feed",
+
+    "WSJ_US_BUSINESS": "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+    "WSJ_MARKETS_MAIN": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
 }
 
 # Calendar-only sources (do not add to bias evidence)
@@ -216,27 +219,19 @@ SOURCE_WEIGHT: Dict[str, float] = {
     "MYFX_NEWS": 1.15,
     "MYFX_COMM": 0.55,
 
-        # S&P DJI (methodologies/performance reports): очень “тяжёлый” по фактам, но это не trade-news,
-    # поэтому вес высокий, но не максимальный
-    "SPDJI_METHODOLOGIES": 1.6,
-    "SPDJI_PERFORMANCE":   1.7,
+    # Added
+    "SPDJI_METHOD": 1.6,
+    "SPDJI_PERF": 1.6,
+    "NASDAQ_STOCKS": 1.3,
+    "NASDAQ_EARN": 1.3,
+    "NASDAQ_ORIG": 1.25,
+    "NASDAQ_AI": 1.15,
+    "FEEDBURNER_INV": 1.0,
+    "FEEDBURNER_ECON": 1.0,
+    "INVESTINGLIVE": 1.1,
+    "WSJ_US_BUSINESS": 1.6,
+    "WSJ_MARKETS_MAIN": 1.6,
 
-    # Nasdaq: обычно быстро и по делу, но встречается PR/обзорность
-    "NASDAQ_STOCKS":   1.25,
-    "NASDAQ_EARNINGS": 1.35,
-    "NASDAQ_ORIGINAL": 1.15,
-    "NASDAQ_AI":       1.05,
-
-    # Feedburner/Investing/InvestingLive: полезно, но больше шума/перепечаток
-    "FEEDBURNER_INVESTING": 0.95,
-    "FEEDBURNER_ECONOMY":   1.00,
-    "INVESTINGLIVE":        0.90,
-
-    # Dow Jones / WSJ feeds: качественный слой (но paywall не мешает заголовкам)
-    "DJ_WSJ_US_BUSINESS": 1.35,
-    "DJ_MARKETS_MAIN":    1.40,
-
-    
     "FRED": 1.0,
 }
 
@@ -256,9 +251,6 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
         (r"\b(rate cut|dovish|easing)\b", +0.5, "Easing supports risk assets"),
         (r"\b(risk-off|selloff|panic|crash)\b", -0.7, "Risk-off headlines"),
         (r"\b(rally|rebound|risk-on)\b", +0.3, "Risk-on tape"),
-        (r"\b(antitrust|doj|sec|regulator|investigation|probe)\b", -0.5, "Regulatory/legal pressure (risk-off)"),
-        (r"\b(ai|artificial intelligence|chip|semiconductor|nvda|nvidia)\b", +0.2, "AI/semis risk-on impulse (context-dependent)"),
-        (r"\b(job cuts|layoffs)\b", -0.2, "Layoffs headline (can be mixed; default slightly risk-off)"),
         (r"\b(vix spikes|volatility spikes)\b", -0.6, "Volatility spike (risk-off)"),
     ],
     "WTI": [
@@ -478,7 +470,7 @@ def _human_event_reason(reason_list: List[str]) -> str:
             hh = r.split("<=")[-1].strip()
             out.append(f"Recent macro within {hh}")
         elif r == "calendar_time_unknown":
-            out.append("Calendar time unknown (RSS)")
+            out.append("Calendar time unknown (RSS parse)")
         elif r == "no_macro_no_upcoming":
             out.append("No macro triggers")
         elif r == "disabled":
@@ -650,13 +642,11 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         return None
     s = " ".join(str(blob).split())
 
-    # YYYY-MM-DD HH:MM
     m = re.search(r"(\d{4})-(\d{2})-(\d{2})\s+(\d{1,2}):(\d{2})", s)
     if m:
         y, mo, da, hh, mm = [int(m.group(i)) for i in range(1, 6)]
         return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # "Feb 10, 2026 15:15"
     m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),\s*(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         mon = _MONTHS.get(m.group(1).lower()[:3])
@@ -664,7 +654,6 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # "10 Feb 2026 15:15"
     m = re.search(r"\b(\d{1,2})\s+([A-Za-z]{3})\s+(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da = int(m.group(1)); mon = _MONTHS.get(m.group(2).lower()[:3]); y = int(m.group(3))
@@ -672,37 +661,23 @@ def _try_parse_any_datetime_from_blob(blob: str) -> Optional[int]:
         if mon:
             return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # "MM/DD/YYYY HH:MM"
     m = re.search(r"\b(\d{1,2})/(\d{1,2})/(\d{4})\s+(\d{1,2}):(\d{2})\b", s)
     if m:
         da, mo, y, hh, mm = [int(m.group(i)) for i in range(1, 6)]
         if 1 <= mo <= 12 and 1 <= da <= 31:
             return int(datetime(y, mo, da, hh, mm, tzinfo=timezone.utc).timestamp())
 
-    # NEW: "Feb 10, 15:15" (no year) -> assume current UTC year
-    m = re.search(r"\b([A-Za-z]{3})\s+(\d{1,2}),?\s+(\d{1,2}):(\d{2})\b", s)
-    if m:
-        mon = _MONTHS.get(m.group(1).lower()[:3])
-        da = int(m.group(2))
-        hh = int(m.group(3))
-        mm = int(m.group(4))
-        if mon:
-            y = datetime.now(timezone.utc).year
-            return int(datetime(y, mon, da, hh, mm, tzinfo=timezone.utc).timestamp())
-
     return None
 
 def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     title = (e.get("title") or "").strip()
     summary = (e.get("summary") or e.get("description") or "").strip()
-
-    # NEW: strip html tags (MyFX often embeds)
-    summary_plain = re.sub(r"<[^>]+>", " ", summary)
-    blob = (title + " " + summary_plain).strip()
+    blob = (title + " " + summary).strip()
 
     currency = _get_entry_field(e, ["currency", "ccy", "cur", "ff_currency"])
     impact = _get_entry_field(e, ["impact", "importance", "ff_impact", "volatility"])
 
+    # tags/categories often contain USD, High, etc.
     if not currency:
         tags = e.get("tags") or e.get("categories") or []
         try:
@@ -718,12 +693,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
                     break
         except Exception:
             pass
-
-    # Try currency in title first (usually clean)
-    if not currency:
-        m = _CUR_PAT.search(title)
-        if m:
-            currency = m.group(1).upper()
 
     if not currency:
         m = _CUR_PAT.search(blob)
@@ -880,7 +849,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
-    # fallback if timed events absent: show last known items (some may have unknown time)
+    # fallback: last events (even if time unknown)
     with db_conn() as conn:
         with conn.cursor() as cur:
             cur.execute("""
@@ -904,6 +873,29 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             "in_hours": None
         })
     return unknown[:12]
+
+def _calendar_health(upcoming: List[Dict[str, Any]]) -> Dict[str, Any]:
+    usd = 0
+    known = 0
+    unknown = 0
+    timed = 0
+    for x in upcoming or []:
+        c = (x.get("currency") or "")
+        if c:
+            known += 1
+            if str(c).upper() == "USD":
+                usd += 1
+        else:
+            unknown += 1
+        if x.get("ts"):
+            timed += 1
+    return {
+        "usd": usd,
+        "known_currency": known,
+        "unknown_currency": unknown,
+        "timed": timed,
+        "total": len(upcoming or []),
+    }
 
 def trump_flag_recent(rows: List[Tuple[str, str, str, int]], now_ts: int, hours: float = 12.0) -> Dict[str, Any]:
     cutoff = now_ts - int(hours * 3600)
@@ -1180,6 +1172,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
                 event_reason.append("no_macro_no_upcoming")
 
     trump = trump_flag_recent(rows, now, hours=12.0)
+    cal_health = _calendar_health(upcoming_events)
 
     assets_out: Dict[str, Any] = {}
     for asset in ASSETS:
@@ -1318,6 +1311,7 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
             "reason": event_reason,
             "recent_macro": bool(recent_macro),
             "upcoming_events": upcoming_events,
+            "calendar_health": cal_health,
             "lookahead_hours": float(EVENT_CFG["lookahead_hours"]),
             "recent_hours": float(EVENT_CFG["recent_hours"]),
             "calendar_sources": list(CALENDAR_FEEDS),
@@ -1384,7 +1378,7 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
                 f"{a} bias flip: {pb} → {cb}",
                 asset=a,
                 severity="WARN",
-                extra={"prev": pb, "cur": cb, "score": ca.get("score"), "q2": ca.get("quality_v2"), "conflict": ca.get("conflict_index")}
+                extra={"prev": pb, "cur": cb, "score": ca.get("score"), "quality": ca.get("quality_v2"), "conflict": ca.get("conflict_index")}
             )
 
         pq2 = int(pa.get("quality_v2", 0))
@@ -1403,7 +1397,7 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
         if (cc - pc) >= conflict_spike_th:
             push(
                 "conflict_spike",
-                f"{a} disagreement spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})",
+                f"{a} Conflict spike: {pc:.3f} → {cc:.3f} (Δ={(cc-pc):.3f})",
                 asset=a,
                 severity="WARN",
                 extra={"prev": pc, "cur": cc}
@@ -1462,7 +1456,7 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
     cfg = GATE_THRESHOLDS.get(profile, GATE_THRESHOLDS["STRICT"])
 
     bias = str(asset_obj.get("bias", "NEUTRAL"))
-    q2 = int(asset_obj.get("quality_v2", 0))
+    quality = int(asset_obj.get("quality_v2", 0))
     conflict = float(asset_obj.get("conflict_index", 1.0))
     flip = asset_obj.get("flip", {}) or {}
     to_opp = float(flip.get("to_opposite", 999.0))
@@ -1472,42 +1466,42 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
     must = []
 
     if bias == "NEUTRAL" and not cfg.get("neutral_allow", False):
-        fail.append("Bias is NEUTRAL")
+        fail.append("Bias is NEUTRAL (no clear direction)")
         fail_short.append("NEUTRAL")
         must.append("Bias must become BULLISH or BEARISH")
     elif bias == "NEUTRAL" and cfg.get("neutral_allow", False):
         maxd = float(cfg.get("neutral_flip_dist_max", 0.20))
         if to_opp > maxd:
-            fail.append("Neutral is far from flip")
+            fail.append("Neutral is far from a flip (weak edge)")
             fail_short.append("Neutral far")
-            must.append(f"Move closer to flip (to_opposite ≤ {maxd})")
+            must.append(f"Get closer to flip (FlipDist ≤ {maxd})")
 
     qmin = int(cfg["quality_v2_min"])
-    if q2 < qmin:
-        fail.append(f"Quality too low (Quality {q2} < {qmin})")
+    if quality < qmin:
+        fail.append(f"Quality too low ({quality} < {qmin})")
         fail_short.append("Quality low")
         must.append(f"Quality ≥ {qmin}")
 
     cmax = float(cfg["conflict_max"])
     if conflict > cmax:
-        fail.append(f"Disagreement too high ({conflict:.3f} > {cmax})")
-        fail_short.append("Disagree high")
-        must.append(f"Disagreement ≤ {cmax}")
+        fail.append(f"Conflict too high ({conflict:.3f} > {cmax:.3f})")
+        fail_short.append("Conflict high")
+        must.append(f"Conflict ≤ {cmax:.3f}")
 
     mind = float(cfg["min_opp_flip_dist"])
     if bias in ("BULLISH", "BEARISH") and to_opp < mind:
-        fail.append(f"Too close to opposite flip (flip {to_opp:.3f} < {mind})")
+        fail.append(f"Too close to opposite flip (FlipDist {to_opp:.3f} < {mind:.3f})")
         fail_short.append("Flip close")
-        must.append(f"flip ≥ {mind}")
+        must.append(f"FlipDist ≥ {mind:.3f}")
 
     if event_mode:
         if cfg.get("event_mode_block", True):
             oq = int(cfg.get("event_override_quality", 70))
             oc = float(cfg.get("event_override_conflict", 0.45))
-            if not (q2 >= oq and conflict <= oc and bias != "NEUTRAL"):
-                fail.append("Macro risk window is ON (RISK)")
+            if not (quality >= oq and conflict <= oc and bias != "NEUTRAL"):
+                fail.append("RISK ON: macro window (events/releases)")
                 fail_short.append("RISK")
-                must.append(f"Wait OR require Quality≥{oq} & Disagreement≤{oc} & bias!=NEUTRAL")
+                must.append(f"Wait OR require Quality≥{oq} & Conflict≤{oc:.3f} & bias!=NEUTRAL")
 
     ok = (len(fail) == 0)
 
@@ -1524,11 +1518,11 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
 
         # numeric context for UI (summary + view)
         "bias": bias,
-        "q2": q2, "q2_min": qmin,
+        "quality": quality, "quality_min": qmin,
         "conflict": conflict, "conflict_max": cmax,
         "score": float(asset_obj.get("score", 0.0)),
         "th": float(asset_obj.get("threshold", 0.0)),
-        "to_opposite": to_opp, "min_opp_flip_dist": mind,
+        "flip_dist": to_opp, "flip_min": mind,
         "event_mode": bool(event_mode),
         "profile": str(profile),
     }
@@ -1682,6 +1676,7 @@ def latest(limit: int = 40):
             rows = cur.fetchall()
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
+# MyFXBook calendar page (standalone)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
 def myfx_calendar():
     html = f"""<!doctype html>
@@ -1715,52 +1710,56 @@ def _pill_bias(b: str) -> str:
 def _pill_gate(ok: bool) -> str:
     return '<span class="pill ok">TRADE OK</span>' if ok else '<span class="pill no">NO TRADE</span>'
 
-def _pill_impact(imp: Optional[str]) -> str:
-    imp = _impact_norm(imp)
-    if imp == "HIGH":
-        return '<span class="pill bear">HIGH</span>'
-    if imp == "MED":
-        return '<span class="pill warn">MED</span>'
-    if imp == "LOW":
-        return '<span class="pill neu">LOW</span>'
-    return '<span class="pill neu">—</span>'
+def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
+    """
+    FIX: if USD not detected (currency missing), do NOT lie.
+    Strategy:
+      1) try timed USD
+      2) else timed ANY
+      3) else first ANY
+    Also returns meta health (usd_count/unknown currency).
+    """
+    meta = _calendar_health(upcoming)
 
-def _pick_next_event(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str]:
     if not upcoming:
-        return "No upcoming events in horizon", ""
+        return "No upcoming events in horizon", "", meta
 
     prefer_ccy = (prefer_ccy or "USD").upper()
-    pref = [x for x in upcoming if str(x.get("currency") or "").upper() == prefer_ccy]
 
-    # NEW: fallback to earliest timed ANY-currency event (user-friendly)
-    if not pref:
-        timed_any = [x for x in upcoming if x.get("ts")]
-        if timed_any:
-            timed_any.sort(key=lambda x: int(x.get("ts") or 0))
-            pick = timed_any[0]
-            ts = int(pick["ts"])
-            ccy = (pick.get("currency") or "—")
-            imp = _impact_norm(pick.get("impact"))
-            return (
-                f"{_fmt_hhmm_utc(ts)} • {ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
-                str(pick.get("source", "")),
-            )
-        return "Upcoming events exist but time/currency unclear (RSS)", ""
+    timed = [x for x in upcoming if x.get("ts")]
+    usd_timed = [x for x in timed if str(x.get("currency") or "").upper() == prefer_ccy]
 
-    timed = [x for x in pref if x.get("ts")]
-    if timed:
-        timed.sort(key=lambda x: int(x.get("ts") or 0))
-        pick = timed[0]
+    if usd_timed:
+        usd_timed.sort(key=lambda x: int(x.get("ts") or 0))
+        pick = usd_timed[0]
         ts = int(pick["ts"])
         imp = _impact_norm(pick.get("impact"))
         return (
             f"{_fmt_hhmm_utc(ts)} • {prefer_ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
             str(pick.get("source", "")),
+            meta
         )
 
-    u = pref[0]
-    imp = _impact_norm(u.get("impact"))
-    return (f"(time unknown) • {prefer_ccy} {imp or '—'} • {u.get('title','')}", str(u.get("source", "")))
+    if timed:
+        timed.sort(key=lambda x: int(x.get("ts") or 0))
+        pick = timed[0]
+        ts = int(pick["ts"])
+        ccy = str(pick.get("currency") or "—")
+        imp = _impact_norm(pick.get("impact"))
+        note = f"{ccy} {imp or '—'}"
+        if meta.get("usd", 0) == 0:
+            note += " • (USD not detected)"
+        return (
+            f"{_fmt_hhmm_utc(ts)} • {note} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
+            str(pick.get("source", "")),
+            meta
+        )
+
+    pick = upcoming[0]
+    ccy = str(pick.get("currency") or "—")
+    imp = _impact_norm(pick.get("impact"))
+    note = f"{ccy} {imp or '—'}"
+    return (f"(time unknown) • {note} • {pick.get('title','')}", str(pick.get("source", "")), meta)
 
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard():
@@ -1781,7 +1780,7 @@ def dashboard():
     now_ts = int(time.time())
 
     reason_txt = _human_event_reason([str(x) for x in (event.get("reason", []) or [])])
-    next_event_line, next_event_src = _pick_next_event(now_ts, upcoming, prefer_ccy="USD")
+    next_event_line, next_event_src, cal_meta = _pick_next_event_smart(now_ts, upcoming, prefer_ccy="USD")
 
     trump = meta.get("trump", {}) or {}
     trump_flag = bool(trump.get("flag", False))
@@ -1813,7 +1812,7 @@ def dashboard():
 
     fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
                     "ok" if feeds_ok else "no",
-                    "RSS parsing health. Click to see GOOD/BAD feeds.", "feeds")
+                    "RSS parsing health. Click to see GOOD/WARN/BAD per feed.", "feeds")
 
     fr_chip = _chip("MACRO", ("ON" if fred_on else "OFF"), "neu",
                     "Macro drivers (FRED). OFF reason: " + fred_why + ". Click for details.", "macro")
@@ -1821,43 +1820,51 @@ def dashboard():
     rn_chip = _chip("RUN", ("LOCKED" if token_required else "OPEN"), "neu",
                     "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
 
-    # NEW: legend chip to explain metrics in plain words
-    lg_chip = _chip("HELP", "LEGEND", "neu",
-                    "Explains Quality/Disagreement/Bias score in simple language.", "legend")
+    lg_chip = _chip("LEGEND", "?", "neu",
+                    "Explain what Quality/Conflict/BiasScore/Threshold/FlipDist mean (simple language).", "legend")
 
     dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
 
-    def _why_pills(asset: str, a: dict) -> str:
+    def _short_why(asset: str) -> str:
+        a = assets.get(asset, {}) or {}
         gate = a.get("ui_gate", {}) or {}
-        q2 = int(gate.get("q2", 0)); q2min = int(gate.get("q2_min", 0))
-        c = float(gate.get("conflict", 1.0)); cmax = float(gate.get("conflict_max", 1.0))
-        score = float(gate.get("score", 0.0)); th = float(gate.get("th", 0.0))
-        bias = str(gate.get("bias", a.get("bias", "NEUTRAL")))
-        # compact: Quality / Disagree / BiasScore / Risk
-        parts = []
-        parts.append(f'<span class="pill neu" title="Signal reliability">Quality {q2}/{q2min}</span>')
-        parts.append(f'<span class="pill neu" title="News disagreement (lower is better)">Disagree {c:.2f}/{cmax:.2f}</span>')
-        parts.append(f'<span class="pill neu" title="Bias score vs threshold">Bias {score:.2f}/{th:.2f}</span>')
-        if bias == "NEUTRAL":
-            parts.append('<span class="pill warn" title="Bias is neutral (no clear direction)">NEUTRAL</span>')
-        if gate.get("event_mode"):
-            parts.append('<span class="pill warn" title="Macro risk window">RISK</span>')
-        return '<div class="whyPills">' + " ".join(parts) + "</div>"
+        ok = bool(gate.get("ok", False))
+        b = str(a.get("bias", "NEUTRAL"))
+
+        quality = int(gate.get("quality", 0))
+        qmin = int(gate.get("quality_min", 0))
+        conflict = float(gate.get("conflict", 1.0))
+        cmax = float(gate.get("conflict_max", 1.0))
+        score = float(gate.get("score", 0.0))
+        th = float(gate.get("th", 0.0))
+        flipd = float(gate.get("flip_dist", 999.0))
+        flipmin = float(gate.get("flip_min", 0.0))
+
+        if ok:
+            return f"BiasScore {score:.2f}/{th:.2f} • Conflict {conflict:.2f} • Quality {quality} • RISK {'ON' if gate.get('event_mode') else 'OFF'}"
+        else:
+            parts = [f"Quality {quality}/{qmin}", f"Conflict {conflict:.2f}/{cmax:.2f}", f"BiasScore {score:.2f}/{th:.2f}"]
+            if b in ("BULLISH", "BEARISH") and flipd < flipmin:
+                parts.append(f"FlipDist {flipd:.2f}<{flipmin:.2f}")
+            if gate.get("event_mode"):
+                parts.append("RISK ON")
+            if b == "NEUTRAL":
+                parts.insert(0, "NEUTRAL")
+            return " • ".join(parts)
 
     def row(asset: str) -> str:
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
         ok = bool(gate.get("ok", False))
-
-        why_html = _why_pills(asset, a)
+        short = _short_why(asset)
 
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
           <td>{_pill_bias(bias)}</td>
           <td>{_pill_gate(ok)}</td>
-          <td class="why">{why_html}</td>
+          <td class="why">{short or "—"}</td>
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
         """
@@ -1868,6 +1875,8 @@ def dashboard():
     updated_short = updated.replace("T", " ").replace("+00:00", " UTC")
     if len(updated_short) > 22:
         updated_short = updated_short[:22].strip()
+
+    cal_health_badge = f"USD:{cal_meta.get('usd',0)} • timed:{cal_meta.get('timed',0)} • unk:{cal_meta.get('unknown_currency',0)}"
 
     TEMPLATE = """<!doctype html>
 <html>
@@ -1886,6 +1895,7 @@ def dashboard():
       --pillbg:rgba(255,255,255,.03);
       --btn:#0f1724; --btn2:#162238;
       --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, "Liberation Mono", monospace;
+      --sys: -apple-system, BlinkMacSystemFont, Segoe UI, Arial;
     }
     html,body{height:100%; margin:0; background:var(--bg); color:var(--text);}
     body{padding: env(safe-area-inset-top) env(safe-area-inset-right) env(safe-area-inset-bottom) env(safe-area-inset-left);}
@@ -1910,7 +1920,7 @@ def dashboard():
     button.chip{cursor:pointer; appearance:none; -webkit-appearance:none;}
     button.chip:active{transform:translateY(1px);}
 
-    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg); display:inline-flex; align-items:center; gap:6px;}
+    .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
@@ -1922,6 +1932,7 @@ def dashboard():
     .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
 
+    /* Table stability */
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900; text-align:left;}
@@ -1932,6 +1943,7 @@ def dashboard():
 
     .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch;}
     .panel table .btn{padding:8px 10px; border-radius:10px; font-size:12px; line-height:1; box-sizing:border-box;}
+
     .muted{color:var(--muted);}
     .tvwrap{margin-top:12px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
 
@@ -1946,6 +1958,7 @@ def dashboard():
       margin:0 0 8px 2px;
     }
 
+    /* Tickers */
     .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
     .ticklabel{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 6px 2px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -1958,22 +1971,24 @@ def dashboard():
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
 
+    /* Modal */
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
-                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line); gap:10px; flex-wrap:wrap;}
+                 display:flex; justify-content:space-between; align-items:center; padding:12px; border-bottom:1px solid var(--line);}
     .modal .body{padding:12px;}
     .h2{font-family:var(--mono); font-weight:900; color:var(--muted); font-size:12px; margin-bottom:8px;}
     .list{font-family:var(--mono); font-size:12px;}
     .item{padding:10px 0; border-top:1px solid var(--line);}
     .item .t{font-weight:900;}
-    .item .m{color:var(--muted); margin-top:4px;}
+    .item .m{color:var(--muted); margin-top:6px; line-height:1.45;}
     .kz{color:var(--muted); font-family:var(--mono); font-size:12px; margin-top:10px; line-height:1.45;}
 
     .iframebox{width:100%; height:72vh; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
 
+    /* View emphasis */
     .banner{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
     .bannerTop{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
     .big{font-family:var(--mono); font-weight:900; letter-spacing:.8px; font-size:14px;}
@@ -1984,19 +1999,22 @@ def dashboard():
     .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
     .mini .pill{font-size:11px; padding:5px 9px;}
 
-    /* WHY pills layout */
-    .whyPills{display:flex; flex-wrap:wrap; gap:8px; align-items:center;}
+    /* === iPhone-friendly SUMMARY ===
+       On small screens: hide table and show cards (no horizontal scroll needed).
+    */
+    .sumCards{display:none;}
+    .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
+    .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
+    .sumWhy{margin-top:10px; color:var(--text); font-family:var(--mono); font-size:12px; line-height:1.45; word-break:break-word;}
+    .sumBtn{margin-top:10px;}
 
-    /* Mobile: replace table with cards */
-    .cards{display:none; gap:10px; flex-direction:column;}
-    .card{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
-    .cardTop{display:flex; justify-content:space-between; align-items:center; flex-wrap:wrap; gap:10px;}
-    .cardSym{font-family:var(--mono); font-weight:900; letter-spacing:.6px; color:var(--amber);}
-    .cardMid{margin-top:10px; display:flex; flex-wrap:wrap; gap:8px;}
-    .cardActions{margin-top:10px; display:flex; justify-content:flex-end;}
-    @media(max-width:560px){
+    @media(max-width:640px){
       .tablewrap{display:none;}
-      .cards{display:flex;}
+      .sumCards{display:block;}
+      .wrap{padding:12px;}
+      .btn{padding:10px 12px;}
+      .chip{padding:9px 10px;}
+      .metaLine{gap:10px;}
     }
   </style>
 </head>
@@ -2019,9 +2037,10 @@ def dashboard():
       </div>
       <div class="metaLine" style="margin-top:8px;">
         <span class="k">Next event:</span>
-        <span class="pill neu" style="display:inline-flex;gap:10px;align-items:center; flex-wrap:wrap;">
+        <span class="pill neu" style="display:inline-flex;gap:10px;align-items:center;flex-wrap:wrap;">
           <span style="color:var(--text);font-weight:900;">__NEXT_EVENT__</span>
           <span class="muted" style="font-weight:900;">__NEXT_EVENT_SRC__</span>
+          <span class="muted" style="font-weight:900;">__CAL_HEALTH__</span>
         </span>
       </div>
     </div>
@@ -2029,7 +2048,7 @@ def dashboard():
     <div class="block">
       <div class="blockTitle">SWITCHBOARD</div>
       <div class="chips">
-        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __LG_CHIP__ __DIAG_CHIP__
+        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __LEGEND_CHIP__ __DIAG_CHIP__
       </div>
       <div class="kz" style="margin-top:8px;">Tip: chips are clickable — tap to see what they mean + current details.</div>
     </div>
@@ -2075,7 +2094,7 @@ def dashboard():
   <div class="panel">
     <div class="blockTitle">SUMMARY</div>
 
-    <!-- Desktop table -->
+    <!-- Desktop/tablet table -->
     <div class="tablewrap">
       <table>
         <colgroup>
@@ -2090,10 +2109,14 @@ def dashboard():
       </table>
     </div>
 
-    <!-- Mobile cards -->
-    <div class="cards" id="cards"></div>
+    <!-- iPhone cards -->
+    <div class="sumCards">
+      __CARD_XAU__
+      __CARD_US500__
+      __CARD_WTI__
+    </div>
 
-    <div class="kz">Goal: fast read. Tap <b>View</b> for details. Hotkeys: R/M/E • 1/2/3 • Esc.</div>
+    <div class="kz">Goal: fast read. If you need details: open <b>View</b>. Hotkeys: R/M/E • 1/2/3 • Esc.</div>
   </div>
 </div>
 
@@ -2101,10 +2124,7 @@ def dashboard():
   <div class="box">
     <div class="head">
       <div class="title" id="mt">VIEW</div>
-      <div style="display:flex; gap:8px; flex-wrap:wrap; align-items:center;">
-        <button class="btn" id="modeBtn" onclick="toggleViewMode()">Mode: SIMPLE</button>
-        <button class="btn" onclick="closeModal()">Esc</button>
-      </div>
+      <button class="btn" onclick="closeModal()">Esc</button>
     </div>
     <div class="body" id="mb"></div>
   </div>
@@ -2114,8 +2134,6 @@ def dashboard():
   const PAYLOAD = __JS_PAYLOAD__;
   const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
   const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
-  let VIEW_MODE = 'SIMPLE'; // SIMPLE | QUANT
-  let LAST_VIEW_SYM = null;
 
   function $(id){ return document.getElementById(id); }
   function escapeHtml(s){
@@ -2127,15 +2145,8 @@ def dashboard():
     $('mt').innerText = title;
     $('mb').innerHTML = html;
     $('modal').style.display = 'block';
-    $('modeBtn').innerText = 'Mode: ' + VIEW_MODE;
   }
   function closeModal(){ $('modal').style.display = 'none'; }
-
-  function toggleViewMode(){
-    VIEW_MODE = (VIEW_MODE === 'SIMPLE') ? 'QUANT' : 'SIMPLE';
-    $('modeBtn').innerText = 'Mode: ' + VIEW_MODE;
-    if(LAST_VIEW_SYM) openView(LAST_VIEW_SYM);
-  }
 
   function clearSavedToken(){
     localStorage.removeItem('run_token');
@@ -2203,7 +2214,7 @@ def dashboard():
       var b = x.bias || '—';
       var gate = x.ui_gate || {};
       var trade = gate.ok ? 'TRADE OK' : 'NO TRADE';
-      var why = gate.ok ? ('Bias ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
+      var why = gate.ok ? ('BiasScore ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
                         : ((gate.fail_short||[]).join(' | ') || 'Blocked');
       parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b>' + (why ? (' • ' + escapeHtml(why)) : '') + '</span>');
     });
@@ -2218,18 +2229,20 @@ def dashboard():
     const fred = (meta.fred || {});
     const trump = (meta.trump || {});
     const tokenReq = !!meta.run_token_required;
+    const cal = (ev.calendar_health || {});
 
     let title = 'INFO';
     let body = '';
 
     if(key === 'legend'){
-      title = 'LEGEND (simple)';
+      title = 'LEGEND (simple meaning)';
       body =
-        '<div class="panel"><div class="h2">What you see in SUMMARY</div><div class="list">'
-        + '<div class="item"><div class="t">Quality</div><div class="m">Reliability of the bias. Higher = cleaner signal (more evidence, more sources, fresher, less disagreement, no event penalty).</div></div>'
-        + '<div class="item"><div class="t">Disagree</div><div class="m">How much news contradict each other. Lower is better. 0 = all aligned, 1 = chaos.</div></div>'
-        + '<div class="item"><div class="t">Bias</div><div class="m">Bias score vs threshold. If score ≥ +th → BULLISH, if score ≤ −th → BEARISH, else NEUTRAL.</div></div>'
-        + '<div class="item"><div class="t">RISK</div><div class="m">Macro risk window (upcoming/very recent high-impact releases). In STRICT mode it blocks unless Quality is high and Disagree is low.</div></div>'
+        '<div class="panel"><div class="h2">Core numbers (what you actually need)</div><div class="list">'
+        + '<div class="item"><div class="t">Quality</div><div class="m">0..100. Higher = cleaner signal (more evidence, more diversity, fresher, less internal contradiction, and not punished by macro-risk window).</div></div>'
+        + '<div class="item"><div class="t">Conflict</div><div class="m">0..1. Lower = sources agree. Higher = “one says BUY, another says SELL” → noisy.</div></div>'
+        + '<div class="item"><div class="t">BiasScore / Threshold</div><div class="m">BiasScore is the weighted sum. If it crosses +Threshold → BULLISH, below -Threshold → BEARISH. Inside → NEUTRAL.</div></div>'
+        + '<div class="item"><div class="t">FlipDist</div><div class="m">Distance to opposite bias flip. If too small, you’re close to reversal → more fragile / blocked in STRICT.</div></div>'
+        + '<div class="item"><div class="t">RISK ON</div><div class="m">Macro window is active (events/releases). STRICT blocks unless Quality is high and Conflict is low.</div></div>'
         + '</div></div>';
     }
 
@@ -2243,8 +2256,9 @@ def dashboard():
         + '<div class="panel"><div class="h2">Now</div><div class="list">'
         + '<div class="item"><div class="t">event_mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + '</div></div>'
         + '<div class="item"><div class="t">reason</div><div class="m">' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
-        + '<div class="item"><div class="t">lookahead</div><div class="m">' + escapeHtml(String(ev.lookahead_hours||'')) + 'h</div></div>'
-        + '<div class="item"><div class="t">recent</div><div class="m">' + escapeHtml(String(ev.recent_hours||'')) + 'h</div></div>'
+        + '<div class="item"><div class="t">Calendar parse</div><div class="m">'
+        + 'USD=' + escapeHtml(String(cal.usd||0)) + ', timed=' + escapeHtml(String(cal.timed||0)) + ', unknown_ccy=' + escapeHtml(String(cal.unknown_currency||0))
+        + '</div></div>'
         + '</div></div>';
     }
 
@@ -2263,7 +2277,7 @@ def dashboard():
     }
 
     if(key === 'feeds'){
-      title = 'FEEDS (GOOD/BAD)';
+      title = 'FEEDS (GOOD/WARN/BAD)';
       let keys = Object.keys(feeds || {});
       let good=0, warn=0, bad=0, skip=0;
       let rows = [];
@@ -2297,7 +2311,7 @@ def dashboard():
           }).join('')
         + '</div></div>';
 
-      body = head + list + '<div class="kz"><b>Tip:</b> if BAD spikes, bias/quality becomes noisy. Open DIAG for DB/env too.</div>';
+      body = head + list + '<div class="kz"><b>Tip:</b> if BAD spikes, bias/quality becomes noisy.</div>';
     }
 
     if(key === 'macro'){
@@ -2337,43 +2351,7 @@ def dashboard():
     explainChip(key);
   });
 
-  function renderMobileCards(){
-    const a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
-    const cards = $('cards');
-    if(!cards) return;
-    const order = ['XAU','US500','WTI'];
-    cards.innerHTML = order.map(function(sym){
-      const x = a[sym] || {};
-      const gate = x.ui_gate || {};
-      const ok = !!gate.ok;
-      const bias = x.bias || 'NEUTRAL';
-      const q2 = gate.q2||0, q2min = gate.q2_min||0;
-      const c = gate.conflict||0, cmax = gate.conflict_max||0;
-      const score = gate.score||0, th = gate.th||0;
-      const risk = gate.event_mode ? '<span class="pill warn">RISK</span>' : '<span class="pill neu">RISK OFF</span>';
-
-      return ''
-        + '<div class="card">'
-        + '  <div class="cardTop">'
-        + '    <div class="cardSym">' + escapeHtml(sym) + '</div>'
-        + '    <div style="display:flex; gap:8px; flex-wrap:wrap;">'
-        + '      <span class="pill ' + (bias==='BULLISH'?'bull':(bias==='BEARISH'?'bear':'neu')) + '">' + escapeHtml(bias) + '</span>'
-        + '      <span class="pill ' + (ok?'ok':'no') + '">' + (ok?'TRADE OK':'NO TRADE') + '</span>'
-        + '    </div>'
-        + '  </div>'
-        + '  <div class="cardMid">'
-        + '    <span class="pill neu">Quality ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
-        + '    <span class="pill neu">Disagree ' + Number(c).toFixed(2) + '/' + Number(cmax).toFixed(2) + '</span>'
-        + '    <span class="pill neu">Bias ' + Number(score).toFixed(2) + '/' + Number(th).toFixed(2) + '</span>'
-        +      risk
-        + '  </div>'
-        + '  <div class="cardActions"><button class="btn" onclick="openView(\\'' + escapeHtml(sym) + '\\')">View</button></div>'
-        + '</div>';
-    }).join('');
-  }
-
   function openView(sym){
-    LAST_VIEW_SYM = sym;
     var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
     var gate = a.ui_gate || {};
     var top = (a.top3_drivers || []);
@@ -2384,10 +2362,10 @@ def dashboard():
     var badge = ok ? '<span class="pill ok">TRADE OK</span>' : '<span class="pill no">NO TRADE</span>';
     var big = ok ? '<span class="ok">TRADE OK</span>' : '<span class="no">NO TRADE</span>';
 
-    var q2 = (gate.q2||0), q2min = (gate.q2_min||0);
+    var quality = (gate.quality||0), qmin = (gate.quality_min||0);
     var c = (gate.conflict||0), cmax = (gate.conflict_max||0);
     var score = (gate.score||0), th = (gate.th||0);
-    var toopp = (gate.to_opposite||0), mind = (gate.min_opp_flip_dist||0);
+    var flipd = (gate.flip_dist||0), flipmin = (gate.flip_min||0);
     var evc = (a.evidence_count||0), div = (a.source_diversity||0);
 
     var banner =
@@ -2397,11 +2375,11 @@ def dashboard():
       + '  <div>' + badge + ' ' + '<span class="pill neu">Bias ' + escapeHtml(a.bias||'—') + '</span>' + '</div>'
       + '</div>'
       + '<div class="mini">'
-      + '<span class="pill neu">Bias ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
-      + '<span class="pill neu">Quality ' + escapeHtml(String(q2)) + '/' + escapeHtml(String(q2min)) + '</span>'
-      + '<span class="pill neu">Disagree ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
-      + '<span class="pill neu">Flip ' + toopp.toFixed(3) + ' (min ' + mind.toFixed(3) + ')</span>'
-      + '<span class="pill neu">ev ' + escapeHtml(String(evc)) + ' • div ' + escapeHtml(String(div)) + '</span>'
+      + '<span class="pill neu">BiasScore ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
+      + '<span class="pill neu">Quality ' + escapeHtml(String(quality)) + '/' + escapeHtml(String(qmin)) + '</span>'
+      + '<span class="pill neu">Conflict ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
+      + '<span class="pill neu">FlipDist ' + flipd.toFixed(3) + ' (min ' + flipmin.toFixed(3) + ')</span>'
+      + '<span class="pill neu">evidence ' + escapeHtml(String(evc)) + ' • sources ' + escapeHtml(String(div)) + '</span>'
       + '<span class="pill neu">fresh 0-2h ' + escapeHtml(String(fr["0-2h"]||0)) + ' • 2-8h ' + escapeHtml(String(fr["2-8h"]||0)) + '</span>'
       + (gate.event_mode ? '<span class="pill warn">RISK ON</span>' : '<span class="pill neu">RISK OFF</span>')
       + '</div>'
@@ -2427,51 +2405,36 @@ def dashboard():
       + '</div></div>';
 
     var drivers =
-      '<div class="panel"><div class="h2">Top drivers (why bias)</div><div class="list">'
+      '<div class="panel"><div class="h2">Top drivers</div><div class="list">'
       + (top.length ? top : [{why:'—'}]).map(function(x,i){
         return '<div class="item"><div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div></div>';
       }).join('')
       + '</div></div>';
 
-    // De-dup evidence by "why" (simple grouping)
-    function groupEvidence(items){
-      const map = {};
-      items.forEach(function(it){
-        const k = (it.why || '—');
-        if(!map[k]) map[k] = {why:k, items:[], net:0};
-        map[k].items.push(it);
-        map[k].net += Number(it.contrib || 0);
-      });
-      const arr = Object.keys(map).map(k=>map[k]);
-      arr.sort((a,b)=>Math.abs(b.net)-Math.abs(a.net));
-      return arr;
+    function fmtAge(mins){
+      mins = Number(mins||0);
+      if(mins >= 60) return Math.round(mins/60) + 'h';
+      return mins + 'm';
     }
-    const grouped = groupEvidence((why5||[]).slice(0,8));
 
     var src =
-      '<div class="panel"><div class="h2">Evidence (simple)</div><div class="list">'
-      + (grouped.length ? grouped.slice(0,5).map(function(g,gi){
-          const ex = g.items[0] || {};
-          const age = (ex.age_min!==undefined && ex.age_min!==null) ? (escapeHtml(String(ex.age_min)) + 'm') : '—';
-          const source = ex.source || '—';
-          const title = ex.title || '';
-          const link = ex.link || '';
-          const cnt = g.items.length;
-          if(VIEW_MODE === 'QUANT'){
-            return '<div class="item">'
-              + '<div class="t">' + (gi+1) + '. ' + escapeHtml(g.why) + ' <span class="pill neu">net ' + Number(g.net).toFixed(4) + '</span> <span class="pill neu">n ' + cnt + '</span></div>'
-              + '<div class="m"><span class="pill neu">src ' + escapeHtml(source) + '</span> <span class="pill neu">age ' + age + '</span> <span class="pill neu">contrib ' + escapeHtml(String(ex.contrib||0)) + '</span></div>'
-              + '<div class="m">' + escapeHtml(title) + '</div>'
-              + (link ? ('<div class="m"><a href="' + escapeHtml(link) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
-              + '</div>';
-          }
-          return '<div class="item">'
-            + '<div class="t">' + (gi+1) + '. ' + escapeHtml(g.why) + ' <span class="pill neu">n ' + cnt + '</span></div>'
-            + '<div class="m">' + escapeHtml(source) + ' • ' + age + ' ago</div>'
-            + '<div class="m">' + escapeHtml(title) + '</div>'
-            + (link ? ('<div class="m"><a href="' + escapeHtml(link) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
-            + '</div>';
-        }).join('') : '<div class="item"><div class="t">—</div></div>')
+      '<div class="panel"><div class="h2">Evidence (top 5)</div><div class="list">'
+      + (why5.length ? why5 : [{title:'—'}]).slice(0,5).map(function(x,i){
+        var l = x.link || '';
+        var w = (x.contrib!==undefined && x.contrib!==null) ? Number(x.contrib).toFixed(3) : '';
+        var age = (x.age_min!==undefined && x.age_min!==null) ? fmtAge(x.age_min) : '';
+        var src = x.source || '';
+        return '<div class="item">'
+               + '<div class="t">' + (i+1) + '. ' + escapeHtml(x.why || '—') + '</div>'
+               + '<div class="m">'
+               +   '<span class="pill neu">weight ' + escapeHtml(w) + '</span> '
+               +   '<span class="pill neu">age ' + escapeHtml(age) + '</span> '
+               +   '<span class="pill neu">src ' + escapeHtml(src) + '</span>'
+               + '</div>'
+               + '<div class="m">' + escapeHtml(x.title || '') + '</div>'
+               + (l ? ('<div class="m"><a href="' + escapeHtml(l) + '" target="_blank" rel="noopener">Open source</a></div>') : '')
+               + '</div>';
+      }).join('')
       + '</div></div>';
 
     var html = banner
@@ -2484,6 +2447,7 @@ def dashboard():
   function openMorning(){
     var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
     var upcoming = (ev.upcoming_events || []).slice(0, 12);
+    var ch = (ev.calendar_health || {});
 
     function evRow(x){
       const ts = x.ts ? x.ts : null;
@@ -2500,6 +2464,7 @@ def dashboard():
       '<div class="panel"><div class="h2">Morning</div><div class="list">'
       + '<div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>'
       + '<div class="item"><div class="t">Risk mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
+      + '<div class="item"><div class="t">Calendar parse health</div><div class="m">USD=' + escapeHtml(String(ch.usd||0)) + ', timed=' + escapeHtml(String(ch.timed||0)) + ', unknown_ccy=' + escapeHtml(String(ch.unknown_currency||0)) + '</div></div>'
       + '</div></div>'
       + '<div class="panel"><div class="h2">Upcoming events</div><div class="list">'
       + (upcoming.length ? upcoming.map(evRow).join('') : '<div class="item"><div class="t">—</div></div>')
@@ -2545,12 +2510,32 @@ def dashboard():
 
   buildMarqueeNews();
   buildMarqueeStatus();
-  renderMobileCards();
   setInterval(buildMarqueeNews, 120000);
 </script>
 </body>
 </html>
 """
+
+    def card(asset: str) -> str:
+        a = assets.get(asset, {}) or {}
+        bias = str(a.get("bias", "NEUTRAL"))
+        gate = a.get("ui_gate", {}) or {}
+        ok = bool(gate.get("ok", False))
+        short = _short_why(asset)
+
+        return f"""
+        <div class="sumCard">
+          <div class="sumTop">
+            <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
+              <span class="sym">{asset}</span>
+              {_pill_bias(bias)}
+              {_pill_gate(ok)}
+            </div>
+            <div><button class="btn" onclick="openView('{asset}')">View</button></div>
+          </div>
+          <div class="sumWhy">{short or "—"}</div>
+        </div>
+        """
 
     html = (TEMPLATE
         .replace("__UPDATED_SHORT__", str(updated_short))
@@ -2558,16 +2543,20 @@ def dashboard():
         .replace("__EVENT_REASON_H__", str(reason_txt))
         .replace("__NEXT_EVENT__", str(next_event_line))
         .replace("__NEXT_EVENT_SRC__", (f"source={next_event_src}" if next_event_src else ""))
+        .replace("__CAL_HEALTH__", str(cal_health_badge))
         .replace("__EV_CHIP__", ev_chip)
         .replace("__TR_CHIP__", tr_chip)
         .replace("__FEEDS_CHIP__", fd_chip)
         .replace("__FRED_CHIP__", fr_chip)
         .replace("__RUN_CHIP__", rn_chip)
-        .replace("__LG_CHIP__", lg_chip)
+        .replace("__LEGEND_CHIP__", lg_chip)
         .replace("__DIAG_CHIP__", dg_chip)
         .replace("__ROW_XAU__", row("XAU"))
         .replace("__ROW_US500__", row("US500"))
         .replace("__ROW_WTI__", row("WTI"))
+        .replace("__CARD_XAU__", card("XAU"))
+        .replace("__CARD_US500__", card("US500"))
+        .replace("__CARD_WTI__", card("WTI"))
         .replace("__JS_PAYLOAD__", js_payload)
         .replace("__TV_SYMBOLS__", tv_symbols)
     )

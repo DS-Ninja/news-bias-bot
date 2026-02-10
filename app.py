@@ -1,12 +1,8 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-10b:
-# ✅ iPhone-friendly: SUMMARY becomes cards on narrow screens; WHY never “vertical spaghetti”
-# ✅ Human labels: Q2->Quality, C->Conflict, score->BiasScore, th->Threshold, flip->FlipDist
-# ✅ Next event FIX: smart fallback if USD currency not parsed; shows best timed event anyway
-# ✅ Calendar parse health: shows USD-count + unknown-currency count; improves trust
-# ✅ VIEW evidence cleaned: less noise, better spacing, fewer repeated badges 
-# ✅ Added extra RSS feeds (S&P DJI, Nasdaq, WSJ, InvestingLive, Feedburner)
+# UPDATED v2026-02-10c:
+# ✅ FIX: dashboard JS no longer breaks on RSS titles (safe Base64 embed for PAYLOAD + TV symbols)
+# ✅ Keeps: iPhone-friendly cards, human labels, smart next event, calendar parse health, cleaned evidence, extra feeds
 
 import os
 import json
@@ -15,6 +11,7 @@ import re
 import hashlib
 import math
 import calendar as pycalendar
+import base64
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
@@ -387,6 +384,14 @@ def log_alert(kind: str, message: str, asset: Optional[str] = None, severity: st
 # ============================================================
 # HELPERS
 # ============================================================
+
+def _json_b64(obj: Any) -> str:
+    """
+    Safe embedding for HTML <script>:
+    - Avoids breaking out of script if RSS titles contain </script> or U+2028/U+2029 etc.
+    """
+    raw = json.dumps(obj, ensure_ascii=False, separators=(",", ":"))
+    return base64.b64encode(raw.encode("utf-8")).decode("ascii")
 
 def fingerprint(title: str, link: str) -> str:
     s = (title or "").strip() + "||" + (link or "").strip()
@@ -1869,8 +1874,9 @@ def dashboard():
         </tr>
         """
 
-    js_payload = json.dumps(payload, ensure_ascii=False)
-    tv_symbols = json.dumps(TV_TICKER_SYMBOLS, ensure_ascii=False)
+    # === SAFE EMBED (Base64) ===
+    js_payload_b64 = _json_b64(payload)
+    tv_symbols_b64 = _json_b64(TV_TICKER_SYMBOLS)
 
     updated_short = updated.replace("T", " ").replace("+00:00", " UTC")
     if len(updated_short) > 22:
@@ -1999,9 +2005,7 @@ def dashboard():
     .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
     .mini .pill{font-size:11px; padding:5px 9px;}
 
-    /* === iPhone-friendly SUMMARY ===
-       On small screens: hide table and show cards (no horizontal scroll needed).
-    */
+    /* === iPhone-friendly SUMMARY === */
     .sumCards{display:none;}
     .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
     .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
@@ -2069,7 +2073,7 @@ def dashboard():
         <div class="tradingview-widget-container">
           <div class="tradingview-widget-container__widget"></div>
           <script type="text/javascript" src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
-          { "symbols": __TV_SYMBOLS__, "showSymbolLogo": true, "isTransparent": true, "displayMode": "adaptive",
+          { "symbols": JSON.parse(atob("__TV_SYMBOLS_B64__")), "showSymbolLogo": true, "isTransparent": true, "displayMode": "adaptive",
             "colorTheme": "dark", "locale": "en" }
           </script>
         </div>
@@ -2094,7 +2098,6 @@ def dashboard():
   <div class="panel">
     <div class="blockTitle">SUMMARY</div>
 
-    <!-- Desktop/tablet table -->
     <div class="tablewrap">
       <table>
         <colgroup>
@@ -2109,7 +2112,6 @@ def dashboard():
       </table>
     </div>
 
-    <!-- iPhone cards -->
     <div class="sumCards">
       __CARD_XAU__
       __CARD_US500__
@@ -2131,7 +2133,7 @@ def dashboard():
 </div>
 
 <script>
-  const PAYLOAD = __JS_PAYLOAD__;
+  const PAYLOAD = JSON.parse(atob("__JS_PAYLOAD_B64__"));
   const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
   const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
 
@@ -2557,7 +2559,7 @@ def dashboard():
         .replace("__CARD_XAU__", card("XAU"))
         .replace("__CARD_US500__", card("US500"))
         .replace("__CARD_WTI__", card("WTI"))
-        .replace("__JS_PAYLOAD__", js_payload)
-        .replace("__TV_SYMBOLS__", tv_symbols)
+        .replace("__JS_PAYLOAD_B64__", js_payload_b64)
+        .replace("__TV_SYMBOLS_B64__", tv_symbols_b64)
     )
     return HTMLResponse(html)

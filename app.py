@@ -1,11 +1,13 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-10d (FULL FIX / TOKEN REMOVED):
-# ✅ Fixed broken indentation + duplicate pipeline_run() calls in /run endpoints
-# ✅ Token auth fully DISABLED (no RUN_TOKEN / RUN_TOKENS required)
-# ✅ /health + payload meta always report run_token_required=false
-# ✅ Added simple /run cooldown (default 60s) to avoid abuse (RUN_COOLDOWN_SEC env)
-# ✅ Keeps your XSS-safe JSON injection and other robustness
+# UPDATED v2026-02-10d (FULL FIX):
+# ✅ FIXED: DB connection leak when pool is unavailable (db_put now closes non-pooled conns)
+# ✅ FIXED: /run GET/POST indentation + duplicate lines
+# ✅ FIXED: /run auth implemented (open if no token; constant-time compare if locked)
+# ✅ FIXED: /run rejects BEFORE heavy pipeline_run()
+# ✅ Added shutdown hook to close pool
+# ✅ Keeps XSS-safe payload injection (</script> hardened)
+# ✅ /run POST returns meta-only (lighter + consistent)
 
 import os
 import json
@@ -109,11 +111,25 @@ FRED_SERIES = {
     "BAA10Y":   {"name": "BAA-10Y Spread", "freq": "d"},
 }
 
-# ============================================================
-# RUN TOKEN — DISABLED (you asked to remove it)
-# ============================================================
+# RUN token
+# - RUN_TOKEN: single token (legacy)
+# - RUN_TOKENS: comma-separated list (new)
+RUN_TOKEN = os.environ.get("RUN_TOKEN", "").strip()
+RUN_TOKENS_RAW = os.environ.get("RUN_TOKENS", "").strip()
 RUN_TOKENS: List[str] = []
-RUN_TOKEN_HASHES: List[str] = []
+if RUN_TOKEN:
+    RUN_TOKENS.append(RUN_TOKEN)
+if RUN_TOKENS_RAW:
+    RUN_TOKENS.extend([x.strip() for x in RUN_TOKENS_RAW.split(",") if x.strip()])
+
+# de-dup while preserving order
+_seen = set()
+RUN_TOKENS = [t for t in RUN_TOKENS if not (t in _seen or _seen.add(t))]
+
+def _token_hash(t: str) -> str:
+    return hashlib.sha1((t or "").encode("utf-8", errors="ignore")).hexdigest()[:10]
+
+RUN_TOKEN_HASHES = [_token_hash(t) for t in RUN_TOKENS]
 
 # MyFXBook widget iframe
 MYFXBOOK_IFRAME_SRC = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
@@ -257,7 +273,7 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 }
 
 # ============================================================
-# DB (with optional pooling)
+# DB (FIXED: no-POOL connection leak + graceful shutdown)
 # ============================================================
 
 _DB_POOL: Optional[Any] = None
@@ -272,13 +288,13 @@ def _make_dsn() -> str:
     db = os.environ.get("PGDATABASE", "postgres")
     user = os.environ.get("PGUSER", "postgres")
     pwd = os.environ.get("PGPASSWORD", "")
-    dsn = f"host={host} port={port} dbname={db} user={user} password={pwd}"
-    return dsn
+    return f"host={host} port={port} dbname={db} user={user} password={pwd}"
 
 def _get_pool():
     global _DB_POOL
     if _DB_POOL is not None:
         return _DB_POOL
+
     if SimpleConnectionPool is None:
         _DB_POOL = None
         return None
@@ -286,6 +302,7 @@ def _get_pool():
     dsn = _make_dsn()
     maxconn = int(os.environ.get("PGPOOL_MAXCONN", "6"))
     minconn = int(os.environ.get("PGPOOL_MINCONN", "1"))
+
     try:
         _DB_POOL = SimpleConnectionPool(minconn=minconn, maxconn=maxconn, dsn=dsn)
     except Exception:
@@ -296,14 +313,38 @@ def db_conn():
     pool = _get_pool()
     if pool is not None:
         return pool.getconn()
-    dsn = _make_dsn()
-    return psycopg2.connect(dsn)
+    return psycopg2.connect(_make_dsn())
 
 def db_put(conn):
+    """
+    IMPORTANT:
+    - if pooled: return to pool
+    - if not pooled: CLOSE connection (fixes leak)
+    """
+    if conn is None:
+        return
     pool = _get_pool()
     if pool is not None:
         try:
             pool.putconn(conn)
+        except Exception:
+            try:
+                conn.close()
+            except Exception:
+                pass
+    else:
+        try:
+            conn.close()
+        except Exception:
+            pass
+
+def db_close_pool():
+    global _DB_POOL
+    pool = _DB_POOL
+    _DB_POOL = None
+    if pool is not None:
+        try:
+            pool.closeall()
         except Exception:
             pass
 
@@ -395,6 +436,7 @@ def save_bias(payload: Dict[str, Any]):
 
 def load_bias() -> Optional[dict]:
     conn = db_conn()
+    row = None
     try:
         with conn.cursor() as cur:
             cur.execute("SELECT updated_ts, payload_json FROM bias_state WHERE id=1;")
@@ -530,8 +572,9 @@ def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
     return True, "OK"
 
 def _run_token_status() -> Tuple[bool, str]:
-    # token removed
-    return False, "Open (token removed)"
+    if not RUN_TOKENS:
+        return False, "Open (no token required)"
+    return True, f"Locked (token required). expected_hash={','.join(RUN_TOKEN_HASHES) or '—'}"
 
 def _fmt_hhmm_utc(ts: int) -> str:
     return datetime.fromtimestamp(int(ts), tz=timezone.utc).strftime("%Y-%m-%d %H:%M UTC")
@@ -718,6 +761,7 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     currency = _get_entry_field(e, ["currency", "ccy", "cur", "ff_currency"])
     impact = _get_entry_field(e, ["impact", "importance", "ff_impact", "volatility"])
 
+    # tags/categories often contain USD, High, etc.
     if not currency:
         tags = e.get("tags") or e.get("categories") or []
         try:
@@ -1364,9 +1408,8 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
                 "requests_present": bool(requests is not None),
             },
             "trump": trump,
-            # token removed:
-            "run_token_required": False,
-            "run_token_hashes": [],
+            "run_token_required": bool(RUN_TOKENS),
+            "run_token_hashes": RUN_TOKEN_HASHES,
         },
         "event": {
             "enabled": bool(EVENT_CFG["enabled"]),
@@ -1579,6 +1622,7 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
         "fail_short": fail_short[:3],
         "must_change": must[:4],
 
+        # numeric context for UI (summary + view)
         "bias": bias,
         "quality": quality, "quality_min": qmin,
         "conflict": conflict, "conflict_max": cmax,
@@ -1595,6 +1639,10 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
 
 app = FastAPI(title="News Bias // Terminal")
 
+@app.on_event("shutdown")
+def _on_shutdown():
+    db_close_pool()
+
 @app.get("/", include_in_schema=False)
 def root():
     return RedirectResponse(url="/dashboard", status_code=302)
@@ -1607,9 +1655,8 @@ def health(pretty: int = 0):
         "trump_enabled": bool(TRUMP_ENABLED),
         "fred_enabled": bool(FRED_CFG.get("enabled") and bool(FRED_CFG.get("api_key")) and requests is not None),
         "calendar_sources": list(CALENDAR_FEEDS),
-        # token removed:
-        "run_token_required": False,
-        "run_token_hashes": [],
+        "run_token_required": bool(RUN_TOKENS),
+        "run_token_hashes": RUN_TOKEN_HASHES,
         "db_pooling": bool(_get_pool() is not None),
     }
     if pretty:
@@ -1624,9 +1671,8 @@ def diag_json():
         "PGSSLMODE": os.environ.get("PGSSLMODE", "prefer"),
         "FRED_enabled": bool(FRED_CFG["enabled"]),
         "requests_present": bool(requests is not None),
-        # token removed:
-        "RUN_token_required": False,
-        "RUN_token_hashes": [],
+        "RUN_token_required": bool(RUN_TOKENS),
+        "RUN_token_hashes": RUN_TOKEN_HASHES,
         "db_pooling": bool(_get_pool() is not None),
         "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "6"),
     }
@@ -1701,30 +1747,43 @@ def bias(pretty: int = 0):
         return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
     return JSONResponse(state)
 
-# ============================================================
-# /run (TOKEN DISABLED) + COOLDOWN
-# ============================================================
+# ---------------------------
+# RUN auth (FIXED)
+# ---------------------------
 
-LAST_RUN_TS = 0
-RUN_COOLDOWN_SEC = int(os.environ.get("RUN_COOLDOWN_SEC", "60"))
+def _pick_token(query_token: str, header_token: Optional[str]) -> str:
+    t = (query_token or "").strip()
+    if t:
+        return t
+    return (header_token or "").strip()
 
-def _cooldown_guard() -> Optional[JSONResponse]:
-    global LAST_RUN_TS
-    now = int(time.time())
-    if (now - LAST_RUN_TS) < RUN_COOLDOWN_SEC:
-        left = RUN_COOLDOWN_SEC - (now - LAST_RUN_TS)
-        return JSONResponse(
-            {"ok": False, "error": f"cooldown ({RUN_COOLDOWN_SEC}s)", "retry_in_sec": int(left)},
-            status_code=429
-        )
-    LAST_RUN_TS = now
-    return None
+def _auth_run(token: str) -> bool:
+    """
+    If RUN_TOKENS empty -> open.
+    Else token must match any allowed token, using constant-time compare.
+    """
+    if not RUN_TOKENS:
+        return True
+    t = (token or "").strip()
+    if not t:
+        return False
+    for allowed in RUN_TOKENS:
+        if hmac.compare_digest(t, allowed):
+            return True
+    return False
+
+def _unauth_response():
+    return JSONResponse(
+        {"ok": False, "error": "unauthorized", "expected_hash": RUN_TOKEN_HASHES},
+        status_code=401
+    )
 
 @app.get("/run")
 def run_get(token: str = "", x_run_token: Optional[str] = Header(default=None)):
-    cd = _cooldown_guard()
-    if cd:
-        return cd
+    t = _pick_token(token, x_run_token)
+    if not _auth_run(t):
+        return _unauth_response()
+
     try:
         payload = pipeline_run()
         return JSONResponse({"ok": True, "updated_utc": payload.get("updated_utc"), "meta": payload.get("meta", {})})
@@ -1733,9 +1792,10 @@ def run_get(token: str = "", x_run_token: Optional[str] = Header(default=None)):
 
 @app.post("/run")
 def run_post(token: str = "", x_run_token: Optional[str] = Header(default=None)):
-    cd = _cooldown_guard()
-    if cd:
-        return cd
+    t = _pick_token(token, x_run_token)
+    if not _auth_run(t):
+        return _unauth_response()
+
     try:
         payload = pipeline_run()
         return JSONResponse({"ok": True, "updated_utc": payload.get("updated_utc"), "meta": payload.get("meta", {})})
@@ -1873,7 +1933,7 @@ def dashboard():
     feeds_ok = feeds_ok_ratio >= float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
 
     fred_on, fred_why = _fred_status(meta.get("fred", {}) or {})
-    token_required, token_why = _run_token_status()
+    token_required, _token_why = _run_token_status()
 
     for sym in ASSETS:
         a = assets.get(sym, {}) or {}
@@ -1900,8 +1960,8 @@ def dashboard():
     fr_chip = _chip("MACRO", ("ON" if fred_on else "OFF"), "neu",
                     "Macro drivers (FRED). OFF reason: " + fred_why + ". Click for details.", "macro")
 
-    rn_chip = _chip("RUN", ("OPEN"), "neu",
-                    "Refresh pipeline access. Token removed (public). Click for details.", "run")
+    rn_chip = _chip("RUN", ("LOCKED" if token_required else "OPEN"), "neu",
+                    "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
 
     lg_chip = _chip("LEGEND", "?", "neu",
                     "Explain what Quality/Conflict/BiasScore/Threshold/FlipDist mean (simple language).", "legend")
@@ -2017,6 +2077,7 @@ def dashboard():
     .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
 
+    /* Table stability */
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900; text-align:left;}
@@ -2042,6 +2103,7 @@ def dashboard():
       margin:0 0 8px 2px;
     }
 
+    /* Tickers */
     .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
     .ticklabel{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 6px 2px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -2054,6 +2116,7 @@ def dashboard():
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
 
+    /* Modal */
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
@@ -2070,6 +2133,7 @@ def dashboard():
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
 
+    /* View emphasis */
     .banner{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
     .bannerTop{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
     .big{font-family:var(--mono); font-weight:900; letter-spacing:.8px; font-size:14px;}
@@ -2080,6 +2144,7 @@ def dashboard():
     .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
     .mini .pill{font-size:11px; padding:5px 9px;}
 
+    /* === iPhone-friendly SUMMARY === */
     .sumCards{display:none;}
     .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
     .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
@@ -2211,8 +2276,9 @@ def dashboard():
 
 <script>
   const PAYLOAD = JSON.parse(document.getElementById('payloadJson').textContent || '{}');
-  const RUN_TOKEN_REQUIRED = false;
-  const EXPECTED_HASH = [];
+  const RUN_TOKEN_REQUIRED = !!(PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_required);
+
+  const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
 
   function $(id){ return document.getElementById(id); }
   function escapeHtml(s){
@@ -2229,22 +2295,38 @@ def dashboard():
 
   function clearSavedToken(){
     localStorage.removeItem('run_token');
-    showModal('RUN TOKEN', '<div class="panel"><div class="h2">Cleared</div><div class="list"><div class="item"><div class="t">Saved token removed</div><div class="m">Token is not used anymore.</div></div></div></div>');
+    showModal('RUN TOKEN', '<div class="panel"><div class="h2">Cleared</div><div class="list"><div class="item"><div class="t">Saved token removed</div><div class="m">Next RUN will prompt again.</div></div></div></div>');
   }
 
-  function getRunToken(){ return ''; }
+  function getRunToken(){
+    if(!RUN_TOKEN_REQUIRED) return '';
+    var t = localStorage.getItem('run_token') || '';
+    if(!t){
+      const hint = (EXPECTED_HASH && EXPECTED_HASH.length) ? ('expected_hash=' + EXPECTED_HASH.join(',')) : '';
+      t = prompt('RUN_TOKEN is required. Paste token. ' + hint) || '';
+      t = (t || '').trim();
+      if(t) localStorage.setItem('run_token', t);
+    }
+    return (t || '').trim();
+  }
 
   async function runNow(){
     try{
-      var resp = await fetch('/run', { method:'POST' });
+      var token = getRunToken();
+      var headers = token ? { 'X-Run-Token': token } : {};
+      var resp = await fetch('/run', { method:'POST', headers: headers });
       var js = await resp.json();
 
-      if(resp.status === 429){
-        showModal('RUN COOLDOWN', '<div class="panel"><div class="h2">Cooldown</div><div class="list"><div class="item"><div class="t">'
-          + escapeHtml(js.error || 'cooldown') + '</div><div class="m">retry_in_sec=' + escapeHtml(String(js.retry_in_sec||'')) + '</div></div></div></div>');
+      if(resp.status === 401){
+        showModal('RUN UNAUTHORIZED', ''
+          + '<div class="panel">'
+          + '<div class="h2">Token mismatch</div>'
+          + '<div class="list">'
+          + '<div class="item"><div class="t">Server expects hash</div><div class="m">' + escapeHtml((js.expected_hash||EXPECTED_HASH||[]).join(',')) + '</div></div>'
+          + '<div class="item"><div class="t">Fix</div><div class="m">Click "Clear saved token", then RUN again and paste correct token.</div></div>'
+          + '</div></div>');
         return;
       }
-
       if(js && js.ok === false && js.error){
         showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
         return;
@@ -2292,7 +2374,7 @@ def dashboard():
     const feeds = (meta.feeds_status || {});
     const fred = (meta.fred || {});
     const trump = (meta.trump || {});
-    const tokenReq = false;
+    const tokenReq = !!meta.run_token_required;
     const cal = (ev.calendar_health || {});
 
     let title = 'INFO';
@@ -2396,8 +2478,12 @@ def dashboard():
       title = 'RUN (refresh access)';
       body =
         '<div class="panel"><div class="h2">What it means</div><div class="list">'
-        + '<div class="item"><div class="t">OPEN</div><div class="m">/run is public. Token removed.</div></div>'
-        + '<div class="item"><div class="t">Cooldown</div><div class="m">Server enforces cooldown to avoid spam.</div></div>'
+        + '<div class="item"><div class="t">LOCKED</div><div class="m">/run requires token (prevents abuse).</div></div>'
+        + '<div class="item"><div class="t">OPEN</div><div class="m">/run is public.</div></div>'
+        + '</div></div>'
+        + '<div class="panel"><div class="h2">Now</div><div class="list">'
+        + '<div class="item"><div class="t">token_required</div><div class="m">' + escapeHtml(tokenReq ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">Tip</div><div class="m">If locked, Clear saved token then RUN and paste correct token.</div></div>'
         + '</div></div>';
     }
 

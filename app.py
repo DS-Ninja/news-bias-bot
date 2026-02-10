@@ -34,7 +34,7 @@ try:
 except Exception:
     requests = None  # graceful: FRED disabled if requests missing
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 
 # ============================================================
@@ -1732,9 +1732,16 @@ def _auth_run(token: str) -> bool:
             return True
     return False
 
+    def _pick_token(query_token: str, header_token: Optional[str]) -> str:
+    t = (query_token or "").strip()
+    if t:
+        return t
+    return (header_token or "").strip()
+
 @app.get("/run")
-def run_get(token: str = ""):
-    if not _auth_run(token):
+def run_get(token: str = "", x_run_token: Optional[str] = Header(default=None)):
+    tok = _pick_token(token, x_run_token)
+    if not _auth_run(tok):
         return JSONResponse({"ok": False, "error": "unauthorized (token mismatch)", "expected_hash": RUN_TOKEN_HASHES}, status_code=401)
     try:
         payload = pipeline_run()
@@ -1743,13 +1750,13 @@ def run_get(token: str = ""):
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
 @app.post("/run")
-def run_post(token: str = ""):
-    # meta-only (lighter + consistent)
-    if not _auth_run(token):
+def run_post(token: str = "", x_run_token: Optional[str] = Header(default=None)):
+    tok = _pick_token(token, x_run_token)
+    if not _auth_run(tok):
         return JSONResponse({"ok": False, "error": "unauthorized (token mismatch)", "expected_hash": RUN_TOKEN_HASHES}, status_code=401)
     try:
         payload = pipeline_run()
-        return JSONResponse({"ok": True, "updated_utc": payload.get("updated_utc"), "meta": payload.get("meta", {})})
+        return JSONResponse(payload)
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 
@@ -2265,8 +2272,8 @@ def dashboard():
   async function runNow(){
     try{
       var token = getRunToken();
-      var url = token ? ('/run?token=' + encodeURIComponent(token)) : '/run';
-      var resp = await fetch(url, { method:'POST' });
+      var headers = token ? { 'X-Run-Token': token } : {};
+      var resp = await fetch('/run', { method:'POST', headers: headers });
       var js = await resp.json();
 
       if(resp.status === 401){

@@ -1732,7 +1732,8 @@ def _auth_run(token: str) -> bool:
             return True
     return False
 
-    def _pick_token(query_token: str, header_token: Optional[str]) -> str:
+
+def _pick_token(query_token: str, header_token: Optional[str]) -> str:
     t = (query_token or "").strip()
     if t:
         return t
@@ -1756,7 +1757,7 @@ def run_post(token: str = "", x_run_token: Optional[str] = Header(default=None))
         return JSONResponse({"ok": False, "error": "unauthorized (token mismatch)", "expected_hash": RUN_TOKEN_HASHES}, status_code=401)
     try:
         payload = pipeline_run()
-        return JSONResponse(payload)
+        return JSONResponse({"ok": True, "updated_utc": payload.get("updated_utc"), "meta": payload.get("meta", {})})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
 

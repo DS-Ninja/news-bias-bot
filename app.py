@@ -165,6 +165,22 @@ RSS_FEEDS: Dict[str, str] = {
     "FOREXFACTORY_CALENDAR": "https://nfs.faireconomy.media/ff_calendar_thisweek.xml",
     "MYFX_CAL": "https://www.myfxbook.com/rss/forex-economic-calendar-events",
 
+    # ───────────── US500 extra (S&P DJI + Nasdaq + Investing + WSJ/DJ Markets) ─────────────
+    "SPDJI_METHODOLOGIES": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=methodologies",
+    "SPDJI_PERFORMANCE":   "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=performance-reports",
+
+    "NASDAQ_STOCKS":   "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
+    "NASDAQ_EARNINGS": "https://www.nasdaq.com/feed/rssoutbound?category=Earnings",
+    "NASDAQ_ORIGINAL": "https://www.nasdaq.com/feed/nasdaq-original/rss.xml",
+    "NASDAQ_AI":       "https://www.nasdaq.com/feed/rssoutbound?category=Artificial+Intelligence",
+
+    "FEEDBURNER_INVESTING": "https://feeds.feedburner.com/InvestingRss",
+    "FEEDBURNER_ECONOMY":   "https://feeds.feedburner.com/EconomyRss",
+    "INVESTINGLIVE":        "https://investinglive.com/feed",
+
+    "DJ_WSJ_US_BUSINESS":   "https://feeds.content.dowjones.io/public/rss/WSJcomUSBusiness",
+    "DJ_MARKETS_MAIN":      "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+    
     # Myfxbook news/community
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "MYFX_COMM": "https://www.myfxbook.com/rss/forex-community-recent-topics",
@@ -200,6 +216,27 @@ SOURCE_WEIGHT: Dict[str, float] = {
     "MYFX_NEWS": 1.15,
     "MYFX_COMM": 0.55,
 
+        # S&P DJI (methodologies/performance reports): очень “тяжёлый” по фактам, но это не trade-news,
+    # поэтому вес высокий, но не максимальный
+    "SPDJI_METHODOLOGIES": 1.6,
+    "SPDJI_PERFORMANCE":   1.7,
+
+    # Nasdaq: обычно быстро и по делу, но встречается PR/обзорность
+    "NASDAQ_STOCKS":   1.25,
+    "NASDAQ_EARNINGS": 1.35,
+    "NASDAQ_ORIGINAL": 1.15,
+    "NASDAQ_AI":       1.05,
+
+    # Feedburner/Investing/InvestingLive: полезно, но больше шума/перепечаток
+    "FEEDBURNER_INVESTING": 0.95,
+    "FEEDBURNER_ECONOMY":   1.00,
+    "INVESTINGLIVE":        0.90,
+
+    # Dow Jones / WSJ feeds: качественный слой (но paywall не мешает заголовкам)
+    "DJ_WSJ_US_BUSINESS": 1.35,
+    "DJ_MARKETS_MAIN":    1.40,
+
+    
     "FRED": 1.0,
 }
 
@@ -219,6 +256,9 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
         (r"\b(rate cut|dovish|easing)\b", +0.5, "Easing supports risk assets"),
         (r"\b(risk-off|selloff|panic|crash)\b", -0.7, "Risk-off headlines"),
         (r"\b(rally|rebound|risk-on)\b", +0.3, "Risk-on tape"),
+        (r"\b(antitrust|doj|sec|regulator|investigation|probe)\b", -0.5, "Regulatory/legal pressure (risk-off)"),
+        (r"\b(ai|artificial intelligence|chip|semiconductor|nvda|nvidia)\b", +0.2, "AI/semis risk-on impulse (context-dependent)"),
+        (r"\b(job cuts|layoffs)\b", -0.2, "Layoffs headline (can be mixed; default slightly risk-off)"),
         (r"\b(vix spikes|volatility spikes)\b", -0.6, "Volatility spike (risk-off)"),
     ],
     "WTI": [

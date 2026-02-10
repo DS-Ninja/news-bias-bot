@@ -5,7 +5,7 @@
 # ✅ Human labels: Q2->Quality, C->Conflict, score->BiasScore, th->Threshold, flip->FlipDist
 # ✅ Next event FIX: smart fallback if USD currency not parsed; shows best timed event anyway
 # ✅ Calendar parse health: shows USD-count + unknown-currency count; improves trust
-# ✅ VIEW evidence cleaned: less noise, better spacing, fewer repeated badges
+# ✅ VIEW evidence cleaned: less noise, better spacing, fewer repeated badges 
 # ✅ Added extra RSS feeds (S&P DJI, Nasdaq, WSJ, InvestingLive, Feedburner)
 
 import os

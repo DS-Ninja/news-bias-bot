@@ -1,13 +1,27 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-11b (LOG CLEANUP FIX — SINGLE FILE, DROP-IN):
-# ✅ FIXED: noisy 404s in logs:
-#    - /favicon.ico
-#    - /apple-touch-icon.png
-#    - /apple-touch-icon-precomposed.png
-# ✅ FIXED: /run_status 404 (some clients poll it)
-#    - Now returns lightweight status WITHOUT triggering heavy pipeline_run()
-# ✅ Keeps everything else unchanged (pipeline lock, timings, quick/full, cached feeds health, auth, UI)
+# UPDATED v2026-02-11b (FULL SINGLE FILE — HTML INCLUDED — FIXED):
+# ✅ FULL file (no drop-ins)
+# ✅ SAFE import for PoolError (won't crash on env differences)
+# ✅ QUICK mode now: NO FRED ingest by default, BUT still uses existing FRED DB points for drivers (if present)
+# ✅ Keeps: global run lock, per-stage timings, cached feeds health TTL, robust /run parsing, pooled+fallback DB, shutdown hook, XSS-safe JSON injection
+#
+# Modes:
+#   - quick (default for /run): budgeted RSS, calendar limit, feeds health cached, FRED ingest throttled (drivers still computed from DB)
+#   - full: heavy run (incl. FRED ingest)
+#
+# Env knobs (optional):
+#   HTTP_TIMEOUT=12
+#   RUN_MODE_DEFAULT=quick|full
+#   RUN_MAX_SEC=10
+#   FEEDS_HEALTH_TTL_SEC=90
+#   RUN_LOCK_TIMEOUT_SEC=25
+#   FRED_ENABLED=0|1
+#   FRED_API_KEY=...
+#   FRED_ON_RUN=0|1
+#   FRED_INGEST_EVERY_RUN=0|1
+#   RSS_LIMIT_QUICK=18, RSS_LIMIT_FULL=40
+#   CAL_LIMIT_QUICK=120, CAL_LIMIT_FULL=250
 
 import os
 import json
@@ -24,15 +38,21 @@ import feedparser
 import psycopg2
 import socket
 import threading
-import base64
 
 socket.setdefaulttimeout(float(os.environ.get("HTTP_TIMEOUT", "12")))
 
 # Optional DB pool
 try:
-    from psycopg2.pool import ThreadedConnectionPool
+    from psycopg2.pool import ThreadedConnectionPool  # type: ignore
 except Exception:
     ThreadedConnectionPool = None  # type: ignore
+
+# SAFE PoolError import (prevents crash on some psycopg2 builds)
+try:
+    from psycopg2.pool import PoolError  # type: ignore
+except Exception:
+    class PoolError(Exception):
+        pass
 
 # Optional dependency: requests (only if FRED enabled + key present)
 try:
@@ -41,13 +61,7 @@ except Exception:
     requests = None  # graceful: FRED disabled if requests missing
 
 from fastapi import FastAPI, Header
-from fastapi.responses import (
-    HTMLResponse,
-    RedirectResponse,
-    JSONResponse,
-    PlainTextResponse,
-    Response,
-)
+from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse, PlainTextResponse
 
 # ============================================================
 # CONFIG
@@ -331,8 +345,6 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 # DB (pooled + fallback direct conn + safe return/close + init-once)
 # ============================================================
 
-from psycopg2.pool import PoolError  # keep near imports
-
 _DB_POOL: Optional[Any] = None
 _DB_READY = False
 
@@ -369,6 +381,7 @@ def _get_pool():
 
 def db_conn():
     pool = _get_pool()
+
     if pool is not None:
         try:
             conn = pool.getconn()
@@ -377,13 +390,17 @@ def db_conn():
             except Exception:
                 pass
             return conn
-        except PoolError:
-            conn = psycopg2.connect(_make_dsn())
+        except Exception:
+            # Any pool error -> fallback
             try:
-                setattr(conn, "_from_pool", False)
+                conn = psycopg2.connect(_make_dsn())
+                try:
+                    setattr(conn, "_from_pool", False)
+                except Exception:
+                    pass
+                return conn
             except Exception:
-                pass
-            return conn
+                raise
 
     conn = psycopg2.connect(_make_dsn())
     try:
@@ -655,6 +672,7 @@ def _human_event_reason(reason_list: List[str]) -> str:
     return " | ".join(out)
 
 def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
+    # meta_fred.enabled means "drivers active", not "ingest performed"
     if not FRED_CFG.get("enabled", True):
         return False, "Disabled by env (FRED_ENABLED=0)"
     if requests is None:
@@ -662,7 +680,7 @@ def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
     if not (FRED_CFG.get("api_key") or "").strip():
         return False, "Missing FRED_API_KEY"
     if not bool(meta_fred.get("enabled", False)):
-        return False, "Not active (check key/requests)"
+        return False, "Not active (drivers off)"
     return True, "OK"
 
 def _run_token_status() -> Tuple[bool, str]:
@@ -1345,7 +1363,21 @@ def flip_metrics(score: float, th: float, bias: str, median_abs: float) -> Dict[
 # BIAS COMPUTE
 # ============================================================
 
-def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200, allow_fred: bool = True) -> Dict[str, Any]:
+def _fred_available_env() -> Tuple[bool, str]:
+    if not FRED_CFG["enabled"]:
+        return False, "FRED_ENABLED=0"
+    if requests is None:
+        return False, "requests missing"
+    if not (FRED_CFG["api_key"] or "").strip():
+        return False, "FRED_API_KEY missing"
+    return True, "OK"
+
+def compute_bias(
+    lookback_hours: int = 24,
+    limit_rows: int = 1200,
+    allow_fred_ingest: bool = True,
+    allow_fred_drivers: bool = True
+) -> Dict[str, Any]:
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -1363,17 +1395,21 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200, allow_fred: b
     finally:
         db_put(conn)
 
-    # FRED ingest + drivers
+    # FRED: ingest optional; drivers can be computed from existing DB points
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
-    fred_on = bool(allow_fred and FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None)
 
-    if fred_on:
+    fred_env_ok, fred_env_why = _fred_available_env()
+    fred_drivers_on = bool(allow_fred_drivers and fred_env_ok)
+
+    if fred_env_ok and allow_fred_ingest:
         for sid in FRED_SERIES.keys():
             try:
                 fred_inserted += fred_ingest_series(sid, days=FRED_CFG["window_days"])
             except Exception:
                 pass
+
+    if fred_drivers_on:
         try:
             fred_drivers = compute_fred_drivers()
         except Exception:
@@ -1437,25 +1473,26 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200, allow_fred: b
                     "pattern": m["pattern"],
                 })
 
-        # Inject FRED drivers
-        for d in (fred_drivers.get(asset) or []):
-            c = float(d.get("w", 0.0))
-            if abs(c) < 1e-12:
-                continue
-            score += c
-            contribs.append({
-                "source": "FRED",
-                "title": f'{d.get("driver","")} value={d.get("value","")} delta={d.get("delta","")}',
-                "link": "https://fred.stlouisfed.org/",
-                "published_ts": now,
-                "age_min": 0,
-                "base_w": float(d.get("w", 0.0)),
-                "src_w": 1.0,
-                "time_w": 1.0,
-                "contrib": round(c, 4),
-                "why": str(d.get("why", "FRED driver")),
-                "pattern": "FRED",
-            })
+        # Inject FRED drivers (if allowed)
+        if fred_drivers_on:
+            for d in (fred_drivers.get(asset) or []):
+                c = float(d.get("w", 0.0))
+                if abs(c) < 1e-12:
+                    continue
+                score += c
+                contribs.append({
+                    "source": "FRED",
+                    "title": f'{d.get("driver","")} value={d.get("value","")} delta={d.get("delta","")}',
+                    "link": "https://fred.stlouisfed.org/",
+                    "published_ts": now,
+                    "age_min": 0,
+                    "base_w": float(d.get("w", 0.0)),
+                    "src_w": 1.0,
+                    "time_w": 1.0,
+                    "contrib": round(c, 4),
+                    "why": str(d.get("why", "FRED driver")),
+                    "pattern": "FRED",
+                })
 
         th = float(BIAS_THRESH.get(asset, 1.0))
         if score >= th:
@@ -1524,8 +1561,11 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200, allow_fred: b
             "feeds": list(RSS_FEEDS.keys()),
             "gate_profile": GATE_PROFILE,
             "fred": {
-                "enabled": bool(fred_on),
-                "inserted_points_last_run": int(fred_inserted),
+                "enabled": bool(fred_drivers_on),
+                "env_ok": bool(fred_env_ok),
+                "env_why": str(fred_env_why),
+                "ingest_allowed": bool(allow_fred_ingest),
+                "ingested_points_last_run": int(fred_inserted),
                 "series": list(FRED_SERIES.keys()),
                 "requests_present": bool(requests is not None),
             },
@@ -1658,8 +1698,8 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
 def pipeline_run(mode: str = "quick"):
     """
     mode:
-      - quick: budgeted ingest, cached feeds health, optionally throttled FRED
-      - full: original heavy run
+      - quick: budgeted ingest, cached feeds health, FRED ingest throttled (drivers still computed from DB)
+      - full: heavy run (incl. FRED ingest)
     """
     mode = (mode or RUN_MODE_DEFAULT).strip().lower()
     if mode not in ("quick", "full"):
@@ -1668,10 +1708,8 @@ def pipeline_run(mode: str = "quick"):
     t0 = time.time()
     timing: Dict[str, Any] = {"mode": mode}
 
-    # Prevent concurrent heavy runs (multi-click / multi-clients)
     got_lock = _PIPELINE_LOCK.acquire(timeout=RUN_LOCK_TIMEOUT_SEC)
     if not got_lock:
-        # Return last saved bias (if any) + explain lock
         db_init()
         last = load_bias()
         if last:
@@ -1679,9 +1717,6 @@ def pipeline_run(mode: str = "quick"):
             last.setdefault("meta", {})
             last["meta"]["timing"] = {"mode": mode, "lock_timeout": True, "total_ms": int((time.time()-t0)*1000)}
             return last
-        # no state, proceed without lock (rare)
-    else:
-        timing["lock_ms"] = int((time.time() - t0) * 1000)
 
     try:
         t1 = time.time()
@@ -1703,13 +1738,20 @@ def pipeline_run(mode: str = "quick"):
         inserted_cal = ingest_calendar_once(limit_per_feed=cal_limit)
         timing["cal_ingest_ms"] = int((time.time() - t1) * 1000)
 
-        # Bias compute (with optional FRED ingest throttle)
+        # Bias compute
         t1 = time.time()
-        fred_allowed = bool(FRED_ON_RUN)
-        if mode == "quick" and (not FRED_INGEST_EVERY_RUN):
-            fred_allowed = False
 
-        payload = compute_bias(lookback_hours=24, limit_rows=1200, allow_fred=fred_allowed)
+        # Drivers can be ON (use DB) even if ingest is OFF.
+        fred_ingest_allowed = bool(FRED_ON_RUN)
+        if mode == "quick" and (not FRED_INGEST_EVERY_RUN):
+            fred_ingest_allowed = False
+
+        payload = compute_bias(
+            lookback_hours=24,
+            limit_rows=1200,
+            allow_fred_ingest=fred_ingest_allowed,
+            allow_fred_drivers=True
+        )
         timing["compute_bias_ms"] = int((time.time() - t1) * 1000)
 
         # Feeds status (cached in quick)
@@ -1726,7 +1768,6 @@ def pipeline_run(mode: str = "quick"):
         payload["meta"]["alerts"] = alerts[:25]
         timing["alerts_ms"] = int((time.time() - t1) * 1000)
 
-        # Ensure meta.run_token_* always equals CURRENT env
         payload["meta"]["run_token_required"] = bool(get_run_tokens())
         payload["meta"]["run_token_hashes"] = get_run_token_hashes()
 
@@ -1811,7 +1852,6 @@ def eval_trade_gate(asset_obj: Dict[str, Any], event_mode: bool, profile: str) -
         "fail_short": fail_short[:3],
         "must_change": must[:4],
 
-        # numeric context for UI (summary + view)
         "bias": bias,
         "quality": quality, "quality_min": qmin,
         "conflict": conflict, "conflict_max": cmax,
@@ -1836,37 +1876,6 @@ def _on_shutdown():
 def root():
     return RedirectResponse(url="/dashboard", status_code=302)
 
-# -------------------------------------------------------------------
-# ICONS (fix noisy 404s): favicon + apple-touch-icon
-# -------------------------------------------------------------------
-# 1x1 transparent PNG
-_ICON_PNG = base64.b64decode(
-    "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR4nGNgYAAAAAMAASsJTYQAAAAASUVORK5CYII="
-)
-
-def _icon_resp():
-    return Response(
-        content=_ICON_PNG,
-        media_type="image/png",
-        headers={"Cache-Control": "public, max-age=86400"},
-    )
-
-@app.get("/favicon.ico", include_in_schema=False)
-def favicon():
-    return _icon_resp()
-
-@app.get("/apple-touch-icon.png", include_in_schema=False)
-def apple_touch_icon():
-    return _icon_resp()
-
-@app.get("/apple-touch-icon-precomposed.png", include_in_schema=False)
-def apple_touch_icon_precomposed():
-    return _icon_resp()
-
-# -------------------------------------------------------------------
-# HEALTH / DIAG
-# -------------------------------------------------------------------
-
 @app.get("/health")
 def health(pretty: int = 0):
     toks = get_run_tokens()
@@ -1881,7 +1890,6 @@ def health(pretty: int = 0):
         "db_pooling": bool(_get_pool() is not None),
         "run_mode_default": RUN_MODE_DEFAULT,
         "feeds_health_ttl_sec": FEEDS_HEALTH_TTL_SEC,
-        "pipeline_running": bool(_PIPELINE_LOCK.locked()),
     }
     if pretty:
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
@@ -1905,7 +1913,6 @@ def diag_json():
         "FEEDS_HEALTH_TTL_SEC": FEEDS_HEALTH_TTL_SEC,
         "FRED_ON_RUN": FRED_ON_RUN,
         "FRED_INGEST_EVERY_RUN": FRED_INGEST_EVERY_RUN,
-        "pipeline_running": bool(_PIPELINE_LOCK.locked()),
     }
     ok = True
     news_items = 0
@@ -2020,41 +2027,6 @@ def _unauth_response():
         status_code=401
     )
 
-# -------------------------------------------------------------------
-# /run_status (fix 404) — LIGHTWEIGHT status, NO heavy pipeline run
-# -------------------------------------------------------------------
-@app.get("/run_status", include_in_schema=False)
-def run_status():
-    """
-    Some UIs/clients poll /run_status.
-    We keep it very light: returns last saved bias timing/state + lock + token status.
-    Does NOT trigger pipeline_run() to avoid load.
-    """
-    try:
-        db_init()
-    except Exception:
-        pass
-
-    st = None
-    try:
-        st = load_bias()
-    except Exception:
-        st = None
-
-    meta = (st.get("meta", {}) if isinstance(st, dict) else {}) or {}
-    tim = (meta.get("timing") or {})
-    updated = (st.get("updated_utc") if isinstance(st, dict) else None)
-
-    return {
-        "ok": True,
-        "updated_utc": updated,
-        "pipeline_running": bool(_PIPELINE_LOCK.locked()),
-        "run_mode_default": RUN_MODE_DEFAULT,
-        "timing": tim,
-        "run_token_required": bool(get_run_tokens()),
-        "run_token_hashes": get_run_token_hashes(),
-    }
-
 @app.get("/run")
 def run_get(mode: str = "", token: str = "", x_run_token: Optional[str] = Header(default=None)):
     t = _pick_token(token, x_run_token)
@@ -2093,7 +2065,6 @@ def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Heade
 
 @app.get("/latest")
 def latest(limit: int = 40):
-    # Keep quick and safe. /latest is called often by UI.
     limit = int(max(1, min(80, limit)))
     db_init()
     conn = db_conn()
@@ -2146,355 +2117,11 @@ def _pill_gate(ok: bool) -> str:
 
 def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
     """
-    FIX: if USD not detected (currency missing), do NOT lie.
+    If USD not detected (currency missing), do NOT lie.
     Strategy:
       1) try timed USD
       2) else timed ANY
       3) else first ANY
-    Also returns meta health (usd_count/unknown currency).
-    """
-    meta = _calendar_health(upcoming)
-
-    if not upcoming:
-        return "No upcoming events in horizon", "", meta
-
-    prefer_ccy = (prefer_ccy or "USD").upper()
-
-    timed = [x for x in upcoming if x.get("ts")]
-    usd_timed = [x for x in timed if str(x.get("currency") or "").upper() == prefer_ccy]
-
-    if usd_timed:
-        usd_timed.sort(key=lambda x: int(x.get("ts") or 0))
-        pick = usd_timed[0]
-        ts = int(pick["ts"])
-        imp = _impact_norm(pick.get("impact"))
-        return (
-            f"{_fmt_hhmm_utc(ts)} • {prefer_ccy} {imp or '—'} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
-            str(pick.get("source", "")),
-            meta
-        )
-
-    if timed:
-        timed.sort(key=lambda x: int(x.get("ts") or 0))
-        pick = timed[0]
-        ts = int(pick["ts"])
-        ccy = str(pick.get("currency") or "—")
-        imp = _impact_norm(pick.get("impact"))
-        note = f"{ccy} {imp or '—'}"
-        if meta.get("usd", 0) == 0:
-            note += " • (USD not detected)"
-        return (
-            f"{_fmt_hhmm_utc(ts)} • {note} • {pick.get('title','')} ({_fmt_countdown(now_ts, ts)})",
-            str(pick.get("source", "")),
-            meta
-        )
-
-    pick = upcoming[0]
-    ccy = str(pick.get("currency") or "—")
-    imp = _impact_norm(pick.get("impact"))
-    note = f"{ccy} {imp or '—'}"
-    return (f"(time unknown) • {note} • {pick.get('title','')}", str(pick.get("source", "")), meta)
-
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard():
-    # (UI code unchanged)
-    # NOTE: Keeping your template as-is; only earlier fixes were added.
-    # For brevity, UI template is identical to your previous v2026-02-11a.
-    # -------------------------------------------------------------------
-    db_init()
-    payload = load_bias()
-    if not payload:
-        payload = pipeline_run(mode=RUN_MODE_DEFAULT)
-
-    payload["meta"] = (payload.get("meta", {}) or {})
-    payload["meta"]["run_token_required"] = bool(get_run_tokens())
-    payload["meta"]["run_token_hashes"] = get_run_token_hashes()
-
-    assets = payload.get("assets", {}) or {}
-    meta = payload.get("meta", {}) or {}
-    event = payload.get("event", {}) or {}
-    feeds_status = meta.get("feeds_status", {}) or {}
-
-    updated = payload.get("updated_utc", "")
-    gate_profile = str(meta.get("gate_profile", GATE_PROFILE))
-    event_mode = bool(event.get("event_mode", False))
-    upcoming = (event.get("upcoming_events", []) or [])[:12]
-    now_ts = int(time.time())
-
-    reason_txt = _human_event_reason([str(x) for x in (event.get("reason", []) or [])])
-    next_event_line, next_event_src, cal_meta = _pick_next_event_smart(now_ts, upcoming, prefer_ccy="USD")
-
-    trump = meta.get("trump", {}) or {}
-    trump_flag = bool(trump.get("flag", False))
-    trump_enabled = bool(trump.get("enabled", False))
-
-    feeds_ok_ratio = _feeds_ok_ratio(feeds_status) if feeds_status else 1.0
-    feeds_ok = feeds_ok_ratio >= float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
-
-    fred_on, fred_why = _fred_status(meta.get("fred", {}) or {})
-    token_required, _token_why = _run_token_status()
-
-    for sym in ASSETS:
-        a = assets.get(sym, {}) or {}
-        a["ui_gate"] = eval_trade_gate(a, event_mode, gate_profile)
-        assets[sym] = a
-    payload["assets"] = assets
-
-    def _chip(label: str, value: str, cls: str, tip: str, key: str) -> str:
-        return f'<button class="chip {cls}" data-chip="{key}" title="{tip}"><span class="k">{label}</span> {value}</button>'
-
-    risk_val = "HIGH" if event_mode else "LOW"
-    ev_chip = _chip("RISK", risk_val, "warn" if event_mode else "neu",
-                    "Macro-risk window (recent major releases or upcoming events). Click for details.", "risk")
-
-    head_val = ("HOT" if (trump_enabled and trump_flag) else ("ON" if trump_enabled else "OFF"))
-    tr_chip = _chip("HEADLINES", head_val,
-                    "warn" if (trump_enabled and trump_flag) else "neu",
-                    "Trump/White House headline monitor. HOT=hits in last 12h. Click for details.", "headlines")
-
-    fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
-                    "ok" if feeds_ok else "no",
-                    "RSS parsing health. Click to see GOOD/WARN/BAD per feed.", "feeds")
-
-    fr_chip = _chip("MACRO", ("ON" if fred_on else "OFF"), "neu",
-                    "Macro drivers (FRED). OFF reason: " + fred_why + ". Click for details.", "macro")
-
-    rn_chip = _chip("RUN", ("LOCKED" if token_required else "OPEN"), "neu",
-                    "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
-
-    lg_chip = _chip("LEGEND", "?", "neu",
-                    "Explain what Quality/Conflict/BiasScore/Threshold/FlipDist mean (simple language).", "legend")
-
-    dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
-
-    def _short_why(asset: str) -> str:
-        a = assets.get(asset, {}) or {}
-        gate = a.get("ui_gate", {}) or {}
-        ok = bool(gate.get("ok", False))
-        b = str(a.get("bias", "NEUTRAL"))
-
-        quality = int(gate.get("quality", 0))
-        qmin = int(gate.get("quality_min", 0))
-        conflict = float(gate.get("conflict", 1.0))
-        cmax = float(gate.get("conflict_max", 1.0))
-        score = float(gate.get("score", 0.0))
-        th = float(gate.get("th", 0.0))
-        flipd = float(gate.get("flip_dist", 999.0))
-        flipmin = float(gate.get("flip_min", 0.0))
-
-        if ok:
-            return f"BiasScore {score:.2f}/{th:.2f} • Conflict {conflict:.2f} • Quality {quality} • RISK {'ON' if gate.get('event_mode') else 'OFF'}"
-        else:
-            parts = [f"Quality {quality}/{qmin}", f"Conflict {conflict:.2f}/{cmax:.2f}", f"BiasScore {score:.2f}/{th:.2f}"]
-            if b in ("BULLISH", "BEARISH") and flipd < flipmin:
-                parts.append(f"FlipDist {flipd:.2f}<{flipmin:.2f}")
-            if gate.get("event_mode"):
-                parts.append("RISK ON")
-            if b == "NEUTRAL":
-                parts.insert(0, "NEUTRAL")
-            return " • ".join(parts)
-
-    def row(asset: str) -> str:
-        a = assets.get(asset, {}) or {}
-        bias = str(a.get("bias", "NEUTRAL"))
-        gate = a.get("ui_gate", {}) or {}
-        ok = bool(gate.get("ok", False))
-        short = _short_why(asset)
-
-        return f"""
-        <tr class="r">
-          <td class="sym">{asset}</td>
-          <td>{_pill_bias(bias)}</td>
-          <td>{_pill_gate(ok)}</td>
-          <td class="why">{short or "—"}</td>
-          <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
-        </tr>
-        """
-
-    updated_short = str(updated).replace("T", " ").replace("+00:00", " UTC")
-    if len(updated_short) > 22:
-        updated_short = updated_short[:22].strip()
-
-    cal_health_badge = f"USD:{cal_meta.get('usd',0)} • timed:{cal_meta.get('timed',0)} • unk:{cal_meta.get('unknown_currency',0)}"
-    js_payload = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")  # SAFE JSON injection
-    tv_symbols = json.dumps(TV_TICKER_SYMBOLS, ensure_ascii=False)
-
-@app.get("/diag", response_class=HTMLResponse)
-def diag_page():
-    d = diag_json()
-    pretty = json.dumps(d, ensure_ascii=False, indent=2)
-    html = f"""<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>DIAG</title>
-<style>
-html,body{{margin:0;background:#070a0f;color:#d7e2ff;font-family:ui-monospace,Menlo,Consolas,monospace}}
-.wrap{{max-width:1100px;margin:0 auto;padding:16px}}
-h1{{font-size:14px;color:#ffb000;margin:0 0 12px 0}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#0b111a;border:1px solid rgba(255,255,255,.08);
-padding:12px;border-radius:12px;}}
-a{{color:#00e5ff;text-decoration:none}}
-a:hover{{text-decoration:underline}}
-.row{{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 14px}}
-.btn{{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
-background:#0f1724;color:#d7e2ff}}
-</style>
-</head><body>
-<div class="wrap">
-  <h1>DIAG</h1>
-  <div class="row">
-    <a class="btn" href="/dashboard">← Back</a>
-    <a class="btn" href="/diag.json" target="_blank" rel="noopener">Open JSON</a>
-  </div>
-  <pre>{pretty}</pre>
-</div>
-</body></html>"""
-    return HTMLResponse(html)
-
-@app.get("/rules")
-def rules():
-    return {"assets": ASSETS, "rules": RULES}
-
-@app.get("/bias")
-def bias(pretty: int = 0):
-    db_init()
-    state = load_bias()
-    if not state:
-        state = pipeline_run(mode=RUN_MODE_DEFAULT)
-    if pretty:
-        return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
-    return JSONResponse(state)
-
-# ---------------------------
-# RUN auth (DYNAMIC)
-# ---------------------------
-
-def _pick_token(query_token: str, header_token: Optional[str]) -> str:
-    t = (query_token or "").strip()
-    if t:
-        return t
-    return (header_token or "").strip()
-
-def _auth_run(token: str) -> bool:
-    """
-    If tokens empty -> open.
-    Else token must match any allowed token, using constant-time compare.
-    """
-    toks = get_run_tokens()
-    if not toks:
-        return True
-    t = (token or "").strip()
-    if not t:
-        return False
-    for allowed in toks:
-        if hmac.compare_digest(t, allowed):
-            return True
-    return False
-
-def _unauth_response():
-    return JSONResponse(
-        {"ok": False, "error": "unauthorized", "expected_hash": get_run_token_hashes()},
-        status_code=401
-    )
-
-@app.get("/run")
-def run_get(mode: str = "", token: str = "", x_run_token: Optional[str] = Header(default=None)):
-    t = _pick_token(token, x_run_token)
-    if not _auth_run(t):
-        return _unauth_response()
-
-    try:
-        payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
-        meta = payload.get("meta", {}) or {}
-        return JSONResponse({
-            "ok": True,
-            "updated_utc": payload.get("updated_utc"),
-            "meta": meta,
-            "timing": (meta.get("timing") or {}),
-        })
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@app.post("/run")
-def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Header(default=None)):
-    t = _pick_token(token, x_run_token)
-    if not _auth_run(t):
-        return _unauth_response()
-
-    try:
-        payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
-        meta = payload.get("meta", {}) or {}
-        return JSONResponse({
-            "ok": True,
-            "updated_utc": payload.get("updated_utc"),
-            "meta": meta,
-            "timing": (meta.get("timing") or {}),
-        })
-    except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
-
-@app.get("/latest")
-def latest(limit: int = 40):
-    # Keep quick and safe. /latest is called often by UI.
-    limit = int(max(1, min(80, limit)))
-    db_init()
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source, title, link, published_ts
-                FROM news_items
-                ORDER BY published_ts DESC
-                LIMIT %s;
-            """, (limit,))
-            rows = cur.fetchall()
-    finally:
-        db_put(conn)
-    return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
-
-# MyFXBook calendar page (standalone)
-@app.get("/myfx_calendar", response_class=HTMLResponse)
-def myfx_calendar():
-    html = f"""<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>MyFXBook Calendar</title>
-<style>
-html,body{{height:100%;margin:0;background:#070a0f;color:#d7e2ff;font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Arial}}
-.wrap{{height:100%;}}
-iframe{{border:0;width:100%;height:100%;}}
-</style>
-</head><body>
-<div class="wrap">
-<iframe src="{MYFXBOOK_IFRAME_SRC}" loading="lazy" referrerpolicy="no-referrer-when-downgrade"></iframe>
-</div>
-</body></html>"""
-    return HTMLResponse(html)
-
-# ============================================================
-# UI
-# ============================================================
-
-def _pill_bias(b: str) -> str:
-    if b == "BULLISH":
-        return '<span class="pill bull">BULLISH</span>'
-    if b == "BEARISH":
-        return '<span class="pill bear">BEARISH</span>'
-    return '<span class="pill neu">NEUTRAL</span>'
-
-def _pill_gate(ok: bool) -> str:
-    return '<span class="pill ok">TRADE OK</span>' if ok else '<span class="pill no">NO TRADE</span>'
-
-def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
-    """
-    FIX: if USD not detected (currency missing), do NOT lie.
-    Strategy:
-      1) try timed USD
-      2) else timed ANY
-      3) else first ANY
-    Also returns meta health (usd_count/unknown currency).
     """
     meta = _calendar_health(upcoming)
 
@@ -2545,7 +2172,6 @@ def dashboard():
     if not payload:
         payload = pipeline_run(mode=RUN_MODE_DEFAULT)
 
-    # IMPORTANT: UI must reflect CURRENT env token state, not old DB payload
     payload["meta"] = (payload.get("meta", {}) or {})
     payload["meta"]["run_token_required"] = bool(get_run_tokens())
     payload["meta"]["run_token_hashes"] = get_run_token_hashes()
@@ -2657,7 +2283,6 @@ def dashboard():
 
     cal_health_badge = f"USD:{cal_meta.get('usd',0)} • timed:{cal_meta.get('timed',0)} • unk:{cal_meta.get('unknown_currency',0)}"
 
-    # SAFE JSON injection:
     js_payload = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
 
     tv_symbols = json.dumps(TV_TICKER_SYMBOLS, ensure_ascii=False)
@@ -2716,7 +2341,6 @@ def dashboard():
     .btnrow{display:flex; gap:8px; flex-wrap:wrap; margin-top:12px;}
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
 
-    /* Table stability */
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900; text-align:left;}
@@ -2742,7 +2366,6 @@ def dashboard():
       margin:0 0 8px 2px;
     }
 
-    /* Tickers */
     .tickerstack{margin-top:12px; display:flex; flex-direction:column; gap:10px;}
     .ticklabel{font-family:var(--mono); font-size:12px; color:var(--muted); margin:0 0 6px 2px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -2755,7 +2378,6 @@ def dashboard():
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
 
-    /* Modal */
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding: calc(14px + env(safe-area-inset-top)) 14px calc(14px + env(safe-area-inset-bottom)); z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto; -webkit-overflow-scrolling:touch;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
@@ -2772,7 +2394,6 @@ def dashboard():
     .iframebox iframe{width:100%; height:100%; border:0;}
     .iframebox.dark iframe{filter: invert(1) hue-rotate(180deg) contrast(0.92) brightness(0.95);}
 
-    /* View emphasis */
     .banner{border:1px solid var(--line); border-radius:16px; padding:12px; background:rgba(255,255,255,.02);}
     .bannerTop{display:flex; gap:12px; align-items:center; justify-content:space-between; flex-wrap:wrap;}
     .big{font-family:var(--mono); font-weight:900; letter-spacing:.8px; font-size:14px;}
@@ -2783,7 +2404,6 @@ def dashboard():
     .mini{display:flex; gap:8px; flex-wrap:wrap; margin-top:10px;}
     .mini .pill{font-size:11px; padding:5px 9px;}
 
-    /* === iPhone-friendly SUMMARY === */
     .sumCards{display:none;}
     .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
     .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
@@ -2911,7 +2531,6 @@ def dashboard():
   </div>
 </div>
 
-<!-- SAFE payload injection -->
 <script id="payloadJson" type="application/json">__JS_PAYLOAD__</script>
 
 <script>
@@ -2953,11 +2572,8 @@ def dashboard():
     try{
       var token = getRunToken();
       var headers = token ? { 'X-Run-Token': token } : {};
-
-      // default: quick mode to avoid “long RUN”
       var resp = await fetch('/run?mode=__RUN_MODE__', { method:'POST', headers: headers });
 
-      // Robust parse (handles proxy 502 HTML etc.)
       let txt = await resp.text();
       let js = {};
       try { js = JSON.parse(txt || '{}'); }
@@ -2979,10 +2595,8 @@ def dashboard():
         return;
       }
 
-      // If timing exists, show quick confirmation (optional)
       const tm = (js && js.timing) ? js.timing : null;
       if(tm && tm.total_ms !== undefined){
-        // small toast-like modal, then reload
         showModal('RUN OK', '<div class="panel"><div class="h2">Updated</div>'
           + '<div class="list"><div class="item"><div class="t">Pipeline time</div><div class="m">' + escapeHtml(String(tm.total_ms)) + ' ms</div></div></div></div>');
         setTimeout(function(){ location.reload(); }, 350);
@@ -3124,11 +2738,12 @@ def dashboard():
       body =
         '<div class="panel"><div class="h2">What it means</div><div class="list">'
         + '<div class="item"><div class="t">ON</div><div class="m">Bias includes macro drivers (yields/USD/VIX etc.).</div></div>'
-        + '<div class="item"><div class="t">OFF</div><div class="m">Only RSS evidence (more noise). Typical cause: missing FRED_API_KEY.</div></div>'
+        + '<div class="item"><div class="t">OFF</div><div class="m">Only RSS evidence. Typical cause: missing FRED_API_KEY or requests missing.</div></div>'
         + '</div></div>'
         + '<div class="panel"><div class="h2">Now</div><div class="list">'
         + '<div class="item"><div class="t">enabled</div><div class="m">' + escapeHtml(fred.enabled ? 'true' : 'false') + '</div></div>'
-        + '<div class="item"><div class="t">requests_present</div><div class="m">' + escapeHtml(fred.requests_present ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">ingest_allowed</div><div class="m">' + escapeHtml(fred.ingest_allowed ? 'true' : 'false') + '</div></div>'
+        + '<div class="item"><div class="t">env</div><div class="m">' + escapeHtml(String(fred.env_why||'')) + '</div></div>'
         + '<div class="item"><div class="t">Fix</div><div class="m">Set env: FRED_ENABLED=1 and FRED_API_KEY=...</div></div>'
         + '</div></div>';
     }

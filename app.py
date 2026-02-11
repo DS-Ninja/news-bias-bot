@@ -2737,6 +2737,7 @@ def dashboard():
   buildMarqueeNews();
   buildMarqueeStatus();
   setInterval(buildMarqueeNews, 120000);
+  setInterval(buildMarqueeStatus, 120000);
 </script>
 </body>
 </html>

@@ -23,6 +23,10 @@ import calendar as pycalendar
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+
 import feedparser
 import psycopg2
 import socket
@@ -114,6 +118,26 @@ FRED_SERIES = {
     "DTWEXBGS": {"name": "Broad USD",      "freq": "d"},
     "VIXCLS":   {"name": "VIX",            "freq": "d"},
     "BAA10Y":   {"name": "BAA-10Y Spread", "freq": "d"},
+}
+
+# ============================================================
+# PERF / CACHES
+# ============================================================
+
+RUN_MODE_DEFAULT = os.environ.get("RUN_MODE_DEFAULT", "quick").strip().lower()  # quick|full
+RUN_MAX_SEC = float(os.environ.get("RUN_MAX_SEC", "8.5"))  # hard budget for ingest stage in /run
+FEED_PARSE_WORKERS = int(os.environ.get("FEED_PARSE_WORKERS", "10"))
+
+FRED_REFRESH_MINUTES = int(os.environ.get("FRED_REFRESH_MINUTES", "60"))
+FEEDS_HEALTH_EVERY_MINUTES = int(os.environ.get("FEEDS_HEALTH_EVERY_MINUTES", "8"))
+CAL_REFRESH_MINUTES = int(os.environ.get("CAL_REFRESH_MINUTES", "15"))
+
+_PIPELINE_LOCK = threading.Lock()
+
+_cache = {
+    "feeds_health": {"ts": 0, "data": {}},
+    "fred_ingest_ts": 0,
+    "cal_ingest_ts": 0,
 }
 
 # ============================================================
@@ -558,8 +582,18 @@ def _ts_from_entry(e: dict, now_ts: int) -> int:
             return int(now_ts)
     return int(now_ts)
 
-def feeds_health_live() -> Dict[str, Any]:
+def feeds_health_live(force: bool = False) -> Dict[str, Any]:
+    """
+    Cached health check, because parsing all feeds every run is expensive.
+    """
+    now = int(time.time())
+    every = max(1, int(FEEDS_HEALTH_EVERY_MINUTES * 60))
+
+    if (not force) and _cache["feeds_health"]["data"] and (now - int(_cache["feeds_health"]["ts"]) < every):
+        return dict(_cache["feeds_health"]["data"])
+
     res = {}
+    # NOTE: this still parses all feeds; caching keeps it rare
     for src, url in RSS_FEEDS.items():
         try:
             if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
@@ -570,7 +604,9 @@ def feeds_health_live() -> Dict[str, Any]:
             res[src] = {"ok": True, "bozo": int(getattr(d, "bozo", 0)), "entries": int(len(entries))}
         except Exception as e:
             res[src] = {"ok": False, "error": str(e), "entries": 0}
-    return res
+
+    _cache["feeds_health"] = {"ts": now, "data": res}
+    return dict(res)
 
 def _feeds_ok_ratio(feeds_status: dict) -> float:
     ok = 0
@@ -656,36 +692,60 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
 # INGEST (NEWS) — network-first then DB batch
 # ============================================================
 
-def ingest_news_once(limit_per_feed: int = 40) -> int:
+def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) -> int:
+    """
+    Parallel RSS parse + optional time budget.
+    max_sec: if set, stops collecting after budget (best-effort).
+    """
     inserted = 0
     now = int(time.time())
+    t0 = time.time()
 
-    batch: List[Tuple[str, str, str, int, str]] = []
-
+    # build feed list (exclude calendar feeds)
+    feed_list = []
     for src, url in RSS_FEEDS.items():
         if src in CALENDAR_FEEDS:
             continue
         if src == "TRUMP_HEADLINES" and not TRUMP_ENABLED:
             continue
+        feed_list.append((src, url))
 
+    batch: List[Tuple[str, str, str, int, str]] = []
+
+    def parse_one(src_url):
+        src, url = src_url
         try:
             d = feedparser.parse(url)
-        except Exception:
-            continue
+            return src, d, None
+        except Exception as e:
+            return src, None, e
 
-        entries = getattr(d, "entries", []) or []
-        if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
-            continue
+    workers = max(2, min(FEED_PARSE_WORKERS, len(feed_list) or 2))
+    with ThreadPoolExecutor(max_workers=workers) as ex:
+        futures = [ex.submit(parse_one, x) for x in feed_list]
+        for fu in as_completed(futures):
+            if max_sec is not None and (time.time() - t0) > float(max_sec):
+                break
 
-        for e in entries[:limit_per_feed]:
-            title = (e.get("title") or "").strip()
-            link = (e.get("link") or "").strip()
-            if not title or not link:
+            src, d, err = fu.result()
+            if err or d is None:
                 continue
 
-            published_ts = _ts_from_entry(e, now)
-            fp = fingerprint(title, link)
-            batch.append((src, title, link, int(published_ts), fp))
+            entries = getattr(d, "entries", []) or []
+            if int(getattr(d, "bozo", 0)) == 1 and len(entries) == 0:
+                continue
+
+            for e in entries[:limit_per_feed]:
+                title = (e.get("title") or "").strip()
+                link = (e.get("link") or "").strip()
+                if not title or not link:
+                    continue
+                published_ts = _ts_from_entry(e, now)
+                fp = fingerprint(title, link)
+                batch.append((src, title, link, int(published_ts), fp))
+
+            if max_sec is not None and (time.time() - t0) > float(max_sec):
+                break
 
     if not batch:
         return 0
@@ -1306,19 +1366,16 @@ def compute_bias(lookback_hours: int = 24, limit_rows: int = 1200) -> Dict[str, 
         db_put(conn)
 
     # FRED ingest + drivers
+        # FRED drivers only (ingest is handled in pipeline_run with caching)
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
     fred_on = bool(FRED_CFG["enabled"] and bool(FRED_CFG["api_key"]) and requests is not None)
     if fred_on:
-        for sid in FRED_SERIES.keys():
-            try:
-                fred_inserted += fred_ingest_series(sid, days=FRED_CFG["window_days"])
-            except Exception:
-                pass
         try:
             fred_drivers = compute_fred_drivers()
         except Exception:
             fred_drivers = {"XAU": [], "US500": [], "WTI": []}
+
 
     # Event mode
     upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
@@ -1596,31 +1653,75 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
 # PIPELINE RUN
 # ============================================================
 
-def pipeline_run():
-    db_init()
+def pipeline_run(mode: str = "full"):
+    """
+    mode:
+      - quick: fast RUN (minimal network, no FRED ingest, calendar cached, feeds_health cached)
+      - full:  full refresh (still uses caching for FRED/calendar/feeds_health to avoid pointless repeat)
+    """
+    mode = (mode or "full").strip().lower()
+    if mode not in ("quick", "full"):
+        mode = "quick"
 
-    prev = load_bias()
+    with _PIPELINE_LOCK:
+        db_init()
 
-    inserted_news = ingest_news_once(limit_per_feed=40)
-    inserted_cal = ingest_calendar_once(limit_per_feed=250)
+        prev = load_bias()
 
-    payload = compute_bias(lookback_hours=24, limit_rows=1200)
+        # ---------- RSS ingest ----------
+        # quick: smaller per-feed + time budget
+        if mode == "quick":
+            inserted_news = ingest_news_once(limit_per_feed=18, max_sec=RUN_MAX_SEC)
+        else:
+            inserted_news = ingest_news_once(limit_per_feed=40, max_sec=None)
 
-    feeds_status = feeds_health_live()
+        # ---------- Calendar ingest (cached) ----------
+        inserted_cal = 0
+        if EVENT_CFG.get("enabled", True):
+            now = int(time.time())
+            every = max(60, int(CAL_REFRESH_MINUTES * 60))
+            if (now - int(_cache["cal_ingest_ts"])) >= every or mode == "full":
+                try:
+                    inserted_cal = ingest_calendar_once(limit_per_feed=250)
+                except Exception:
+                    inserted_cal = 0
+                _cache["cal_ingest_ts"] = now
 
-    payload["meta"]["inserted_news_last_run"] = int(inserted_news)
-    payload["meta"]["inserted_calendar_last_run"] = int(inserted_cal)
-    payload["meta"]["feeds_status"] = feeds_status
+        # ---------- FRED ingest (cached; heavy) ----------
+        fred_inserted = 0
+        if mode == "full" and (FRED_CFG.get("enabled") and FRED_CFG.get("api_key") and requests is not None):
+            now = int(time.time())
+            every = max(60, int(FRED_REFRESH_MINUTES * 60))
+            if (now - int(_cache["fred_ingest_ts"])) >= every:
+                for sid in FRED_SERIES.keys():
+                    try:
+                        fred_inserted += fred_ingest_series(sid, days=FRED_CFG["window_days"])
+                    except Exception:
+                        pass
+                _cache["fred_ingest_ts"] = now
 
-    alerts = compute_alerts(prev, payload)
-    payload["meta"]["alerts"] = alerts[:25]
+        # ---------- Compute bias (reads DB only; fast) ----------
+        payload = compute_bias(lookback_hours=24, limit_rows=1200)
 
-    # IMPORTANT: ensure meta.run_token_* always equals CURRENT env (even if DB had old payload)
-    payload["meta"]["run_token_required"] = bool(get_run_tokens())
-    payload["meta"]["run_token_hashes"] = get_run_token_hashes()
+        # ---------- Feeds status (cached) ----------
+        feeds_status = feeds_health_live(force=(mode == "full"))
 
-    save_bias(payload)
-    return payload
+        payload["meta"]["inserted_news_last_run"] = int(inserted_news)
+        payload["meta"]["inserted_calendar_last_run"] = int(inserted_cal)
+        payload["meta"]["feeds_status"] = feeds_status
+
+        # Keep your meta + alerts
+        payload["meta"]["fred"]["inserted_points_last_run"] = int(fred_inserted)
+
+        alerts = compute_alerts(prev, payload)
+        payload["meta"]["alerts"] = alerts[:25]
+
+        # Token meta must always reflect current env
+        payload["meta"]["run_token_required"] = bool(get_run_tokens())
+        payload["meta"]["run_token_hashes"] = get_run_token_hashes()
+
+        save_bias(payload)
+        return payload
 
 # ============================================================
 # TRADE GATE
@@ -1856,7 +1957,7 @@ def run_get(token: str = "", x_run_token: Optional[str] = Header(default=None)):
         return _unauth_response()
 
     try:
-        payload = pipeline_run()
+        payload = pipeline_run(mode=RUN_MODE_DEFAULT)
         return JSONResponse({"ok": True, "updated_utc": payload.get("updated_utc"), "meta": payload.get("meta", {})})
     except Exception as e:
         return JSONResponse({"ok": False, "error": str(e)}, status_code=500)

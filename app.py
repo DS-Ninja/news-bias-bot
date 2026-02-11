@@ -25,6 +25,8 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import feedparser
 import psycopg2
+import socket
+socket.setdefaulttimeout(float(os.environ.get("HTTP_TIMEOUT", "12")))
 
 # Optional DB pool
 try:

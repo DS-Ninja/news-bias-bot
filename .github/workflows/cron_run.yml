@@ -1,24 +1,68 @@
-- name: Call /run endpoint (warm + retry)
-  env:
-    RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
-  run: |
-    set -euo pipefail
+name: cron_run
 
-    BASE="https://web-production-9bcf3.up.railway.app"
-    URL="$BASE/run?token=${RUN_TOKEN}"
+on:
+  schedule:
+    - cron: "10 8 * * 1-5"
+    - cron: "10 13 * * 1-5"
+    - cron: "40 15 * * 1-5"
+  workflow_dispatch: {}
 
-    echo "Warmup /health ..."
-    curl -4 -fSs --connect-timeout 10 --max-time 120 "$BASE/health?pretty=1" > /dev/null || true
-    sleep 3
+jobs:
+  call-run:
+    runs-on: ubuntu-latest
 
-    for i in 1 2 3 4 5; do
-      echo "Attempt $i..."
-      if curl -4 -fSs --connect-timeout 10 --max-time 240 "$URL" > /dev/null; then
-        echo "OK: /run triggered"
-        exit 0
-      fi
-      sleep $((i*5))
-    done
+    steps:
+      - name: Call /run endpoint (warm + retry)
+        env:
+          RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
+        shell: bash
+        run: |
+          set -euo pipefail
 
-    echo "ERROR: /run failed after retries"
-    exit 1
+          BASE="https://web-production-9bcf3.up.railway.app"
+
+          echo "Warmup /health ..."
+          curl -fsS --connect-timeout 10 --max-time 60 "${BASE}/health?pretty=1" >/dev/null || true
+          sleep 2
+
+          call_run() {
+            local code body
+            if [[ -n "${RUN_TOKEN:-}" ]]; then
+              echo "Calling /run with X-Run-Token header (LOCKED mode expected)"
+              body="$(curl -sS --connect-timeout 10 --max-time 240 \
+                -H "X-Run-Token: ${RUN_TOKEN}" \
+                -w "\n%{http_code}" \
+                -X POST "${BASE}/run" || true)"
+            else
+              echo "Calling /run WITHOUT token (OPEN mode expected)"
+              body="$(curl -sS --connect-timeout 10 --max-time 240 \
+                -w "\n%{http_code}" \
+                -X POST "${BASE}/run" || true)"
+            fi
+
+            code="$(echo "$body" | tail -n1)"
+            body="$(echo "$body" | sed '$d')"
+
+            echo "HTTP $code"
+            # show a short snippet if not OK
+            if [[ "$code" != "200" ]]; then
+              echo "Body (first 400 chars):"
+              echo "$body" | head -c 400 || true
+              echo
+              return 1
+            fi
+
+            echo "OK: /run triggered"
+            return 0
+          }
+
+          for i in 1 2 3 4 5; do
+            echo "Attempt $i..."
+            if call_run; then
+              exit 0
+            fi
+            sleep $((i*6))
+          done
+
+          echo "ERROR: /run failed after retries"
+          exit 1

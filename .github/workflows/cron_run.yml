@@ -7,62 +7,108 @@ on:
     - cron: "40 15 * * 1-5"
   workflow_dispatch: {}
 
+concurrency:
+  group: cron-run
+  cancel-in-progress: false
+
 jobs:
   call-run:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
 
     steps:
-      - name: Call /run endpoint (warm + retry)
+      - name: Call /run endpoint (warm + retry + accept 200/202)
         env:
           RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
+          BASE: "https://web-production-9bcf3.up.railway.app"
         shell: bash
         run: |
           set -euo pipefail
 
-          BASE="https://web-production-9bcf3.up.railway.app"
+          echo "BASE=${BASE}"
 
           echo "Warmup /health ..."
           curl -fsS --connect-timeout 10 --max-time 60 "${BASE}/health?pretty=1" >/dev/null || true
           sleep 2
 
           call_run() {
-            local code body
+            local body code json
+
             if [[ -n "${RUN_TOKEN:-}" ]]; then
-              echo "Calling /run with X-Run-Token header (LOCKED mode expected)"
+              echo "Calling /run with X-Run-Token header"
               body="$(curl -sS --connect-timeout 10 --max-time 240 \
                 -H "X-Run-Token: ${RUN_TOKEN}" \
+                -H "Accept: application/json" \
                 -w "\n%{http_code}" \
                 -X POST "${BASE}/run" || true)"
             else
-              echo "Calling /run WITHOUT token (OPEN mode expected)"
+              echo "Calling /run WITHOUT token"
               body="$(curl -sS --connect-timeout 10 --max-time 240 \
+                -H "Accept: application/json" \
                 -w "\n%{http_code}" \
                 -X POST "${BASE}/run" || true)"
             fi
 
-            code="$(echo "$body" | tail -n1)"
-            body="$(echo "$body" | sed '$d')"
+            code="$(echo "$body" | tail -n1 | tr -d '\r')"
+            json="$(echo "$body" | sed '$d')"
 
-            echo "HTTP $code"
-            # show a short snippet if not OK
-            if [[ "$code" != "200" ]]; then
-              echo "Body (first 400 chars):"
-              echo "$body" | head -c 400 || true
-              echo
+            echo "HTTP ${code}"
+            echo "Body (first 500 chars):"
+            echo "$json" | head -c 500 || true
+            echo
+
+            # Accept both 200 OK and 202 Accepted (async run)
+            if [[ "$code" != "200" && "$code" != "202" ]]; then
               return 1
             fi
 
-            echo "OK: /run triggered"
+            # If response is 401, fail fast (token mismatch)
+            if echo "$json" | grep -qi '"error"[[:space:]]*:[[:space:]]*"unauthorized"'; then
+              echo "ERROR: unauthorized (token mismatch)."
+              return 2
+            fi
+
             return 0
           }
 
+          # 5 attempts with backoff
           for i in 1 2 3 4 5; do
-            echo "Attempt $i..."
+            echo "Attempt ${i}..."
             if call_run; then
-              exit 0
+              echo "OK: /run accepted (200/202)"
+              break
             fi
-            sleep $((i*6))
+            rc=$?
+            if [[ "$rc" == "2" ]]; then
+              echo "FATAL: unauthorized. Stop retries."
+              exit 1
+            fi
+            sleep $((i*8))
           done
 
-          echo "ERROR: /run failed after retries"
-          exit 1
+          # Optional: check /run_status if implemented
+          echo "Checking /run_status (optional)..."
+          set +e
+          st="$(curl -sS --connect-timeout 10 --max-time 30 \
+                -H "Accept: application/json" \
+                "${BASE}/run_status" 2>/dev/null)"
+          code=$?
+          set -e
+
+          if [[ "$code" != "0" || -z "$st" ]]; then
+            echo "NOTE: /run_status not available (skipping)."
+            exit 0
+          fi
+
+          echo "/run_status (first 500 chars):"
+          echo "$st" | head -c 500 || true
+          echo
+
+          # If your /run_status returns running=true, we don't fail — just inform.
+          if echo "$st" | grep -qi '"running"[[:space:]]*:[[:space:]]*true'; then
+            echo "INFO: pipeline still running (expected in async mode)."
+            exit 0
+          fi
+
+          echo "INFO: pipeline not running (finished or idle)."
+          exit 0

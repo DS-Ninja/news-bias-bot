@@ -1,30 +1,24 @@
-name: Run pipeline every 5 minutes
+- name: Call /run endpoint (warm + retry)
+  env:
+    RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
+  run: |
+    set -euo pipefail
 
-on:
-  schedule:
-    - cron: "*/5 * * * *"
-  workflow_dispatch:
+    BASE="https://web-production-9bcf3.up.railway.app"
+    URL="$BASE/run?token=${RUN_TOKEN}"
 
-jobs:
-  run:
-    runs-on: ubuntu-latest
-    steps:
-      - name: Call /run endpoint (GET + token)
-        env:
-          RUN_TOKEN: ${{ secrets.RUN_TOKEN }}
-        run: |
-          set -euo pipefail
+    echo "Warmup /health ..."
+    curl -4 -fSs --connect-timeout 10 --max-time 120 "$BASE/health?pretty=1" > /dev/null || true
+    sleep 3
 
-          URL="https://web-production-9bcf3.up.railway.app/run?token=${RUN_TOKEN}"
+    for i in 1 2 3 4 5; do
+      echo "Attempt $i..."
+      if curl -4 -fSs --connect-timeout 10 --max-time 240 "$URL" > /dev/null; then
+        echo "OK: /run triggered"
+        exit 0
+      fi
+      sleep $((i*5))
+    done
 
-          for i in 1 2 3 4 5; do
-            echo "Attempt $i..."
-            if curl -fsS --max-time 60 "$URL" > /dev/null; then
-              echo "OK: /run triggered (GET)"
-              exit 0
-            fi
-            sleep $((i*3))
-          done
-
-          echo "ERROR: /run failed after retries"
-          exit 1
+    echo "ERROR: /run failed after retries"
+    exit 1

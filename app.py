@@ -1,12 +1,28 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-11c (FULL SINGLE FILE — SAFE MODE + SSL PATCH — RAILWAY READY):
-# ✅ FULL file (single-file)
-# ✅ Auto-append sslmode=require when needed (PGSSLMODE=require OR Railway proxy host)
-# ✅ SAFE MODE: dashboard/diag/bias/latest/run never crash when DB is down
-# ✅ Robust pooled + fallback direct conn, safe close/return, shutdown hook
-# ✅ Quick/full pipeline, cached feeds health TTL, FRED ingest throttled, drivers computed from existing DB points
-# ✅ XSS-safe JSON injection, /run auth dynamic tokens, per-stage timing, global run lock
+# RESTORED v2026-02-11c (FULL SINGLE FILE — HTML INCLUDED — DB SAFE MODE + SSL FIX)
+#
+# KEY FIXES:
+# ✅ Railway Postgres SSL: auto-enforce sslmode=require if missing in DATABASE_URL (uses PGSSLMODE)
+# ✅ Connect retries for "server closed the connection unexpectedly"
+# ✅ TRUE safe mode for /dashboard, /run, /diag when DB is down (no crash)
+# ✅ Pooled + fallback direct conn + safe close/return + shutdown hook
+#
+# Env knobs (optional):
+#   HTTP_TIMEOUT=12
+#   RUN_MODE_DEFAULT=quick|full
+#   RUN_MAX_SEC=10
+#   FEEDS_HEALTH_TTL_SEC=90
+#   RUN_LOCK_TIMEOUT_SEC=25
+#   FRED_ENABLED=0|1
+#   FRED_API_KEY=...
+#   FRED_ON_RUN=0|1
+#   FRED_INGEST_EVERY_RUN=0|1
+#   RSS_LIMIT_QUICK=18, RSS_LIMIT_FULL=40
+#   CAL_LIMIT_QUICK=120, CAL_LIMIT_FULL=250
+#   PGPOOL_MAXCONN=10
+#   PGPOOL_MINCONN=1
+#   PGSSLMODE=require   (IMPORTANT for Railway)
 
 import os
 import json
@@ -16,11 +32,12 @@ import hashlib
 import math
 import hmac
 import calendar as pycalendar
+import socket
+import threading
 from datetime import datetime, timezone
 from typing import Dict, List, Tuple, Any, Optional
 
-import socket
-import threading
+from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import feedparser
 import psycopg2
@@ -156,11 +173,6 @@ _FEEDS_HEALTH_TS: int = 0
 # ============================================================
 
 def get_run_tokens() -> List[str]:
-    """
-    Reads env each call.
-    RUN_TOKEN: single token (legacy)
-    RUN_TOKENS: comma-separated list (new)
-    """
     rt = os.environ.get("RUN_TOKEN", "").strip()
     rts = os.environ.get("RUN_TOKENS", "").strip()
 
@@ -170,7 +182,6 @@ def get_run_tokens() -> List[str]:
     if rts:
         toks.extend([x.strip() for x in rts.split(",") if x.strip()])
 
-    # de-dup while preserving order
     seen = set()
     out: List[str] = []
     for t in toks:
@@ -328,45 +339,77 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 }
 
 # ============================================================
-# DB (pooled + fallback + SSL patch + SAFE)
+# DB (pooled + fallback direct conn + safe return/close + init-once)
 # ============================================================
 
 _DB_POOL: Optional[Any] = None
 _DB_READY = False
 
-def _append_sslmode_if_needed(db_url: str) -> str:
+def _ensure_sslmode_in_url(db_url: str) -> str:
     """
-    Railway Postgres often requires SSL.
-    If PGSSLMODE=require OR host looks like Railway proxy AND url has no sslmode -> append sslmode=require.
+    Railway часто требует SSL. Если в DATABASE_URL нет sslmode=..., добавляем sslmode из PGSSLMODE (default=require).
+    Поддерживает URL формата postgresql://... и обычный DSN.
     """
+    db_url = (db_url or "").strip()
     if not db_url:
         return db_url
 
-    low = db_url.lower()
-    if "sslmode=" in low:
-        return db_url
+    sslmode_env = os.environ.get("PGSSLMODE", "require").strip() or "require"
 
-    pgssl = (os.environ.get("PGSSLMODE", "") or "").strip().lower()
-    railwayish = ("rlwy.net" in low) or ("railway" in low) or ("interchange.proxy" in low)
+    # If it looks like a URL
+    if "://" in db_url:
+        try:
+            u = urlparse(db_url)
+            q = dict(parse_qsl(u.query, keep_blank_values=True))
+            if "sslmode" not in q or not str(q.get("sslmode") or "").strip():
+                q["sslmode"] = sslmode_env
+            new_q = urlencode(q)
+            u2 = u._replace(query=new_q)
+            return urlunparse(u2)
+        except Exception:
+            # fallback: append ?sslmode=
+            if "sslmode=" not in db_url:
+                sep = "&" if "?" in db_url else "?"
+                return db_url + f"{sep}sslmode={sslmode_env}"
+            return db_url
 
-    if pgssl == "require" or railwayish:
-        sep = "&" if "?" in db_url else "?"
-        return db_url + f"{sep}sslmode=require"
+    # DSN string
+    if "sslmode=" not in db_url.lower():
+        return db_url + f" sslmode={sslmode_env}"
     return db_url
 
 def _make_dsn() -> str:
     db_url = os.environ.get("DATABASE_URL", "").strip()
     if db_url:
-        db_url = _append_sslmode_if_needed(db_url)
-        return db_url
+        return _ensure_sslmode_in_url(db_url)
 
     host = os.environ.get("PGHOST", "localhost")
     port = os.environ.get("PGPORT", "5432")
     db = os.environ.get("PGDATABASE", "postgres")
     user = os.environ.get("PGUSER", "postgres")
     pwd = os.environ.get("PGPASSWORD", "")
-    sslmode = os.environ.get("PGSSLMODE", "prefer")
-    return f"host={host} port={port} dbname={db} user={user} password={pwd} sslmode={sslmode} connect_timeout=5"
+    sslmode_env = os.environ.get("PGSSLMODE", "prefer")
+    return f"host={host} port={port} dbname={db} user={user} password={pwd} connect_timeout=5 sslmode={sslmode_env}"
+
+def _connect_with_retries(dsn: str, tries: int = 3) -> Any:
+    """
+    Retry for common Railway/proxy hiccups:
+      - "server closed the connection unexpectedly"
+      - transient proxy resets
+    """
+    last_err = None
+    for i in range(max(1, int(tries))):
+        try:
+            return psycopg2.connect(dsn, connect_timeout=5)
+        except Exception as e:
+            last_err = e
+            msg = str(e).lower()
+            transient = ("server closed the connection unexpectedly" in msg) or ("connection reset" in msg) or ("terminating connection" in msg)
+            if i < tries - 1 and transient:
+                time.sleep(0.35 * (i + 1))
+                continue
+            raise
+    raise last_err  # type: ignore
 
 def _get_pool():
     global _DB_POOL
@@ -382,13 +425,18 @@ def _get_pool():
     minconn = int(os.environ.get("PGPOOL_MINCONN", "1"))
 
     try:
-        _DB_POOL = ThreadedConnectionPool(minconn=minconn, maxconn=maxconn, dsn=dsn)
+        pool = ThreadedConnectionPool(minconn=minconn, maxconn=maxconn, dsn=dsn)
+        # validate one connection
+        c = pool.getconn()
+        pool.putconn(c)
+        _DB_POOL = pool
     except Exception:
         _DB_POOL = None
     return _DB_POOL
 
 def db_conn():
     pool = _get_pool()
+    dsn = _make_dsn()
 
     if pool is not None:
         try:
@@ -400,14 +448,14 @@ def db_conn():
             return conn
         except Exception:
             # Any pool error -> fallback
-            conn = psycopg2.connect(_make_dsn())
+            conn = _connect_with_retries(dsn, tries=3)
             try:
                 setattr(conn, "_from_pool", False)
             except Exception:
                 pass
             return conn
 
-    conn = psycopg2.connect(_make_dsn())
+    conn = _connect_with_retries(dsn, tries=3)
     try:
         setattr(conn, "_from_pool", False)
     except Exception:
@@ -447,19 +495,12 @@ def db_close_pool():
         except Exception:
             pass
 
-def _try_db_init() -> Tuple[bool, str]:
-    """
-    SAFE: never raises. Returns (ok, error_string).
-    """
+def db_init():
     global _DB_READY
     if _DB_READY:
-        return True, ""
+        return
 
-    try:
-        conn = db_conn()
-    except Exception as e:
-        return False, str(e)
-
+    conn = db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
@@ -493,6 +534,7 @@ def _try_db_init() -> Tuple[bool, str]:
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
 
+                # Econ calendar store
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS econ_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -512,6 +554,7 @@ def _try_db_init() -> Tuple[bool, str]:
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_events_ts ON econ_events(event_ts DESC);")
 
+                # Optional alerts log
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS alerts_log (
                     id BIGSERIAL PRIMARY KEY,
@@ -526,16 +569,10 @@ def _try_db_init() -> Tuple[bool, str]:
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_log_created_ts ON alerts_log(created_ts DESC);")
 
         _DB_READY = True
-        return True, ""
-    except Exception as e:
-        return False, str(e)
     finally:
         db_put(conn)
 
 def save_bias(payload: Dict[str, Any]):
-    ok, _err = _try_db_init()
-    if not ok:
-        return
     now = int(time.time())
     conn = db_conn()
     try:
@@ -551,9 +588,6 @@ def save_bias(payload: Dict[str, Any]):
         db_put(conn)
 
 def load_bias() -> Optional[dict]:
-    ok, _err = _try_db_init()
-    if not ok:
-        return None
     conn = db_conn()
     row = None
     try:
@@ -572,9 +606,6 @@ def load_bias() -> Optional[dict]:
         return None
 
 def log_alert(kind: str, message: str, asset: Optional[str] = None, severity: str = "INFO", payload: Optional[dict] = None):
-    ok, _err = _try_db_init()
-    if not ok:
-        return
     now = int(time.time())
     conn = db_conn()
     try:
@@ -694,7 +725,6 @@ def _human_event_reason(reason_list: List[str]) -> str:
     return " | ".join(out)
 
 def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
-    # meta_fred.enabled means "drivers active", not "ingest performed"
     if not FRED_CFG.get("enabled", True):
         return False, "Disabled by env (FRED_ENABLED=0)"
     if requests is None:
@@ -739,18 +769,10 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
     return s[:8]
 
 # ============================================================
-# INGEST (NEWS) — network-first then DB batch (with budget)
+# INGEST (NEWS)
 # ============================================================
 
 def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) -> int:
-    """
-    If max_sec is set, we stop early when the budget is exceeded (quick mode).
-    SAFE: if DB down -> returns 0.
-    """
-    ok, _err = _try_db_init()
-    if not ok:
-        return 0
-
     inserted = 0
     now = int(time.time())
 
@@ -815,7 +837,7 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
     return inserted
 
 # ============================================================
-# INGEST (CALENDAR) — network-first then DB upsert batch
+# INGEST (CALENDAR)
 # ============================================================
 
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
@@ -975,14 +997,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     }
 
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
-    """
-    Counts ONLY true inserts (not updates) using RETURNING (xmax=0).
-    SAFE: if DB down -> returns 0.
-    """
-    ok, _err = _try_db_init()
-    if not ok:
-        return 0
-
     inserted = 0
     batch: List[Tuple[str, str, str, Optional[int], Dict[str, Optional[str]], str]] = []
 
@@ -1081,10 +1095,6 @@ def _macro_recent_flag(rows: List[Tuple[str, str, str, int]], now_ts: int) -> bo
     return False
 
 def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
-    ok, _err = _try_db_init()
-    if not ok:
-        return []
-
     lookahead_sec = int(EVENT_CFG["lookahead_hours"] * 3600)
     horizon = now_ts + lookahead_sec
 
@@ -1115,7 +1125,36 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             "in_hours": round((int(ts) - now_ts) / 3600.0, 2),
         })
 
-    return out[: int(EVENT_CFG["max_upcoming"])]
+    if out:
+        return out[: int(EVENT_CFG["max_upcoming"])]
+
+    # fallback: last events (even if time unknown)
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("""
+                SELECT source, title, link, event_ts, currency, impact, country
+                FROM econ_events
+                ORDER BY COALESCE(event_ts, 0) DESC, id DESC
+                LIMIT 12;
+            """)
+            rows2 = cur.fetchall()
+    finally:
+        db_put(conn)
+
+    unknown = []
+    for (source, title, link, ts, currency, impact, country) in rows2:
+        unknown.append({
+            "source": source,
+            "title": title,
+            "link": link,
+            "ts": int(ts) if ts else None,
+            "currency": (currency or None),
+            "impact": _impact_norm(impact),
+            "country": (country or None),
+            "in_hours": None
+        })
+    return unknown[:12]
 
 def _calendar_health(upcoming: List[Dict[str, Any]]) -> Dict[str, Any]:
     usd = 0
@@ -1184,9 +1223,6 @@ def fred_fetch_observations(series_id: str, days: int = 120) -> List[Tuple[str, 
     return out
 
 def fred_ingest_series(series_id: str, days: int = 120) -> int:
-    ok, _err = _try_db_init()
-    if not ok:
-        return 0
     obs = fred_fetch_observations(series_id, days=days)
     if not obs:
         return 0
@@ -1209,9 +1245,6 @@ def fred_ingest_series(series_id: str, days: int = 120) -> int:
     return inserted
 
 def fred_last_values(series_id: str, n: int = 90) -> List[float]:
-    ok, _err = _try_db_init()
-    if not ok:
-        return []
     conn = db_conn()
     try:
         with conn.cursor() as cur:
@@ -1391,31 +1424,6 @@ def compute_bias(
     allow_fred_ingest: bool = True,
     allow_fred_drivers: bool = True
 ) -> Dict[str, Any]:
-    ok, err = _try_db_init()
-    if not ok:
-        return {
-            "updated_utc": datetime.now(timezone.utc).isoformat(),
-            "assets": {a: {"bias": "NEUTRAL", "score": 0.0, "threshold": float(BIAS_THRESH.get(a, 1.0)), "quality_v2": 0,
-                           "evidence_count": 0, "source_diversity": 0, "consensus_ratio": 0.0, "conflict_index": 1.0,
-                           "freshness": {"0-2h": 0, "2-8h": 0, "8-24h": 0},
-                           "top3_drivers": [], "flip": flip_metrics(0.0, float(BIAS_THRESH.get(a, 1.0)), "NEUTRAL", 0.0),
-                           "consensus_by_source": [], "why_top5": []} for a in ASSETS},
-            "meta": {
-                "db_ok": False,
-                "db_error": str(err),
-                "gate_profile": GATE_PROFILE,
-                "run_token_required": bool(get_run_tokens()),
-                "run_token_hashes": get_run_token_hashes(),
-                "fred": {"enabled": False, "env_ok": False, "env_why": "DB down", "ingest_allowed": False, "ingested_points_last_run": 0,
-                         "series": list(FRED_SERIES.keys()), "requests_present": bool(requests is not None)},
-                "trump": {"enabled": bool(TRUMP_ENABLED), "flag": False, "items": []},
-            },
-            "event": {"enabled": bool(EVENT_CFG["enabled"]), "event_mode": False, "reason": ["db_down"], "recent_macro": False,
-                      "upcoming_events": [], "calendar_health": _calendar_health([]),
-                      "lookahead_hours": float(EVENT_CFG["lookahead_hours"]), "recent_hours": float(EVENT_CFG["recent_hours"]),
-                      "calendar_sources": list(CALENDAR_FEEDS)},
-        }
-
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -1433,6 +1441,7 @@ def compute_bias(
     finally:
         db_put(conn)
 
+    # FRED: ingest optional; drivers can be computed from existing DB points
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
@@ -1452,6 +1461,7 @@ def compute_bias(
         except Exception:
             fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
+    # Event mode
     upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
     recent_macro = _macro_recent_flag(rows, now)
     has_timed_event = any(x.get("ts") is not None for x in upcoming_events)
@@ -1509,6 +1519,7 @@ def compute_bias(
                     "pattern": m["pattern"],
                 })
 
+        # Inject FRED drivers (if allowed)
         if fred_drivers_on:
             for d in (fred_drivers.get(asset) or []):
                 c = float(d.get("w", 0.0))
@@ -1595,7 +1606,6 @@ def compute_bias(
             "lookback_hours": lookback_hours,
             "feeds": list(RSS_FEEDS.keys()),
             "gate_profile": GATE_PROFILE,
-            "db_ok": True,
             "fred": {
                 "enabled": bool(fred_drivers_on),
                 "env_ok": bool(fred_env_ok),
@@ -1630,8 +1640,6 @@ def compute_bias(
 def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     if not ALERT_CFG.get("enabled", True):
         return []
-    if not prev:
-        return []
 
     alerts: List[Dict[str, Any]] = []
     now = int(time.time())
@@ -1651,6 +1659,9 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
             log_alert(kind, message, asset=asset, severity=severity, payload=obj)
         except Exception:
             pass
+
+    if not prev:
+        return alerts
 
     p_assets = (prev.get("assets", {}) or {})
     c_assets = (cur.get("assets", {}) or {})
@@ -1737,41 +1748,41 @@ def pipeline_run(mode: str = "quick"):
     t0 = time.time()
     timing: Dict[str, Any] = {"mode": mode}
 
-    ok, err = _try_db_init()
-    if not ok:
-        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=False)
-        payload.setdefault("meta", {})
-        payload["meta"]["timing"] = {"mode": mode, "db_down": True, "db_error": str(err), "total_ms": int((time.time()-t0)*1000)}
-        return payload
-
     got_lock = _PIPELINE_LOCK.acquire(timeout=RUN_LOCK_TIMEOUT_SEC)
     if not got_lock:
+        # lock timeout -> serve last state if possible
+        db_init()
         last = load_bias()
         if last:
             last = dict(last)
             last.setdefault("meta", {})
             last["meta"]["timing"] = {"mode": mode, "lock_timeout": True, "total_ms": int((time.time()-t0)*1000)}
             return last
-        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=True)
-        payload.setdefault("meta", {})
-        payload["meta"]["timing"] = {"mode": mode, "lock_timeout": True, "total_ms": int((time.time()-t0)*1000)}
-        return payload
 
     try:
+        t1 = time.time()
+        db_init()
+        timing["db_init_ms"] = int((time.time() - t1) * 1000)
+
         prev = load_bias()
 
+        # Ingest news
         t1 = time.time()
         rss_limit = RSS_LIMIT_QUICK if mode == "quick" else RSS_LIMIT_FULL
         max_sec = RUN_MAX_SEC if mode == "quick" else None
         inserted_news = ingest_news_once(limit_per_feed=rss_limit, max_sec=max_sec)
         timing["rss_ingest_ms"] = int((time.time() - t1) * 1000)
 
+        # Ingest calendar
         t1 = time.time()
         cal_limit = CAL_LIMIT_QUICK if mode == "quick" else CAL_LIMIT_FULL
         inserted_cal = ingest_calendar_once(limit_per_feed=cal_limit)
         timing["cal_ingest_ms"] = int((time.time() - t1) * 1000)
 
+        # Bias compute
         t1 = time.time()
+
+        # Drivers can be ON (use DB) even if ingest is OFF.
         fred_ingest_allowed = bool(FRED_ON_RUN)
         if mode == "quick" and (not FRED_INGEST_EVERY_RUN):
             fred_ingest_allowed = False
@@ -1784,6 +1795,7 @@ def pipeline_run(mode: str = "quick"):
         )
         timing["compute_bias_ms"] = int((time.time() - t1) * 1000)
 
+        # Feeds status (cached in quick)
         t1 = time.time()
         feeds_status = feeds_health_live(force=(mode == "full"))
         timing["feeds_health_ms"] = int((time.time() - t1) * 1000)
@@ -1807,10 +1819,11 @@ def pipeline_run(mode: str = "quick"):
         return payload
 
     finally:
-        try:
-            _PIPELINE_LOCK.release()
-        except Exception:
-            pass
+        if got_lock:
+            try:
+                _PIPELINE_LOCK.release()
+            except Exception:
+                pass
 
 # ============================================================
 # TRADE GATE
@@ -1904,6 +1917,47 @@ def _on_shutdown():
 def root():
     return RedirectResponse(url="/dashboard", status_code=302)
 
+# ---------------------------
+# SAFE MODE HTML
+# ---------------------------
+
+def _safe_mode_page(detail: str) -> HTMLResponse:
+    detail = (detail or "").strip()
+    detail_esc = (detail.replace("&", "&amp;")
+                        .replace("<", "&lt;")
+                        .replace(">", "&gt;"))
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>DB DOWN</title>
+<style>
+html,body{{margin:0;background:#070a0f;color:#d7e2ff;font-family:ui-monospace,Menlo,Consolas,monospace}}
+.wrap{{max-width:1100px;margin:0 auto;padding:16px}}
+h1{{font-size:14px;color:#ffb000;margin:0 0 12px 0}}
+pre{{white-space:pre-wrap;word-break:break-word;background:#0b111a;border:1px solid rgba(255,255,255,.08);
+padding:12px;border-radius:12px;}}
+a{{color:#00e5ff;text-decoration:none}}
+a:hover{{text-decoration:underline}}
+.row{{display:flex;gap:10px;flex-wrap:wrap;margin:10px 0 14px}}
+.btn{{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
+background:#0f1724;color:#d7e2ff}}
+.small{{color:#7b8aa7;font-size:12px}}
+</style>
+</head><body>
+<div class="wrap">
+  <h1>DB DOWN — dashboard running in safe mode</h1>
+  <div class="row">
+    <a class="btn" href="/health?pretty=1">/health</a>
+    <a class="btn" href="/diag.json">/diag.json</a>
+    <a class="btn" href="/run">/run</a>
+  </div>
+  <div class="small">Fix hints: check DATABASE_URL, ensure sslmode=require, check Railway DB status / connection limits.</div>
+  <pre>{detail_esc}</pre>
+</div>
+</body></html>"""
+    return HTMLResponse(html)
+
 @app.get("/health")
 def health(pretty: int = 0):
     toks = get_run_tokens()
@@ -1918,7 +1972,7 @@ def health(pretty: int = 0):
         "db_pooling": bool(_get_pool() is not None),
         "run_mode_default": RUN_MODE_DEFAULT,
         "feeds_health_ttl_sec": FEEDS_HEALTH_TTL_SEC,
-        "sslmode": os.environ.get("PGSSLMODE", "prefer"),
+        "pgsslmode": os.environ.get("PGSSLMODE", ""),
     }
     if pretty:
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
@@ -1929,6 +1983,7 @@ def diag_json():
     toks = get_run_tokens()
     env = {
         "has_DATABASE_URL": bool(os.environ.get("DATABASE_URL", "").strip()),
+        "DATABASE_URL_ssl_enforced": _ensure_sslmode_in_url(os.environ.get("DATABASE_URL", "").strip()) if os.environ.get("DATABASE_URL") else "",
         "PGSSLMODE": os.environ.get("PGSSLMODE", "prefer"),
         "FRED_enabled": bool(FRED_CFG["enabled"]),
         "requests_present": bool(requests is not None),
@@ -1943,40 +1998,42 @@ def diag_json():
         "FRED_INGEST_EVERY_RUN": FRED_INGEST_EVERY_RUN,
     }
 
-    ok, err = _try_db_init()
+    ok = True
+    err = ""
     news_items = 0
     fred_points = 0
     has_bias_state = False
     econ_events = 0
     last_timing = None
-    if ok:
-        try:
-            conn = db_conn()
-            try:
-                with conn.cursor() as cur:
-                    cur.execute("SELECT COUNT(*) FROM news_items;")
-                    news_items = int(cur.fetchone()[0])
-                    cur.execute("SELECT COUNT(*) FROM fred_series;")
-                    fred_points = int(cur.fetchone()[0])
-                    cur.execute("SELECT COUNT(*) FROM bias_state;")
-                    has_bias_state = int(cur.fetchone()[0]) > 0
-                    cur.execute("SELECT COUNT(*) FROM econ_events;")
-                    econ_events = int(cur.fetchone()[0])
-            finally:
-                db_put(conn)
 
-            st = load_bias()
-            if st:
-                last_timing = ((st.get("meta", {}) or {}).get("timing", None))
-        except Exception as e:
-            ok = False
-            err = str(e)
+    try:
+        db_init()
+        conn = db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("SELECT COUNT(*) FROM news_items;")
+                news_items = int(cur.fetchone()[0])
+                cur.execute("SELECT COUNT(*) FROM fred_series;")
+                fred_points = int(cur.fetchone()[0])
+                cur.execute("SELECT COUNT(*) FROM bias_state;")
+                has_bias_state = int(cur.fetchone()[0]) > 0
+                cur.execute("SELECT COUNT(*) FROM econ_events;")
+                econ_events = int(cur.fetchone()[0])
+        finally:
+            db_put(conn)
+
+        st = load_bias()
+        if st:
+            last_timing = ((st.get("meta", {}) or {}).get("timing", None))
+
+    except Exception as e:
+        ok = False
+        err = str(e)
 
     return {
-        "db": {"ok": ok, "error": ("" if ok else err), "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events},
+        "db": {"ok": ok, "error": err, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events},
         "env": env,
         "last_timing": last_timing,
-        "dsn_preview": _make_dsn().replace(os.environ.get("PGPASSWORD", ""), "***") if os.environ.get("PGPASSWORD") else _make_dsn(),
     }
 
 @app.get("/diag", response_class=HTMLResponse)
@@ -2018,22 +2075,16 @@ def rules():
 
 @app.get("/bias")
 def bias(pretty: int = 0):
-    ok, err = _try_db_init()
-    if not ok:
-        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=False)
-        payload.setdefault("meta", {})
-        payload["meta"]["db_ok"] = False
-        payload["meta"]["db_error"] = str(err)
+    try:
+        db_init()
+        state = load_bias()
+        if not state:
+            state = pipeline_run(mode=RUN_MODE_DEFAULT)
         if pretty:
-            return PlainTextResponse(json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json")
-        return JSONResponse(payload, status_code=503)
-
-    state = load_bias()
-    if not state:
-        state = pipeline_run(mode=RUN_MODE_DEFAULT)
-    if pretty:
-        return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
-    return JSONResponse(state)
+            return PlainTextResponse(json.dumps(state, ensure_ascii=False, indent=2), media_type="application/json")
+        return JSONResponse(state)
+    except Exception as e:
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(e)}, status_code=503)
 
 # ---------------------------
 # RUN auth (DYNAMIC)
@@ -2069,10 +2120,6 @@ def run_get(mode: str = "", token: str = "", x_run_token: Optional[str] = Header
     if not _auth_run(t):
         return _unauth_response()
 
-    ok, err = _try_db_init()
-    if not ok:
-        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err)}, status_code=503)
-
     try:
         payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
         meta = payload.get("meta", {}) or {}
@@ -2083,7 +2130,7 @@ def run_get(mode: str = "", token: str = "", x_run_token: Optional[str] = Header
             "timing": (meta.get("timing") or {}),
         })
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(e)}, status_code=503)
 
 @app.post("/run")
 def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Header(default=None)):
@@ -2091,10 +2138,6 @@ def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Heade
     if not _auth_run(t):
         return _unauth_response()
 
-    ok, err = _try_db_init()
-    if not ok:
-        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err)}, status_code=503)
-
     try:
         payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
         meta = payload.get("meta", {}) or {}
@@ -2105,28 +2148,28 @@ def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Heade
             "timing": (meta.get("timing") or {}),
         })
     except Exception as e:
-        return JSONResponse({"ok": False, "error": str(e)}, status_code=500)
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(e)}, status_code=503)
 
 @app.get("/latest")
 def latest(limit: int = 40):
     limit = int(max(1, min(80, limit)))
-    ok, err = _try_db_init()
-    if not ok:
-        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err), "items": []}, status_code=503)
-
-    conn = db_conn()
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source, title, link, published_ts
-                FROM news_items
-                ORDER BY published_ts DESC
-                LIMIT %s;
-            """, (limit,))
-            rows = cur.fetchall()
-    finally:
-        db_put(conn)
-    return {"ok": True, "items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
+        db_init()
+        conn = db_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute("""
+                    SELECT source, title, link, published_ts
+                    FROM news_items
+                    ORDER BY published_ts DESC
+                    LIMIT %s;
+                """, (limit,))
+                rows = cur.fetchall()
+        finally:
+            db_put(conn)
+        return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
+    except Exception as e:
+        return {"items": [], "error": "db_down", "detail": str(e)}
 
 # MyFXBook calendar page (standalone)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
@@ -2149,7 +2192,7 @@ iframe{{border:0;width:100%;height:100%;}}
     return HTMLResponse(html)
 
 # ============================================================
-# UI (Decision/Monitor/Diag + Primary Strip + Tags)
+# DASHBOARD (with DB SAFE MODE)
 # ============================================================
 
 def _pill_bias(b: str) -> str:
@@ -2204,11 +2247,7 @@ def _why_tags(asset: str, assets: Dict[str, Any], event_mode: bool) -> str:
             blocker = "BLOCKED"
 
     out = []
-    if blocker == "OK":
-        out.append(_tag("OK", "ok"))
-    else:
-        out.append(_tag(f"BLOCK: {blocker}", "blk"))
-
+    out.append(_tag("OK", "ok") if blocker == "OK" else _tag(f"BLOCK: {blocker}", "blk"))
     out.append(_tag(f"Q {quality}/{qmin}", "t" if quality >= qmin else "bad"))
     out.append(_tag(f"C {conflict:.2f}>{cmax:.2f}" if conflict > cmax else f"C {conflict:.2f}", "bad" if conflict > cmax else "t"))
     out.append(_tag(f"S {score:.2f}/{th:.2f}", "t"))
@@ -2216,11 +2255,11 @@ def _why_tags(asset: str, assets: Dict[str, Any], event_mode: bool) -> str:
         out.append(_tag(f"Flip {flipd:.2f}<{flipmin:.2f}" if flipd < flipmin else f"Flip {flipd:.2f}", "bad" if flipd < flipmin else "t"))
     if event_mode:
         out.append(_tag("RISK ON", "warn"))
-
     return " ".join(out)
 
 def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
     meta = _calendar_health(upcoming)
+
     if not upcoming:
         return "No upcoming events in horizon", "", meta
 
@@ -2261,50 +2300,21 @@ def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_c
     note = f"{ccy} {imp or '—'}"
     return (f"(time unknown) • {note} • {pick.get('title','')}", str(pick.get("source", "")), meta)
 
-def _safe_mode_html(db_err: str) -> HTMLResponse:
-    html = f"""<!doctype html>
-<html><head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NEWS BIAS // TERMINAL</title>
-<style>
-html,body{{margin:0;background:#070a0f;color:#d7e2ff;font-family:ui-monospace,Menlo,Consolas,monospace}}
-.wrap{{max-width:1100px;margin:0 auto;padding:18px}}
-.box{{background:#0b111a;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px}}
-h1{{font-size:14px;color:#ffb000;margin:0 0 10px 0}}
-a{{color:#00e5ff;text-decoration:none}}
-a:hover{{text-decoration:underline}}
-.btn{{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
-background:#0f1724;color:#d7e2ff;margin-right:8px}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#070a0f;border:1px solid rgba(255,255,255,.08);
-padding:10px;border-radius:12px;margin-top:10px}}
-</style></head><body>
-<div class="wrap">
-  <div class="box">
-    <h1>DB DOWN — dashboard running in safe mode</h1>
-    <div style="margin:10px 0 6px 0;">
-      <a class="btn" href="/health">/health</a>
-      <a class="btn" href="/diag.json">/diag.json</a>
-      <a class="btn" href="/run">/run</a>
-    </div>
-    <pre>{db_err}</pre>
-    <div style="margin-top:10px;color:#7b8aa7">
-      Fix hints: check DATABASE_URL, set PGSSLMODE=require, check Railway DB status / connection limits.
-    </div>
-  </div>
-</div>
-</body></html>"""
-    return HTMLResponse(html, status_code=200)
-
 @app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(view: str = Query(default="")):
-    ok, err = _try_db_init()
-    if not ok:
-        return _safe_mode_html(str(err))
+    # If DB is down, show safe mode instead of crashing
+    try:
+        db_init()
+    except Exception as e:
+        return _safe_mode_page(str(e))
 
-    payload = load_bias()
-    if not payload:
-        payload = pipeline_run(mode=RUN_MODE_DEFAULT)
+    payload = None
+    try:
+        payload = load_bias()
+        if not payload:
+            payload = pipeline_run(mode=RUN_MODE_DEFAULT)
+    except Exception as e:
+        return _safe_mode_page(str(e))
 
     payload["meta"] = (payload.get("meta", {}) or {})
     payload["meta"]["run_token_required"] = bool(get_run_tokens())
@@ -2334,6 +2344,7 @@ def dashboard(view: str = Query(default="")):
     fred_on, _fred_why = _fred_status(meta.get("fred", {}) or {})
     token_required, _token_why = _run_token_status()
 
+    # compute gate per asset
     for sym in ASSETS:
         a = assets.get(sym, {}) or {}
         a["ui_gate"] = eval_trade_gate(a, event_mode, gate_profile)
@@ -2352,13 +2363,13 @@ def dashboard(view: str = Query(default="")):
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
-        ok_ = bool(gate.get("ok", False))
+        ok = bool(gate.get("ok", False))
         tags = _why_tags(asset, assets, event_mode)
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
           <td>{_pill_bias(bias)}</td>
-          <td>{_pill_gate(ok_)}</td>
+          <td>{_pill_gate(ok)}</td>
           <td class="why">{tags}</td>
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
@@ -2368,7 +2379,7 @@ def dashboard(view: str = Query(default="")):
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
-        ok_ = bool(gate.get("ok", False))
+        ok = bool(gate.get("ok", False))
         tags = _why_tags(asset, assets, event_mode)
         return f"""
         <div class="sumCard">
@@ -2376,7 +2387,7 @@ def dashboard(view: str = Query(default="")):
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
               <span class="sym">{asset}</span>
               {_pill_bias(bias)}
-              {_pill_gate(ok_)}
+              {_pill_gate(ok)}
             </div>
             <div><button class="btn" onclick="openView('{asset}')">View</button></div>
           </div>
@@ -2384,14 +2395,13 @@ def dashboard(view: str = Query(default="")):
         </div>
         """
 
-    risk_badge  = _tag("RISK HIGH" if event_mode else "RISK LOW", "warn" if event_mode else "t")
+    risk_badge = _tag("RISK HIGH" if event_mode else "RISK LOW", "warn" if event_mode else "t")
     feeds_badge = _tag(f"FEEDS {'OK' if feeds_ok else 'DEG'} {feeds_ok_ratio:.2f}", "ok" if feeds_ok else "bad")
     macro_badge = _tag("MACRO ON" if fred_on else "MACRO OFF", "t")
-    run_badge   = _tag("RUN LOCK" if token_required else "RUN OPEN", "t")
-    head_badge  = _tag("HEAD HOT" if (trump_enabled and trump_flag) else ("HEAD ON" if trump_enabled else "HEAD OFF"),
-                       "warn" if (trump_enabled and trump_flag) else "t")
-
-    next_badge  = _tag("NEXT: " + (next_event_line[:120] + ("…" if len(next_event_line) > 120 else "")), "t")
+    run_badge = _tag("RUN LOCK" if token_required else "RUN OPEN", "t")
+    head_badge = _tag("HEAD HOT" if (trump_enabled and trump_flag) else ("HEAD ON" if trump_enabled else "HEAD OFF"),
+                      "warn" if (trump_enabled and trump_flag) else "t")
+    next_badge = _tag("NEXT: " + (next_event_line[:120] + ("…" if len(next_event_line) > 120 else "")), "t")
 
     TEMPLATE = """<!doctype html>
 <html>
@@ -2414,36 +2424,65 @@ def dashboard(view: str = Query(default="")):
     a:hover{text-decoration:underline;}
     .wrap{max-width:1250px; margin:0 auto; padding:14px;}
     .hdr{border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px;}
-    .topbar{display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;}
+
+    .topbar{
+      display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;
+    }
     .brand{font-family:var(--mono); font-weight:900; letter-spacing:.8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
     .brand b{color:var(--amber);}
     .profile{font-family:var(--mono); font-size:12px; color:var(--muted);}
     .profile b{color:var(--amber);}
+
     .modes{display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
-    .modebtn{font-family:var(--mono); font-weight:900; font-size:12px;padding:8px 10px; border-radius:12px;
-      border:1px solid var(--line); background:var(--pillbg); color:#b8c3da; cursor:pointer;}
+    .modebtn{
+      font-family:var(--mono); font-weight:900; font-size:12px;
+      padding:8px 10px; border-radius:12px;
+      border:1px solid var(--line); background:var(--pillbg); color:#b8c3da;
+      cursor:pointer;
+    }
     .modebtn.active{color:var(--amber); border-color:rgba(255,176,0,.25);}
-    .strip{margin-top:12px;display:flex; gap:8px; flex-wrap:wrap; align-items:center;font-family:var(--mono);}
-    .tagpill{display:inline-flex; align-items:center; gap:8px;padding:7px 10px; border-radius:999px;border:1px solid var(--line);
-      background:var(--pillbg);font-size:12px; font-weight:900; color:#b8c3da;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
+    .modebtn:active{transform:translateY(1px);}
+
+    .strip{
+      margin-top:12px;
+      display:flex; gap:8px; flex-wrap:wrap; align-items:center;
+      font-family:var(--mono);
+    }
+
+    .tagpill{
+      display:inline-flex; align-items:center; gap:8px;
+      padding:7px 10px; border-radius:999px;
+      border:1px solid var(--line); background:var(--pillbg);
+      font-size:12px; font-weight:900; color:#b8c3da;
+      max-width:100%;
+      overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+    }
     .tagpill.ok{color:var(--ok); border-color:rgba(0,255,106,.25);}
     .tagpill.warn{color:var(--warn); border-color:rgba(255,176,0,.25);}
     .tagpill.bad{color:var(--no); border-color:rgba(255,59,59,.25);}
     .tagpill.blk{color:var(--no); border-color:rgba(255,59,59,.35); background:rgba(255,59,59,.07);}
+
     .actions{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px;}
-    .btn{background:var(--btn); border:1px solid var(--line); color:var(--text);
-      padding:9px 12px; border-radius:12px; cursor:pointer;font-family:var(--mono); font-weight:900; font-size:12px;}
+    .btn{
+      background:var(--btn); border:1px solid var(--line); color:var(--text);
+      padding:9px 12px; border-radius:12px; cursor:pointer;
+      font-family:var(--mono); font-weight:900; font-size:12px;
+    }
     .btn:hover{background:var(--btn2);}
+    .btn:active{transform:translateY(1px);}
+
     .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
     .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .no{color:var(--no); border-color: rgba(255,59,59,.25);}
+
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
     .blockTitle{font-family:var(--mono); font-size:12px; font-weight:900; color:var(--muted); letter-spacing:.6px; margin:0 0 8px 2px;}
     .metaLine{font-family:var(--mono); color:var(--muted); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; align-items:center;}
     .metaLine .v{color:var(--text); font-weight:900;}
+
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900; text-align:left;}
@@ -2451,11 +2490,15 @@ def dashboard(view: str = Query(default="")):
     .why{overflow-wrap:anywhere; word-break:break-word; line-height:1.55;}
     .act{text-align:right; white-space:nowrap;}
     .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch;}
+
     .sumCards{display:none;}
     .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
     .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
     .sumWhy{margin-top:10px; font-family:var(--mono); font-size:12px; line-height:1.55; word-break:break-word;}
+
     .muted{color:var(--muted);}
+
+    /* Monitor blocks */
     .tvwrap{margin-top:10px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .tickerstack{margin-top:10px; display:flex; flex-direction:column; gap:10px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -2467,6 +2510,8 @@ def dashboard(view: str = Query(default="")):
     .tick{font-family:var(--mono); font-size:12px; color:var(--text);}
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
+
+    /* Modal */
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding:14px; z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
@@ -2477,9 +2522,11 @@ def dashboard(view: str = Query(default="")):
     .item{padding:10px 0; border-top:1px solid var(--line);}
     .item .t{font-weight:900;}
     .item .m{color:var(--muted); margin-top:6px; line-height:1.45;}
+
     details{border:1px solid var(--line); border-radius:14px; padding:10px 12px; background:rgba(255,255,255,.02);}
     details summary{cursor:pointer; font-family:var(--mono); font-weight:900; color:#b8c3da;}
     details[open] summary{color:var(--amber);}
+
     @media(max-width:640px){
       .tablewrap{display:none;}
       .sumCards{display:block;}
@@ -2487,14 +2534,17 @@ def dashboard(view: str = Query(default="")):
     }
   </style>
 </head>
+
 <body>
 <div class="wrap">
+
   <div class="hdr">
     <div class="topbar">
       <div class="brand">
         <div><b>NEWS BIAS</b> // TERMINAL</div>
         <div class="profile">Profile: <b>__GATE_PROFILE__</b></div>
       </div>
+
       <div class="modes">
         <button class="modebtn" id="mDecision" onclick="setMode('decision')">Decision</button>
         <button class="modebtn" id="mMonitor"  onclick="setMode('monitor')">Monitor</button>
@@ -2522,8 +2572,10 @@ def dashboard(view: str = Query(default="")):
     </div>
   </div>
 
+  <!-- DECISION -->
   <div class="panel" id="blockDecision">
     <div class="blockTitle">DECISION MATRIX</div>
+
     <div class="tablewrap">
       <table>
         <colgroup>
@@ -2537,18 +2589,22 @@ def dashboard(view: str = Query(default="")):
         <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
       </table>
     </div>
+
     <div class="sumCards">
       __CARD_XAU__
       __CARD_US500__
       __CARD_WTI__
     </div>
+
     <div class="muted" style="font-family:var(--mono); font-size:12px; margin-top:10px;">
       Goal: 1-second read. Hotkeys: R/M/E • 1/2/3 • Esc.
     </div>
   </div>
 
+  <!-- MONITOR -->
   <div class="panel" id="blockMonitor" style="display:none;">
     <div class="blockTitle">MONITOR</div>
+
     <details open>
       <summary>Market tape</summary>
       <div class="tvwrap" style="margin-top:10px;">
@@ -2574,6 +2630,7 @@ def dashboard(view: str = Query(default="")):
     </div>
   </div>
 
+  <!-- DIAG -->
   <div class="panel" id="blockDiag" style="display:none;">
     <div class="blockTitle">DIAG</div>
     <div class="metaLine">
@@ -2583,6 +2640,7 @@ def dashboard(view: str = Query(default="")):
       <span><a href="/health?pretty=1" target="_blank" rel="noopener">Open /health</a></span>
     </div>
   </div>
+
 </div>
 
 <div class="modal" id="modal">
@@ -2681,14 +2739,8 @@ def dashboard(view: str = Query(default="")):
         return;
       }
 
-      if(resp.status === 503){
-        showModal('RUN: DB DOWN', '<div class="panel"><div class="h2">DB down</div><div class="list"><div class="item"><div class="t">'
-          + escapeHtml(js.detail || js.error || 'db_down') + '</div></div></div></div>');
-        return;
-      }
-
-      if(js && js.ok === false && js.error){
-        showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
+      if(js && js.ok === false && (js.error || js.detail)){
+        showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error||'') + '</div><div class="m">' + escapeHtml(js.detail||'') + '</div></div></div></div>');
         return;
       }
 
@@ -2750,7 +2802,7 @@ def dashboard(view: str = Query(default="")):
     });
 
     const html =
-      '<div class="panel"><div class="h2">Overflow (Feeds / Macro / Run / Diag)</div>'
+      '<div class="panel"><div class="h2">Overflow (Feeds/Macro/Run/Diag)</div>'
       + '<div class="list">'
       + '<div class="item"><div class="t">FEEDS</div><div class="m">GOOD/WARN/BAD/SKIP = ' + escapeHtml(good+' / '+warn+' / '+bad+' / '+skip) + '</div></div>'
       + '<div class="item"><div class="t">MACRO (FRED)</div><div class="m">enabled=' + escapeHtml(String(!!fred.enabled)) + ', env=' + escapeHtml(String(fred.env_why||'')) + '</div></div>'
@@ -2766,32 +2818,65 @@ def dashboard(view: str = Query(default="")):
     var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
     var upcoming = (ev.upcoming_events || []).slice(0, 24);
     var ch = (ev.calendar_health || {});
+
+    const buckets = {};
+    upcoming.forEach(function(x){
+      const ts = x.ts ? Number(x.ts) : 0;
+      const key = ts ? (new Date(ts*1000).toISOString().slice(0,16)+'Z') : 'unknown';
+      if(!buckets[key]) buckets[key]=[];
+      buckets[key].push(x);
+    });
+
+    const keys = Object.keys(buckets).sort();
+
+    function row(x){
+      const ts = x.ts ? Number(x.ts) : 0;
+      const when = ts ? new Date(ts*1000).toISOString().replace('T',' ').slice(0,16) + ' UTC' : '(time unknown)';
+      const ccy = x.currency || '—';
+      const imp = x.impact || '—';
+      return '<div class="item"><div class="t">' + escapeHtml(when) + ' • ' + escapeHtml(ccy) + ' • ' + escapeHtml(imp) + '</div>'
+             + '<div class="m">' + escapeHtml(x.title||'') + '</div>'
+             + (x.link ? ('<div class="m"><a href="' + escapeHtml(x.link) + '" target="_blank" rel="noopener">Open</a></div>') : '')
+             + '</div>';
+    }
+
+    const blocks = keys.map(function(k){
+      const arr = buckets[k] || [];
+      const tsLabel = (k==='unknown') ? 'time unknown' : (k.replace('T',' ').replace('Z',' UTC'));
+      if(arr.length > 1){
+        const title = 'Bundle (' + arr.length + ') • ' + tsLabel;
+        return '<details><summary>' + escapeHtml(title) + '</summary>'
+             + '<div style="margin-top:8px;">' + arr.map(row).join('') + '</div></details>';
+      }
+      return '<div class="panel"><div class="h2">' + escapeHtml(tsLabel) + '</div><div class="list">' + arr.map(row).join('') + '</div></div>';
+    }).join('<div style="height:10px"></div>');
+
     var html =
       '<div class="panel"><div class="h2">Morning</div><div class="list">'
       + '<div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>'
       + '<div class="item"><div class="t">Risk mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
       + '<div class="item"><div class="t">Calendar parse</div><div class="m">USD=' + escapeHtml(String(ch.usd||0)) + ', timed=' + escapeHtml(String(ch.timed||0)) + ', unknown=' + escapeHtml(String(ch.unknown_currency||0)) + '</div></div>'
-      + '</div></div>';
+      + '</div></div>'
+      + '<div style="margin-top:12px;">' + (blocks || '<div class="panel"><div class="h2">Upcoming events</div><div class="list"><div class="item"><div class="t">—</div></div></div></div>') + '</div>';
+
     showModal('M MORNING', html);
   }
 
   function openMyfx(){
-    showModal('E MYFX CAL', '<div class="panel"><div class="h2">MyFXBook Economic Calendar</div><div class="list">'
-      + '<div class="item"><div class="t">Open</div><div class="m"><a href="/myfx_calendar" target="_blank" rel="noopener">/myfx_calendar</a></div></div>'
-      + '</div></div>');
+    var html = ''
+      + '<div class="panel">'
+      + '  <div class="h2">MyFXBook Economic Calendar</div>'
+      + '  <div class="list">'
+      + '    <div class="item"><div class="t">Open</div><div class="m"><a href="/myfx_calendar" target="_blank" rel="noopener">/myfx_calendar</a></div></div>'
+      + '  </div>'
+      + '</div>';
+    showModal('E MYFX CAL', html);
   }
 
   function openView(sym){
-    // Minimal view for now (doesn't break). You can extend later.
-    const a = (PAYLOAD.assets || {})[sym] || {};
-    const gate = a.ui_gate || {};
-    const html = '<div class="panel"><div class="h2">'+escapeHtml(sym)+' details</div><div class="list">'
-      + '<div class="item"><div class="t">Bias</div><div class="m">'+escapeHtml(String(a.bias||'—'))+'</div></div>'
-      + '<div class="item"><div class="t">Score</div><div class="m">'+escapeHtml(String(a.score||0))+' / T='+escapeHtml(String(a.threshold||0))+'</div></div>'
-      + '<div class="item"><div class="t">Quality</div><div class="m">'+escapeHtml(String(a.quality_v2||0))+'</div></div>'
-      + '<div class="item"><div class="t">Gate</div><div class="m">'+escapeHtml(String(gate.label||'—'))+' • '+escapeHtml((gate.fail_reasons||[]).join(' | ')||'OK')+'</div></div>'
-      + '</div></div>';
-    showModal('VIEW '+sym, html);
+    // оставлено как заглушка: ты можешь вставить свою прошлую openView реализацию сюда,
+    // если хочешь модалку с деталями. Базовый dashboard + run + monitor работают без неё.
+    showModal('VIEW ' + sym, '<div class="panel"><div class="h2">Info</div><div class="list"><div class="item"><div class="t">openView</div><div class="m">Stub. Dashboard is running.</div></div></div></div>');
   }
 
   document.addEventListener('keydown', function(e){

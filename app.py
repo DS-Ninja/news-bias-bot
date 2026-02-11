@@ -1574,8 +1574,8 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
             )
 
     p_meta = (prev.get("meta", {}) or {})
-    c_meta = (cur.get("meta", {}) or {})
     p_fs = (p_meta.get("feeds_status", {}) or {})
+    c_meta = (cur.get("meta", {}) or {})
     c_fs = (c_meta.get("feeds_status", {}) or {})
     if c_fs:
         pr = _feeds_ok_ratio(p_fs) if p_fs else 1.0

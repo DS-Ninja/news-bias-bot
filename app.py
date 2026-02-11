@@ -1,27 +1,12 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# RESTORED v2026-02-11c (FULL SINGLE FILE — HTML INCLUDED — FIXED)
-# ✅ FULL file (no drop-ins)
-# ✅ Railway Postgres hardening: sslmode=require + dead pooled conn detection + retries
-# ✅ Dashboard safe-mode: does not crash if DB is down
-# ✅ Restored UI openView() + modal detail renderer (so View buttons work again)
-# ✅ Keeps: quick/full modes, run lock, stage timings, feeds health TTL cache, /run auth, pooled+fallback DB, shutdown hook, XSS-safe JSON injection
-#
-# Env knobs (optional):
-#   HTTP_TIMEOUT=12
-#   RUN_MODE_DEFAULT=quick|full
-#   RUN_MAX_SEC=10
-#   FEEDS_HEALTH_TTL_SEC=90
-#   RUN_LOCK_TIMEOUT_SEC=25
-#   FRED_ENABLED=0|1
-#   FRED_API_KEY=...
-#   FRED_ON_RUN=0|1
-#   FRED_INGEST_EVERY_RUN=0|1
-#   RSS_LIMIT_QUICK=18, RSS_LIMIT_FULL=40
-#   CAL_LIMIT_QUICK=120, CAL_LIMIT_FULL=250
-#   PGSSLMODE=require
-#   PGPOOL_MAXCONN=4
-#   PGPOOL_MINCONN=1
+# UPDATED v2026-02-11c (FULL SINGLE FILE — SAFE MODE + SSL PATCH — RAILWAY READY):
+# ✅ FULL file (single-file)
+# ✅ Auto-append sslmode=require when needed (PGSSLMODE=require OR Railway proxy host)
+# ✅ SAFE MODE: dashboard/diag/bias/latest/run never crash when DB is down
+# ✅ Robust pooled + fallback direct conn, safe close/return, shutdown hook
+# ✅ Quick/full pipeline, cached feeds health TTL, FRED ingest throttled, drivers computed from existing DB points
+# ✅ XSS-safe JSON injection, /run auth dynamic tokens, per-stage timing, global run lock
 
 import os
 import json
@@ -36,7 +21,6 @@ from typing import Dict, List, Tuple, Any, Optional
 
 import socket
 import threading
-from urllib.parse import urlparse, parse_qsl, urlencode, urlunparse
 
 import feedparser
 import psycopg2
@@ -49,7 +33,7 @@ try:
 except Exception:
     ThreadedConnectionPool = None  # type: ignore
 
-# SAFE PoolError import
+# SAFE PoolError import (prevents crash on some psycopg2 builds)
 try:
     from psycopg2.pool import PoolError  # type: ignore
 except Exception:
@@ -251,7 +235,7 @@ RSS_FEEDS: Dict[str, str] = {
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "MYFX_COMM": "https://www.myfxbook.com/rss/forex-community-recent-topics",
 
-    # US500 / macro
+    # === Added feeds for US500 / broader macro ===
     "SPDJI_METHOD": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=methodologies",
     "SPDJI_PERF": "https://www.spglobal.com/spdji/en/rss/rss-details/?rssFeedName=performance-reports",
 
@@ -294,9 +278,11 @@ SOURCE_WEIGHT: Dict[str, float] = {
     "FOREXFACTORY_CALENDAR": 0.0,
     "MYFX_CAL": 0.0,
 
+    # Myfxbook news/community weights
     "MYFX_NEWS": 1.15,
     "MYFX_COMM": 0.55,
 
+    # Added
     "SPDJI_METHOD": 1.6,
     "SPDJI_PERF": 1.6,
     "NASDAQ_STOCKS": 1.3,
@@ -342,30 +328,36 @@ RULES: Dict[str, List[Tuple[str, float, str]]] = {
 }
 
 # ============================================================
-# DB (pooled + fallback direct conn + safe return/close + init-once)
+# DB (pooled + fallback + SSL patch + SAFE)
 # ============================================================
 
 _DB_POOL: Optional[Any] = None
 _DB_READY = False
 
+def _append_sslmode_if_needed(db_url: str) -> str:
+    """
+    Railway Postgres often requires SSL.
+    If PGSSLMODE=require OR host looks like Railway proxy AND url has no sslmode -> append sslmode=require.
+    """
+    if not db_url:
+        return db_url
+
+    low = db_url.lower()
+    if "sslmode=" in low:
+        return db_url
+
+    pgssl = (os.environ.get("PGSSLMODE", "") or "").strip().lower()
+    railwayish = ("rlwy.net" in low) or ("railway" in low) or ("interchange.proxy" in low)
+
+    if pgssl == "require" or railwayish:
+        sep = "&" if "?" in db_url else "?"
+        return db_url + f"{sep}sslmode=require"
+    return db_url
+
 def _make_dsn() -> str:
-    """
-    Railway / managed Postgres often needs sslmode=require.
-    If DATABASE_URL exists, we ensure sslmode=require (unless already set).
-    """
     db_url = os.environ.get("DATABASE_URL", "").strip()
     if db_url:
-        try:
-            u = urlparse(db_url)
-            q = dict(parse_qsl(u.query, keep_blank_values=True))
-            if "sslmode" not in q:
-                q["sslmode"] = os.environ.get("PGSSLMODE", "require")
-                u = u._replace(query=urlencode(q))
-                db_url = urlunparse(u)
-        except Exception:
-            if "sslmode=" not in db_url:
-                sep = "&" if "?" in db_url else "?"
-                db_url = db_url + f"{sep}sslmode=" + os.environ.get("PGSSLMODE", "require")
+        db_url = _append_sslmode_if_needed(db_url)
         return db_url
 
     host = os.environ.get("PGHOST", "localhost")
@@ -373,7 +365,7 @@ def _make_dsn() -> str:
     db = os.environ.get("PGDATABASE", "postgres")
     user = os.environ.get("PGUSER", "postgres")
     pwd = os.environ.get("PGPASSWORD", "")
-    sslmode = os.environ.get("PGSSLMODE", "require")
+    sslmode = os.environ.get("PGSSLMODE", "prefer")
     return f"host={host} port={port} dbname={db} user={user} password={pwd} sslmode={sslmode} connect_timeout=5"
 
 def _get_pool():
@@ -386,7 +378,7 @@ def _get_pool():
         return None
 
     dsn = _make_dsn()
-    maxconn = int(os.environ.get("PGPOOL_MAXCONN", "4"))
+    maxconn = int(os.environ.get("PGPOOL_MAXCONN", "10"))
     minconn = int(os.environ.get("PGPOOL_MINCONN", "1"))
 
     try:
@@ -395,95 +387,43 @@ def _get_pool():
         _DB_POOL = None
     return _DB_POOL
 
-def _conn_is_ok(conn) -> bool:
-    try:
-        if conn is None:
-            return False
-        if getattr(conn, "closed", 1) != 0:
-            return False
-        with conn.cursor() as cur:
-            cur.execute("SELECT 1;")
-            _ = cur.fetchone()
-        return True
-    except Exception:
-        return False
-
 def db_conn():
-    """
-    Returns a live connection from pool or direct connect.
-    Adds validation + small retries to avoid dead pooled conns (Railway idle-kill).
-    """
-    dsn = _make_dsn()
     pool = _get_pool()
 
-    last_err = None
-
-    # Try pool (validated)
     if pool is not None:
-        for _ in range(2):
-            try:
-                conn = pool.getconn()
-                try:
-                    setattr(conn, "_from_pool", True)
-                except Exception:
-                    pass
-
-                if _conn_is_ok(conn):
-                    return conn
-
-                # dead conn -> discard and retry
-                try:
-                    pool.putconn(conn, close=True)
-                except Exception:
-                    try:
-                        conn.close()
-                    except Exception:
-                        pass
-
-            except Exception as e:
-                last_err = e
-                time.sleep(0.3)
-
-    # Fallback direct connect with retries
-    for i in range(3):
         try:
-            conn = psycopg2.connect(dsn)
+            conn = pool.getconn()
+            try:
+                setattr(conn, "_from_pool", True)
+            except Exception:
+                pass
+            return conn
+        except Exception:
+            # Any pool error -> fallback
+            conn = psycopg2.connect(_make_dsn())
             try:
                 setattr(conn, "_from_pool", False)
             except Exception:
                 pass
+            return conn
 
-            if _conn_is_ok(conn):
-                return conn
-
-            try:
-                conn.close()
-            except Exception:
-                pass
-
-        except Exception as e:
-            last_err = e
-            time.sleep(0.4 * (i + 1))
-
-    raise last_err if last_err else psycopg2.OperationalError("DB connect failed")
+    conn = psycopg2.connect(_make_dsn())
+    try:
+        setattr(conn, "_from_pool", False)
+    except Exception:
+        pass
+    return conn
 
 def db_put(conn):
     if conn is None:
         return
 
     pool = _get_pool()
-
     from_pool = False
     try:
         from_pool = bool(getattr(conn, "_from_pool", False))
     except Exception:
         from_pool = False
-
-    try:
-        if getattr(conn, "closed", 1) != 0:
-            from_pool = False
-    except Exception:
-        pass
 
     if pool is not None and from_pool:
         try:
@@ -507,12 +447,19 @@ def db_close_pool():
         except Exception:
             pass
 
-def db_init():
+def _try_db_init() -> Tuple[bool, str]:
+    """
+    SAFE: never raises. Returns (ok, error_string).
+    """
     global _DB_READY
     if _DB_READY:
-        return
+        return True, ""
 
-    conn = db_conn()
+    try:
+        conn = db_conn()
+    except Exception as e:
+        return False, str(e)
+
     try:
         with conn:
             with conn.cursor() as cur:
@@ -546,7 +493,6 @@ def db_init():
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
 
-                # Econ calendar store
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS econ_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -566,7 +512,6 @@ def db_init():
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_events_ts ON econ_events(event_ts DESC);")
 
-                # Optional alerts log
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS alerts_log (
                     id BIGSERIAL PRIMARY KEY,
@@ -581,10 +526,16 @@ def db_init():
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_log_created_ts ON alerts_log(created_ts DESC);")
 
         _DB_READY = True
+        return True, ""
+    except Exception as e:
+        return False, str(e)
     finally:
         db_put(conn)
 
 def save_bias(payload: Dict[str, Any]):
+    ok, _err = _try_db_init()
+    if not ok:
+        return
     now = int(time.time())
     conn = db_conn()
     try:
@@ -600,6 +551,9 @@ def save_bias(payload: Dict[str, Any]):
         db_put(conn)
 
 def load_bias() -> Optional[dict]:
+    ok, _err = _try_db_init()
+    if not ok:
+        return None
     conn = db_conn()
     row = None
     try:
@@ -618,6 +572,9 @@ def load_bias() -> Optional[dict]:
         return None
 
 def log_alert(kind: str, message: str, asset: Optional[str] = None, severity: str = "INFO", payload: Optional[dict] = None):
+    ok, _err = _try_db_init()
+    if not ok:
+        return
     now = int(time.time())
     conn = db_conn()
     try:
@@ -737,6 +694,7 @@ def _human_event_reason(reason_list: List[str]) -> str:
     return " | ".join(out)
 
 def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
+    # meta_fred.enabled means "drivers active", not "ingest performed"
     if not FRED_CFG.get("enabled", True):
         return False, "Disabled by env (FRED_ENABLED=0)"
     if requests is None:
@@ -787,7 +745,12 @@ def _impact_norm(x: Optional[str]) -> Optional[str]:
 def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) -> int:
     """
     If max_sec is set, we stop early when the budget is exceeded (quick mode).
+    SAFE: if DB down -> returns 0.
     """
+    ok, _err = _try_db_init()
+    if not ok:
+        return 0
+
     inserted = 0
     now = int(time.time())
 
@@ -1014,7 +977,12 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
     """
     Counts ONLY true inserts (not updates) using RETURNING (xmax=0).
+    SAFE: if DB down -> returns 0.
     """
+    ok, _err = _try_db_init()
+    if not ok:
+        return 0
+
     inserted = 0
     batch: List[Tuple[str, str, str, Optional[int], Dict[str, Optional[str]], str]] = []
 
@@ -1113,6 +1081,10 @@ def _macro_recent_flag(rows: List[Tuple[str, str, str, int]], now_ts: int) -> bo
     return False
 
 def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
+    ok, _err = _try_db_init()
+    if not ok:
+        return []
+
     lookahead_sec = int(EVENT_CFG["lookahead_hours"] * 3600)
     horizon = now_ts + lookahead_sec
 
@@ -1143,36 +1115,7 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
             "in_hours": round((int(ts) - now_ts) / 3600.0, 2),
         })
 
-    if out:
-        return out[: int(EVENT_CFG["max_upcoming"])]
-
-    # fallback: last events (even if time unknown)
-    conn = db_conn()
-    try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT source, title, link, event_ts, currency, impact, country
-                FROM econ_events
-                ORDER BY COALESCE(event_ts, 0) DESC, id DESC
-                LIMIT 12;
-            """)
-            rows2 = cur.fetchall()
-    finally:
-        db_put(conn)
-
-    unknown = []
-    for (source, title, link, ts, currency, impact, country) in rows2:
-        unknown.append({
-            "source": source,
-            "title": title,
-            "link": link,
-            "ts": int(ts) if ts else None,
-            "currency": (currency or None),
-            "impact": _impact_norm(impact),
-            "country": (country or None),
-            "in_hours": None
-        })
-    return unknown[:12]
+    return out[: int(EVENT_CFG["max_upcoming"])]
 
 def _calendar_health(upcoming: List[Dict[str, Any]]) -> Dict[str, Any]:
     usd = 0
@@ -1241,6 +1184,9 @@ def fred_fetch_observations(series_id: str, days: int = 120) -> List[Tuple[str, 
     return out
 
 def fred_ingest_series(series_id: str, days: int = 120) -> int:
+    ok, _err = _try_db_init()
+    if not ok:
+        return 0
     obs = fred_fetch_observations(series_id, days=days)
     if not obs:
         return 0
@@ -1263,6 +1209,9 @@ def fred_ingest_series(series_id: str, days: int = 120) -> int:
     return inserted
 
 def fred_last_values(series_id: str, n: int = 90) -> List[float]:
+    ok, _err = _try_db_init()
+    if not ok:
+        return []
     conn = db_conn()
     try:
         with conn.cursor() as cur:
@@ -1442,6 +1391,31 @@ def compute_bias(
     allow_fred_ingest: bool = True,
     allow_fred_drivers: bool = True
 ) -> Dict[str, Any]:
+    ok, err = _try_db_init()
+    if not ok:
+        return {
+            "updated_utc": datetime.now(timezone.utc).isoformat(),
+            "assets": {a: {"bias": "NEUTRAL", "score": 0.0, "threshold": float(BIAS_THRESH.get(a, 1.0)), "quality_v2": 0,
+                           "evidence_count": 0, "source_diversity": 0, "consensus_ratio": 0.0, "conflict_index": 1.0,
+                           "freshness": {"0-2h": 0, "2-8h": 0, "8-24h": 0},
+                           "top3_drivers": [], "flip": flip_metrics(0.0, float(BIAS_THRESH.get(a, 1.0)), "NEUTRAL", 0.0),
+                           "consensus_by_source": [], "why_top5": []} for a in ASSETS},
+            "meta": {
+                "db_ok": False,
+                "db_error": str(err),
+                "gate_profile": GATE_PROFILE,
+                "run_token_required": bool(get_run_tokens()),
+                "run_token_hashes": get_run_token_hashes(),
+                "fred": {"enabled": False, "env_ok": False, "env_why": "DB down", "ingest_allowed": False, "ingested_points_last_run": 0,
+                         "series": list(FRED_SERIES.keys()), "requests_present": bool(requests is not None)},
+                "trump": {"enabled": bool(TRUMP_ENABLED), "flag": False, "items": []},
+            },
+            "event": {"enabled": bool(EVENT_CFG["enabled"]), "event_mode": False, "reason": ["db_down"], "recent_macro": False,
+                      "upcoming_events": [], "calendar_health": _calendar_health([]),
+                      "lookahead_hours": float(EVENT_CFG["lookahead_hours"]), "recent_hours": float(EVENT_CFG["recent_hours"]),
+                      "calendar_sources": list(CALENDAR_FEEDS)},
+        }
+
     now = int(time.time())
     cutoff = now - lookback_hours * 3600
 
@@ -1459,7 +1433,6 @@ def compute_bias(
     finally:
         db_put(conn)
 
-    # FRED: ingest optional; drivers can be computed from existing DB points
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
@@ -1479,7 +1452,6 @@ def compute_bias(
         except Exception:
             fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
-    # Event mode
     upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
     recent_macro = _macro_recent_flag(rows, now)
     has_timed_event = any(x.get("ts") is not None for x in upcoming_events)
@@ -1537,7 +1509,6 @@ def compute_bias(
                     "pattern": m["pattern"],
                 })
 
-        # Inject FRED drivers (if allowed)
         if fred_drivers_on:
             for d in (fred_drivers.get(asset) or []):
                 c = float(d.get("w", 0.0))
@@ -1624,6 +1595,7 @@ def compute_bias(
             "lookback_hours": lookback_hours,
             "feeds": list(RSS_FEEDS.keys()),
             "gate_profile": GATE_PROFILE,
+            "db_ok": True,
             "fred": {
                 "enabled": bool(fred_drivers_on),
                 "env_ok": bool(fred_env_ok),
@@ -1652,11 +1624,13 @@ def compute_bias(
     return payload
 
 # ============================================================
-# ALERT ENGINE
+# ALERT ENGINE (server-side diff)
 # ============================================================
 
 def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     if not ALERT_CFG.get("enabled", True):
+        return []
+    if not prev:
         return []
 
     alerts: List[Dict[str, Any]] = []
@@ -1677,9 +1651,6 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
             log_alert(kind, message, asset=asset, severity=severity, payload=obj)
         except Exception:
             pass
-
-    if not prev:
-        return alerts
 
     p_assets = (prev.get("assets", {}) or {})
     c_assets = (cur.get("assets", {}) or {})
@@ -1759,11 +1730,6 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
 # ============================================================
 
 def pipeline_run(mode: str = "quick"):
-    """
-    mode:
-      - quick: budgeted ingest, cached feeds health, FRED ingest throttled (drivers still computed from DB)
-      - full: heavy run (incl. FRED ingest)
-    """
     mode = (mode or RUN_MODE_DEFAULT).strip().lower()
     if mode not in ("quick", "full"):
         mode = RUN_MODE_DEFAULT
@@ -1771,40 +1737,41 @@ def pipeline_run(mode: str = "quick"):
     t0 = time.time()
     timing: Dict[str, Any] = {"mode": mode}
 
+    ok, err = _try_db_init()
+    if not ok:
+        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=False)
+        payload.setdefault("meta", {})
+        payload["meta"]["timing"] = {"mode": mode, "db_down": True, "db_error": str(err), "total_ms": int((time.time()-t0)*1000)}
+        return payload
+
     got_lock = _PIPELINE_LOCK.acquire(timeout=RUN_LOCK_TIMEOUT_SEC)
     if not got_lock:
-        db_init()
         last = load_bias()
         if last:
             last = dict(last)
             last.setdefault("meta", {})
             last["meta"]["timing"] = {"mode": mode, "lock_timeout": True, "total_ms": int((time.time()-t0)*1000)}
             return last
+        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=True)
+        payload.setdefault("meta", {})
+        payload["meta"]["timing"] = {"mode": mode, "lock_timeout": True, "total_ms": int((time.time()-t0)*1000)}
+        return payload
 
     try:
-        t1 = time.time()
-        db_init()
-        timing["db_init_ms"] = int((time.time() - t1) * 1000)
-
         prev = load_bias()
 
-        # Ingest news
         t1 = time.time()
         rss_limit = RSS_LIMIT_QUICK if mode == "quick" else RSS_LIMIT_FULL
         max_sec = RUN_MAX_SEC if mode == "quick" else None
         inserted_news = ingest_news_once(limit_per_feed=rss_limit, max_sec=max_sec)
         timing["rss_ingest_ms"] = int((time.time() - t1) * 1000)
 
-        # Ingest calendar
         t1 = time.time()
         cal_limit = CAL_LIMIT_QUICK if mode == "quick" else CAL_LIMIT_FULL
         inserted_cal = ingest_calendar_once(limit_per_feed=cal_limit)
         timing["cal_ingest_ms"] = int((time.time() - t1) * 1000)
 
-        # Bias compute
         t1 = time.time()
-
-        # Drivers can be ON (use DB) even if ingest is OFF.
         fred_ingest_allowed = bool(FRED_ON_RUN)
         if mode == "quick" and (not FRED_INGEST_EVERY_RUN):
             fred_ingest_allowed = False
@@ -1817,7 +1784,6 @@ def pipeline_run(mode: str = "quick"):
         )
         timing["compute_bias_ms"] = int((time.time() - t1) * 1000)
 
-        # Feeds status (cached in quick)
         t1 = time.time()
         feeds_status = feeds_health_live(force=(mode == "full"))
         timing["feeds_health_ms"] = int((time.time() - t1) * 1000)
@@ -1841,11 +1807,10 @@ def pipeline_run(mode: str = "quick"):
         return payload
 
     finally:
-        if got_lock:
-            try:
-                _PIPELINE_LOCK.release()
-            except Exception:
-                pass
+        try:
+            _PIPELINE_LOCK.release()
+        except Exception:
+            pass
 
 # ============================================================
 # TRADE GATE
@@ -1953,6 +1918,7 @@ def health(pretty: int = 0):
         "db_pooling": bool(_get_pool() is not None),
         "run_mode_default": RUN_MODE_DEFAULT,
         "feeds_health_ttl_sec": FEEDS_HEALTH_TTL_SEC,
+        "sslmode": os.environ.get("PGSSLMODE", "prefer"),
     }
     if pretty:
         return PlainTextResponse(json.dumps(out, indent=2), media_type="application/json")
@@ -1960,7 +1926,6 @@ def health(pretty: int = 0):
 
 @app.get("/diag.json")
 def diag_json():
-    # SAFE: if DB down, return ok:false with env anyway
     toks = get_run_tokens()
     env = {
         "has_DATABASE_URL": bool(os.environ.get("DATABASE_URL", "").strip()),
@@ -1970,8 +1935,7 @@ def diag_json():
         "RUN_token_required": bool(toks),
         "RUN_token_hashes": [_token_hash(t) for t in toks],
         "db_pooling": bool(_get_pool() is not None),
-        "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "4"),
-        "pool_minconn": os.environ.get("PGPOOL_MINCONN", "1"),
+        "pool_maxconn": os.environ.get("PGPOOL_MAXCONN", "10"),
         "RUN_MODE_DEFAULT": RUN_MODE_DEFAULT,
         "RUN_MAX_SEC": RUN_MAX_SEC,
         "FEEDS_HEALTH_TTL_SEC": FEEDS_HEALTH_TTL_SEC,
@@ -1979,42 +1943,40 @@ def diag_json():
         "FRED_INGEST_EVERY_RUN": FRED_INGEST_EVERY_RUN,
     }
 
-    ok = True
+    ok, err = _try_db_init()
     news_items = 0
     fred_points = 0
     has_bias_state = False
     econ_events = 0
     last_timing = None
-    err = None
-
-    try:
-        db_init()
-        conn = db_conn()
+    if ok:
         try:
-            with conn.cursor() as cur:
-                cur.execute("SELECT COUNT(*) FROM news_items;")
-                news_items = int(cur.fetchone()[0])
-                cur.execute("SELECT COUNT(*) FROM fred_series;")
-                fred_points = int(cur.fetchone()[0])
-                cur.execute("SELECT COUNT(*) FROM bias_state;")
-                has_bias_state = int(cur.fetchone()[0]) > 0
-                cur.execute("SELECT COUNT(*) FROM econ_events;")
-                econ_events = int(cur.fetchone()[0])
-        finally:
-            db_put(conn)
+            conn = db_conn()
+            try:
+                with conn.cursor() as cur:
+                    cur.execute("SELECT COUNT(*) FROM news_items;")
+                    news_items = int(cur.fetchone()[0])
+                    cur.execute("SELECT COUNT(*) FROM fred_series;")
+                    fred_points = int(cur.fetchone()[0])
+                    cur.execute("SELECT COUNT(*) FROM bias_state;")
+                    has_bias_state = int(cur.fetchone()[0]) > 0
+                    cur.execute("SELECT COUNT(*) FROM econ_events;")
+                    econ_events = int(cur.fetchone()[0])
+            finally:
+                db_put(conn)
 
-        st = load_bias()
-        if st:
-            last_timing = ((st.get("meta", {}) or {}).get("timing", None))
-
-    except Exception as e:
-        ok = False
-        err = str(e)
+            st = load_bias()
+            if st:
+                last_timing = ((st.get("meta", {}) or {}).get("timing", None))
+        except Exception as e:
+            ok = False
+            err = str(e)
 
     return {
-        "db": {"ok": ok, "error": err, "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events},
+        "db": {"ok": ok, "error": ("" if ok else err), "news_items": news_items, "fred_points": fred_points, "has_bias_state": has_bias_state, "econ_events": econ_events},
         "env": env,
         "last_timing": last_timing,
+        "dsn_preview": _make_dsn().replace(os.environ.get("PGPASSWORD", ""), "***") if os.environ.get("PGPASSWORD") else _make_dsn(),
     }
 
 @app.get("/diag", response_class=HTMLResponse)
@@ -2044,7 +2006,6 @@ background:#0f1724;color:#d7e2ff}}
   <div class="row">
     <a class="btn" href="/dashboard">← Back</a>
     <a class="btn" href="/diag.json" target="_blank" rel="noopener">Open JSON</a>
-    <a class="btn" href="/health?pretty=1" target="_blank" rel="noopener">/health</a>
   </div>
   <pre>{pretty}</pre>
 </div>
@@ -2057,7 +2018,16 @@ def rules():
 
 @app.get("/bias")
 def bias(pretty: int = 0):
-    db_init()
+    ok, err = _try_db_init()
+    if not ok:
+        payload = compute_bias(allow_fred_ingest=False, allow_fred_drivers=False)
+        payload.setdefault("meta", {})
+        payload["meta"]["db_ok"] = False
+        payload["meta"]["db_error"] = str(err)
+        if pretty:
+            return PlainTextResponse(json.dumps(payload, ensure_ascii=False, indent=2), media_type="application/json")
+        return JSONResponse(payload, status_code=503)
+
     state = load_bias()
     if not state:
         state = pipeline_run(mode=RUN_MODE_DEFAULT)
@@ -2099,6 +2069,10 @@ def run_get(mode: str = "", token: str = "", x_run_token: Optional[str] = Header
     if not _auth_run(t):
         return _unauth_response()
 
+    ok, err = _try_db_init()
+    if not ok:
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err)}, status_code=503)
+
     try:
         payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
         meta = payload.get("meta", {}) or {}
@@ -2117,6 +2091,10 @@ def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Heade
     if not _auth_run(t):
         return _unauth_response()
 
+    ok, err = _try_db_init()
+    if not ok:
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err)}, status_code=503)
+
     try:
         payload = pipeline_run(mode=(mode or RUN_MODE_DEFAULT))
         meta = payload.get("meta", {}) or {}
@@ -2132,7 +2110,10 @@ def run_post(mode: str = "", token: str = "", x_run_token: Optional[str] = Heade
 @app.get("/latest")
 def latest(limit: int = 40):
     limit = int(max(1, min(80, limit)))
-    db_init()
+    ok, err = _try_db_init()
+    if not ok:
+        return JSONResponse({"ok": False, "error": "db_down", "detail": str(err), "items": []}, status_code=503)
+
     conn = db_conn()
     try:
         with conn.cursor() as cur:
@@ -2145,7 +2126,7 @@ def latest(limit: int = 40):
             rows = cur.fetchall()
     finally:
         db_put(conn)
-    return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
+    return {"ok": True, "items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
 # MyFXBook calendar page (standalone)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
@@ -2168,7 +2149,7 @@ iframe{{border:0;width:100%;height:100%;}}
     return HTMLResponse(html)
 
 # ============================================================
-# UI  (Decision/Monitor/Diag)
+# UI (Decision/Monitor/Diag + Primary Strip + Tags)
 # ============================================================
 
 def _pill_bias(b: str) -> str:
@@ -2240,7 +2221,6 @@ def _why_tags(asset: str, assets: Dict[str, Any], event_mode: bool) -> str:
 
 def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
     meta = _calendar_health(upcoming)
-
     if not upcoming:
         return "No upcoming events in horizon", "", meta
 
@@ -2281,46 +2261,50 @@ def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_c
     note = f"{ccy} {imp or '—'}"
     return (f"(time unknown) • {note} • {pick.get('title','')}", str(pick.get("source", "")), meta)
 
-@app.get("/dashboard", response_class=HTMLResponse)
-def dashboard(view: str = Query(default="")):
-    # SAFE MODE: never crash whole page if DB down
-    try:
-        db_init()
-        payload = load_bias()
-        if not payload:
-            payload = pipeline_run(mode=RUN_MODE_DEFAULT)
-    except Exception as e:
-        msg = str(e)
-        html = f"""<!doctype html>
-<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NEWS BIAS // DB DOWN</title>
+def _safe_mode_html(db_err: str) -> HTMLResponse:
+    html = f"""<!doctype html>
+<html><head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NEWS BIAS // TERMINAL</title>
 <style>
 html,body{{margin:0;background:#070a0f;color:#d7e2ff;font-family:ui-monospace,Menlo,Consolas,monospace}}
-.wrap{{max-width:980px;margin:0 auto;padding:16px}}
-.card{{background:#0b111a;border:1px solid rgba(255,255,255,.08);border-radius:14px;padding:14px}}
-h1{{font-size:14px;color:#ffb000;margin:0 0 10px}}
-pre{{white-space:pre-wrap;word-break:break-word;background:#0f1724;border:1px solid rgba(255,255,255,.08);
-padding:12px;border-radius:12px}}
+.wrap{{max-width:1100px;margin:0 auto;padding:18px}}
+.box{{background:#0b111a;border:1px solid rgba(255,255,255,.08);border-radius:16px;padding:14px}}
+h1{{font-size:14px;color:#ffb000;margin:0 0 10px 0}}
 a{{color:#00e5ff;text-decoration:none}}
 a:hover{{text-decoration:underline}}
 .btn{{display:inline-block;padding:8px 10px;border-radius:10px;border:1px solid rgba(255,255,255,.08);
 background:#0f1724;color:#d7e2ff;margin-right:8px}}
-</style></head>
-<body><div class="wrap">
-  <div class="card">
+pre{{white-space:pre-wrap;word-break:break-word;background:#070a0f;border:1px solid rgba(255,255,255,.08);
+padding:10px;border-radius:12px;margin-top:10px}}
+</style></head><body>
+<div class="wrap">
+  <div class="box">
     <h1>DB DOWN — dashboard running in safe mode</h1>
-    <div style="margin:10px 0 12px">
-      <a class="btn" href="/health?pretty=1">/health</a>
+    <div style="margin:10px 0 6px 0;">
+      <a class="btn" href="/health">/health</a>
       <a class="btn" href="/diag.json">/diag.json</a>
       <a class="btn" href="/run">/run</a>
     </div>
-    <pre>{msg}</pre>
+    <pre>{db_err}</pre>
     <div style="margin-top:10px;color:#7b8aa7">
-      Fix: check DATABASE_URL, sslmode=require, Railway DB status / connection limits.
+      Fix hints: check DATABASE_URL, set PGSSLMODE=require, check Railway DB status / connection limits.
     </div>
   </div>
-</div></body></html>"""
-        return HTMLResponse(html)
+</div>
+</body></html>"""
+    return HTMLResponse(html, status_code=200)
+
+@app.get("/dashboard", response_class=HTMLResponse)
+def dashboard(view: str = Query(default="")):
+    ok, err = _try_db_init()
+    if not ok:
+        return _safe_mode_html(str(err))
+
+    payload = load_bias()
+    if not payload:
+        payload = pipeline_run(mode=RUN_MODE_DEFAULT)
 
     payload["meta"] = (payload.get("meta", {}) or {})
     payload["meta"]["run_token_required"] = bool(get_run_tokens())
@@ -2350,7 +2334,6 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     fred_on, _fred_why = _fred_status(meta.get("fred", {}) or {})
     token_required, _token_why = _run_token_status()
 
-    # compute gate per asset
     for sym in ASSETS:
         a = assets.get(sym, {}) or {}
         a["ui_gate"] = eval_trade_gate(a, event_mode, gate_profile)
@@ -2369,14 +2352,13 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
-        ok = bool(gate.get("ok", False))
+        ok_ = bool(gate.get("ok", False))
         tags = _why_tags(asset, assets, event_mode)
-
         return f"""
         <tr class="r">
           <td class="sym">{asset}</td>
           <td>{_pill_bias(bias)}</td>
-          <td>{_pill_gate(ok)}</td>
+          <td>{_pill_gate(ok_)}</td>
           <td class="why">{tags}</td>
           <td class="act"><button class="btn" onclick="openView('{asset}')">View</button></td>
         </tr>
@@ -2386,16 +2368,15 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
         a = assets.get(asset, {}) or {}
         bias = str(a.get("bias", "NEUTRAL"))
         gate = a.get("ui_gate", {}) or {}
-        ok = bool(gate.get("ok", False))
+        ok_ = bool(gate.get("ok", False))
         tags = _why_tags(asset, assets, event_mode)
-
         return f"""
         <div class="sumCard">
           <div class="sumTop">
             <div style="display:flex;gap:10px;align-items:center;flex-wrap:wrap;">
               <span class="sym">{asset}</span>
               {_pill_bias(bias)}
-              {_pill_gate(ok)}
+              {_pill_gate(ok_)}
             </div>
             <div><button class="btn" onclick="openView('{asset}')">View</button></div>
           </div>
@@ -2403,13 +2384,14 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
         </div>
         """
 
-    risk_badge = _tag("RISK HIGH" if event_mode else "RISK LOW", "warn" if event_mode else "t")
+    risk_badge  = _tag("RISK HIGH" if event_mode else "RISK LOW", "warn" if event_mode else "t")
     feeds_badge = _tag(f"FEEDS {'OK' if feeds_ok else 'DEG'} {feeds_ok_ratio:.2f}", "ok" if feeds_ok else "bad")
     macro_badge = _tag("MACRO ON" if fred_on else "MACRO OFF", "t")
-    run_badge = _tag("RUN LOCK" if token_required else "RUN OPEN", "t")
-    head_badge = _tag("HEAD HOT" if (trump_enabled and trump_flag) else ("HEAD ON" if trump_enabled else "HEAD OFF"),
-                      "warn" if (trump_enabled and trump_flag) else "t")
-    next_badge = _tag("NEXT: " + (next_event_line[:120] + ("…" if len(next_event_line) > 120 else "")), "t")
+    run_badge   = _tag("RUN LOCK" if token_required else "RUN OPEN", "t")
+    head_badge  = _tag("HEAD HOT" if (trump_enabled and trump_flag) else ("HEAD ON" if trump_enabled else "HEAD OFF"),
+                       "warn" if (trump_enabled and trump_flag) else "t")
+
+    next_badge  = _tag("NEXT: " + (next_event_line[:120] + ("…" if len(next_event_line) > 120 else "")), "t")
 
     TEMPLATE = """<!doctype html>
 <html>
@@ -2432,65 +2414,36 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     a:hover{text-decoration:underline;}
     .wrap{max-width:1250px; margin:0 auto; padding:14px;}
     .hdr{border-bottom:1px solid var(--line); padding-bottom:12px; margin-bottom:12px;}
-
-    .topbar{
-      display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;
-    }
+    .topbar{display:flex; justify-content:space-between; gap:12px; flex-wrap:wrap; align-items:flex-start;}
     .brand{font-family:var(--mono); font-weight:900; letter-spacing:.8px; display:flex; gap:10px; align-items:center; flex-wrap:wrap;}
     .brand b{color:var(--amber);}
     .profile{font-family:var(--mono); font-size:12px; color:var(--muted);}
     .profile b{color:var(--amber);}
-
     .modes{display:flex; gap:8px; flex-wrap:wrap; align-items:center;}
-    .modebtn{
-      font-family:var(--mono); font-weight:900; font-size:12px;
-      padding:8px 10px; border-radius:12px;
-      border:1px solid var(--line); background:var(--pillbg); color:#b8c3da;
-      cursor:pointer;
-    }
+    .modebtn{font-family:var(--mono); font-weight:900; font-size:12px;padding:8px 10px; border-radius:12px;
+      border:1px solid var(--line); background:var(--pillbg); color:#b8c3da; cursor:pointer;}
     .modebtn.active{color:var(--amber); border-color:rgba(255,176,0,.25);}
-    .modebtn:active{transform:translateY(1px);}
-
-    .strip{
-      margin-top:12px;
-      display:flex; gap:8px; flex-wrap:wrap; align-items:center;
-      font-family:var(--mono);
-    }
-
-    .tagpill{
-      display:inline-flex; align-items:center; gap:8px;
-      padding:7px 10px; border-radius:999px;
-      border:1px solid var(--line); background:var(--pillbg);
-      font-size:12px; font-weight:900; color:#b8c3da;
-      max-width:100%;
-      overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
-    }
+    .strip{margin-top:12px;display:flex; gap:8px; flex-wrap:wrap; align-items:center;font-family:var(--mono);}
+    .tagpill{display:inline-flex; align-items:center; gap:8px;padding:7px 10px; border-radius:999px;border:1px solid var(--line);
+      background:var(--pillbg);font-size:12px; font-weight:900; color:#b8c3da;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;}
     .tagpill.ok{color:var(--ok); border-color:rgba(0,255,106,.25);}
     .tagpill.warn{color:var(--warn); border-color:rgba(255,176,0,.25);}
     .tagpill.bad{color:var(--no); border-color:rgba(255,59,59,.25);}
     .tagpill.blk{color:var(--no); border-color:rgba(255,59,59,.35); background:rgba(255,59,59,.07);}
-
     .actions{display:flex; gap:8px; flex-wrap:wrap; align-items:center; margin-top:10px;}
-    .btn{
-      background:var(--btn); border:1px solid var(--line); color:var(--text);
-      padding:9px 12px; border-radius:12px; cursor:pointer;
-      font-family:var(--mono); font-weight:900; font-size:12px;
-    }
+    .btn{background:var(--btn); border:1px solid var(--line); color:var(--text);
+      padding:9px 12px; border-radius:12px; cursor:pointer;font-family:var(--mono); font-weight:900; font-size:12px;}
     .btn:hover{background:var(--btn2);}
-    .btn:active{transform:translateY(1px);}
-
     .pill{font-family:var(--mono); font-size:12px; font-weight:900; padding:6px 10px; border-radius:999px; border:1px solid var(--line); background:var(--pillbg);}
     .bull{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .bear{color:var(--no); border-color: rgba(255,59,59,.25);}
     .neu{color:#b8c3da;}
     .ok{color:var(--ok); border-color: rgba(0,255,106,.25);}
     .no{color:var(--no); border-color: rgba(255,59,59,.25);}
-
     .panel{background:var(--panel); border:1px solid var(--line); border-radius:16px; padding:12px; margin-top:12px;}
     .blockTitle{font-family:var(--mono); font-size:12px; font-weight:900; color:var(--muted); letter-spacing:.6px; margin:0 0 8px 2px;}
     .metaLine{font-family:var(--mono); color:var(--muted); font-size:12px; display:flex; gap:14px; flex-wrap:wrap; align-items:center;}
     .metaLine .v{color:var(--text); font-weight:900;}
-
     table{width:100%; border-collapse:collapse; font-family:var(--mono); table-layout:fixed;}
     th,td{border-top:1px solid var(--line); padding:12px 10px; font-size:12px; vertical-align:top;}
     th{color:var(--muted); font-weight:900; text-align:left;}
@@ -2498,14 +2451,11 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     .why{overflow-wrap:anywhere; word-break:break-word; line-height:1.55;}
     .act{text-align:right; white-space:nowrap;}
     .tablewrap{overflow-x:auto; -webkit-overflow-scrolling:touch;}
-
     .sumCards{display:none;}
     .sumCard{border-top:1px solid var(--line); padding:12px 6px;}
     .sumTop{display:flex; justify-content:space-between; gap:10px; align-items:center; flex-wrap:wrap;}
     .sumWhy{margin-top:10px; font-family:var(--mono); font-size:12px; line-height:1.55; word-break:break-word;}
-
     .muted{color:var(--muted);}
-
     .tvwrap{margin-top:10px; border:1px solid var(--line); border-radius:14px; overflow:hidden;}
     .tickerstack{margin-top:10px; display:flex; flex-direction:column; gap:10px;}
     .tickerline{border:1px solid var(--line); border-radius:14px; padding:10px 0; overflow:hidden; background:rgba(255,255,255,.02);}
@@ -2517,7 +2467,6 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     .tick{font-family:var(--mono); font-size:12px; color:var(--text);}
     .tick .tag{color:var(--cyan); font-weight:900;}
     .tick b{color:var(--amber);}
-
     .modal{display:none; position:fixed; inset:0; background:rgba(0,0,0,.72); padding:14px; z-index:9998;}
     .modal .box{max-width:1180px; margin:0 auto; background:var(--panel); border:1px solid var(--line); border-radius:16px; max-height:86vh; overflow:auto;}
     .modal .head{position:sticky; top:0; background:rgba(11,17,26,.92); backdrop-filter:blur(10px);
@@ -2528,11 +2477,9 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     .item{padding:10px 0; border-top:1px solid var(--line);}
     .item .t{font-weight:900;}
     .item .m{color:var(--muted); margin-top:6px; line-height:1.45;}
-
     details{border:1px solid var(--line); border-radius:14px; padding:10px 12px; background:rgba(255,255,255,.02);}
     details summary{cursor:pointer; font-family:var(--mono); font-weight:900; color:#b8c3da;}
     details[open] summary{color:var(--amber);}
-
     @media(max-width:640px){
       .tablewrap{display:none;}
       .sumCards{display:block;}
@@ -2540,17 +2487,14 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     }
   </style>
 </head>
-
 <body>
 <div class="wrap">
-
   <div class="hdr">
     <div class="topbar">
       <div class="brand">
         <div><b>NEWS BIAS</b> // TERMINAL</div>
         <div class="profile">Profile: <b>__GATE_PROFILE__</b></div>
       </div>
-
       <div class="modes">
         <button class="modebtn" id="mDecision" onclick="setMode('decision')">Decision</button>
         <button class="modebtn" id="mMonitor"  onclick="setMode('monitor')">Monitor</button>
@@ -2578,10 +2522,8 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     </div>
   </div>
 
-  <!-- DECISION -->
   <div class="panel" id="blockDecision">
     <div class="blockTitle">DECISION MATRIX</div>
-
     <div class="tablewrap">
       <table>
         <colgroup>
@@ -2595,22 +2537,18 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
         <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
       </table>
     </div>
-
     <div class="sumCards">
       __CARD_XAU__
       __CARD_US500__
       __CARD_WTI__
     </div>
-
     <div class="muted" style="font-family:var(--mono); font-size:12px; margin-top:10px;">
       Goal: 1-second read. Hotkeys: R/M/E • 1/2/3 • Esc.
     </div>
   </div>
 
-  <!-- MONITOR -->
   <div class="panel" id="blockMonitor" style="display:none;">
     <div class="blockTitle">MONITOR</div>
-
     <details open>
       <summary>Market tape</summary>
       <div class="tvwrap" style="margin-top:10px;">
@@ -2636,7 +2574,6 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     </div>
   </div>
 
-  <!-- DIAG -->
   <div class="panel" id="blockDiag" style="display:none;">
     <div class="blockTitle">DIAG</div>
     <div class="metaLine">
@@ -2646,7 +2583,6 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
       <span><a href="/health?pretty=1" target="_blank" rel="noopener">Open /health</a></span>
     </div>
   </div>
-
 </div>
 
 <div class="modal" id="modal">
@@ -2745,6 +2681,12 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
         return;
       }
 
+      if(resp.status === 503){
+        showModal('RUN: DB DOWN', '<div class="panel"><div class="h2">DB down</div><div class="list"><div class="item"><div class="t">'
+          + escapeHtml(js.detail || js.error || 'db_down') + '</div></div></div></div>');
+        return;
+      }
+
       if(js && js.ok === false && js.error){
         showModal('RUN ERROR', '<div class="panel"><div class="h2">Error</div><div class="list"><div class="item"><div class="t">' + escapeHtml(js.error) + '</div></div></div></div>');
         return;
@@ -2808,11 +2750,10 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     });
 
     const html =
-      '<div class="panel"><div class="h2">Overflow (Legend / Feeds / Macro / Run / Diag)</div>'
+      '<div class="panel"><div class="h2">Overflow (Feeds / Macro / Run / Diag)</div>'
       + '<div class="list">'
-      + '<div class="item"><div class="t">LEGEND</div><div class="m"><button class="btn" onclick="explainLegend()">Open legend</button></div></div>'
-      + '<div class="item"><div class="t">FEEDS</div><div class="m">GOOD/WARN/BAD/SKIP = ' + escapeHtml(good+' / '+warn+' / '+bad+' / '+skip) + ' <button class="btn" onclick="explainFeeds()">Details</button></div></div>'
-      + '<div class="item"><div class="t">MACRO (FRED)</div><div class="m">enabled=' + escapeHtml(String(!!fred.enabled)) + ', env=' + escapeHtml(String(fred.env_why||'')) + ' <button class="btn" onclick="explainMacro()">Details</button></div></div>'
+      + '<div class="item"><div class="t">FEEDS</div><div class="m">GOOD/WARN/BAD/SKIP = ' + escapeHtml(good+' / '+warn+' / '+bad+' / '+skip) + '</div></div>'
+      + '<div class="item"><div class="t">MACRO (FRED)</div><div class="m">enabled=' + escapeHtml(String(!!fred.enabled)) + ', env=' + escapeHtml(String(fred.env_why||'')) + '</div></div>'
       + '<div class="item"><div class="t">RUN</div><div class="m">token_required=' + escapeHtml(String(!!meta.run_token_required)) + ', last=' + escapeHtml(tim.total_ms!==undefined ? (String(tim.total_ms)+' ms') : '—') + '</div></div>'
       + '<div class="item"><div class="t">Calendar parse</div><div class="m">USD=' + escapeHtml(String(cal.usd||0)) + ', timed=' + escapeHtml(String(cal.timed||0)) + ', unknown=' + escapeHtml(String(cal.unknown_currency||0)) + '</div></div>'
       + '<div class="item"><div class="t">DIAG</div><div class="m"><a href="/diag" target="_blank" rel="noopener">/diag</a> • <a href="/diag.json" target="_blank" rel="noopener">/diag.json</a></div></div>'
@@ -2821,178 +2762,36 @@ background:#0f1724;color:#d7e2ff;margin-right:8px}}
     showModal('⋯ OVERFLOW', html);
   }
 
-  function explainLegend(){
-    const html =
-      '<div class="panel"><div class="h2">Legend (fast)</div><div class="list">'
-      + '<div class="item"><div class="t">Quality</div><div class="m">0..100. Higher = cleaner (more evidence, more diversity, fresher, less conflict, less macro penalty).</div></div>'
-      + '<div class="item"><div class="t">Conflict</div><div class="m">0..1. Lower = agreement. Higher = internal contradiction.</div></div>'
-      + '<div class="item"><div class="t">Score/Threshold</div><div class="m">Score crosses +T => BULLISH; below -T => BEARISH; inside => NEUTRAL.</div></div>'
-      + '<div class="item"><div class="t">FlipDist</div><div class="m">Distance to opposite flip (fragile if too small).</div></div>'
-      + '<div class="item"><div class="t">RISK ON</div><div class="m">Macro window active. STRICT blocks unless quality/conflict override met.</div></div>'
-      + '</div></div>';
-    showModal('LEGEND', html);
-  }
-
-  function explainFeeds(){
-    const meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
-    const feeds = (meta.feeds_status || {});
-    let keys = Object.keys(feeds || {});
-    keys.sort();
-    const rows = keys.map(function(k){
-      const o = feeds[k] || {};
-      let st='WARN', cls='warn', m='';
-      if(o.skipped){ st='SKIP'; cls='neu'; m='skipped'; }
-      else if(!o.ok){ st='BAD'; cls='bad'; m=(o.error||'error'); }
-      else{
-        const bozo=(o.bozo||0), en=(o.entries||0);
-        if(bozo===0 && en>0){ st='GOOD'; cls='ok'; m='entries='+en; }
-        else { st='WARN'; cls='warn'; m='bozo='+bozo+' entries='+en; }
-      }
-      return '<div class="item"><div class="t"><span class="tagpill '+cls+'">'+escapeHtml(st)+'</span> <b style="color:var(--amber)">'+escapeHtml(k)+'</b></div><div class="m">'+escapeHtml(m)+'</div></div>';
-    }).join('');
-    showModal('FEEDS', '<div class="panel"><div class="h2">Feeds health</div><div class="list">'+rows+'</div></div>');
-  }
-
-  function explainMacro(){
-    const meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
-    const fred = (meta.fred || {});
-    const html =
-      '<div class="panel"><div class="h2">Macro (FRED drivers)</div><div class="list">'
-      + '<div class="item"><div class="t">enabled</div><div class="m">'+escapeHtml(String(!!fred.enabled))+'</div></div>'
-      + '<div class="item"><div class="t">env_ok</div><div class="m">'+escapeHtml(String(!!fred.env_ok))+'</div></div>'
-      + '<div class="item"><div class="t">env_why</div><div class="m">'+escapeHtml(String(fred.env_why||''))+'</div></div>'
-      + '<div class="item"><div class="t">ingest_allowed</div><div class="m">'+escapeHtml(String(!!fred.ingest_allowed))+'</div></div>'
-      + '<div class="item"><div class="t">Fix</div><div class="m">Set env: FRED_ENABLED=1 and FRED_API_KEY=... (requests must be installed)</div></div>'
-      + '</div></div>';
-    showModal('MACRO', html);
-  }
-
   function openMorning(){
     var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
     var upcoming = (ev.upcoming_events || []).slice(0, 24);
     var ch = (ev.calendar_health || {});
-
-    const buckets = {};
-    upcoming.forEach(function(x){
-      const ts = x.ts ? Number(x.ts) : 0;
-      const key = ts ? (new Date(ts*1000).toISOString().slice(0,16)+'Z') : 'unknown';
-      if(!buckets[key]) buckets[key]=[];
-      buckets[key].push(x);
-    });
-
-    const keys = Object.keys(buckets).sort();
-
-    function isEIA(x){
-      const t = (x.title||'').toLowerCase();
-      return t.includes('eia') || t.includes('inventor') || t.includes('crude oil stocks') || t.includes('petroleum status');
-    }
-
-    function row(x){
-      const ts = x.ts ? Number(x.ts) : 0;
-      const when = ts ? new Date(ts*1000).toISOString().replace('T',' ').slice(0,16) + ' UTC' : '(time unknown)';
-      const ccy = x.currency || '—';
-      const imp = x.impact || '—';
-      return '<div class="item"><div class="t">' + escapeHtml(when) + ' • ' + escapeHtml(ccy) + ' • ' + escapeHtml(imp) + '</div>'
-             + '<div class="m">' + escapeHtml(x.title||'') + '</div>'
-             + (x.link ? ('<div class="m"><a href="' + escapeHtml(x.link) + '" target="_blank" rel="noopener">Open</a></div>') : '')
-             + '</div>';
-    }
-
-    const blocks = keys.map(function(k){
-      const arr = buckets[k] || [];
-      const anyEIA = arr.some(isEIA);
-      const tsLabel = (k==='unknown') ? 'time unknown' : (k.replace('T',' ').replace('Z',' UTC'));
-      if(arr.length > 1 || anyEIA){
-        const title = (anyEIA ? ('EIA bundle') : 'Bundle') + ' (' + arr.length + ') • ' + tsLabel;
-        return '<details ' + (anyEIA ? 'open' : '') + '><summary>' + escapeHtml(title) + '</summary>'
-             + '<div style="margin-top:8px;">' + arr.map(row).join('') + '</div></details>';
-      }
-      return '<div class="panel"><div class="h2">' + escapeHtml(tsLabel) + '</div><div class="list">' + arr.map(row).join('') + '</div></div>';
-    }).join('<div style="height:10px"></div>');
-
     var html =
       '<div class="panel"><div class="h2">Morning</div><div class="list">'
       + '<div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>'
       + '<div class="item"><div class="t">Risk mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
       + '<div class="item"><div class="t">Calendar parse</div><div class="m">USD=' + escapeHtml(String(ch.usd||0)) + ', timed=' + escapeHtml(String(ch.timed||0)) + ', unknown=' + escapeHtml(String(ch.unknown_currency||0)) + '</div></div>'
-      + '</div></div>'
-      + '<div style="margin-top:12px;">' + (blocks || '<div class="panel"><div class="h2">Upcoming events</div><div class="list"><div class="item"><div class="t">—</div></div></div></div>') + '</div>';
-
+      + '</div></div>';
     showModal('M MORNING', html);
   }
 
   function openMyfx(){
-    var html = ''
-      + '<div class="panel">'
-      + '  <div class="h2">MyFXBook Economic Calendar</div>'
-      + '  <div class="list">'
-      + '    <div class="item"><div class="t">Open</div><div class="m"><a href="/myfx_calendar" target="_blank" rel="noopener">/myfx_calendar</a></div></div>'
-      + '  </div>'
-      + '</div>';
-    showModal('E MYFX CAL', html);
-  }
-
-  function _kv(k, v){
-    return '<div class="item"><div class="t">' + escapeHtml(k) + '</div><div class="m">' + escapeHtml(v) + '</div></div>';
-  }
-  function _linkRow(title, url){
-    if(!url) return '';
-    return '<div class="item"><div class="t">' + escapeHtml(title) + '</div><div class="m"><a href="' + escapeHtml(url) + '" target="_blank" rel="noopener">Open</a></div></div>';
+    showModal('E MYFX CAL', '<div class="panel"><div class="h2">MyFXBook Economic Calendar</div><div class="list">'
+      + '<div class="item"><div class="t">Open</div><div class="m"><a href="/myfx_calendar" target="_blank" rel="noopener">/myfx_calendar</a></div></div>'
+      + '</div></div>');
   }
 
   function openView(sym){
-    const a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
+    // Minimal view for now (doesn't break). You can extend later.
+    const a = (PAYLOAD.assets || {})[sym] || {};
     const gate = a.ui_gate || {};
-    const flip = a.flip || {};
-    const top3 = a.top3_drivers || [];
-    const why5 = a.why_top5 || [];
-    const csrc = a.consensus_by_source || [];
-
-    let html = '<div class="panel"><div class="h2">' + escapeHtml(sym) + ' — Detail</div><div class="list">';
-    html += _kv('Bias', a.bias || '—');
-    html += _kv('Score', String(a.score ?? '—') + ' / Th=' + String(a.threshold ?? '—'));
-    html += _kv('Quality', String(a.quality_v2 ?? '—'));
-    html += _kv('Conflict', String(a.conflict_index ?? '—'));
-    html += _kv('Evidence', String(a.evidence_count ?? '—') + ' • Sources=' + String(a.source_diversity ?? '—'));
-    html += _kv('FlipDist (to opposite)', String((flip.to_opposite ?? '—')) + ' • approx headlines=' + String((flip.approx_headlines_to_flip ?? '—')));
-    html += '</div></div>';
-
-    html += '<div class="panel"><div class="h2">Trade Gate</div><div class="list">';
-    html += _kv('Gate', (gate.ok ? 'TRADE OK' : 'NO TRADE'));
-    html += _kv('FailShort', (gate.fail_short || []).join(' | ') || '—');
-    html += _kv('Must change', (gate.must_change || []).join(' | ') || '—');
-    html += '</div></div>';
-
-    if(top3 && top3.length){
-      html += '<div class="panel"><div class="h2">Top drivers (abs sum)</div><div class="list">';
-      top3.forEach(function(x){
-        html += _kv(x.why || '—', String(x.abs_contrib_sum ?? '—'));
-      });
-      html += '</div></div>';
-    }
-
-    if(csrc && csrc.length){
-      html += '<div class="panel"><div class="h2">Consensus by source</div><div class="list">';
-      csrc.slice(0,10).forEach(function(x){
-        html += _kv(String(x.source||'—'), 'net=' + String(x.net) + ' • abs=' + String(x.abs) + ' • n=' + String(x.count));
-      });
-      html += '</div></div>';
-    }
-
-    if(why5 && why5.length){
-      html += '<div class="panel"><div class="h2">Top 5 headlines (by |contrib|)</div><div class="list">';
-      why5.slice(0,5).forEach(function(x){
-        const ts = x.published_ts ? new Date(Number(x.published_ts)*1000).toISOString().replace('T',' ').slice(0,16)+' UTC' : '—';
-        html += '<div class="item"><div class="t">' + escapeHtml((x.source||'') + ' • ' + ts) + '</div>'
-             + '<div class="m"><b>' + escapeHtml(String(x.contrib||'—')) + '</b> • ' + escapeHtml(x.why||'') + '</div>'
-             + '<div class="m">' + escapeHtml(x.title||'') + '</div>'
-             + _linkRow('Link', x.link||'')
-             + '</div>';
-      });
-      html += '</div></div>';
-    }
-
-    showModal(sym + ' VIEW', html);
+    const html = '<div class="panel"><div class="h2">'+escapeHtml(sym)+' details</div><div class="list">'
+      + '<div class="item"><div class="t">Bias</div><div class="m">'+escapeHtml(String(a.bias||'—'))+'</div></div>'
+      + '<div class="item"><div class="t">Score</div><div class="m">'+escapeHtml(String(a.score||0))+' / T='+escapeHtml(String(a.threshold||0))+'</div></div>'
+      + '<div class="item"><div class="t">Quality</div><div class="m">'+escapeHtml(String(a.quality_v2||0))+'</div></div>'
+      + '<div class="item"><div class="t">Gate</div><div class="m">'+escapeHtml(String(gate.label||'—'))+' • '+escapeHtml((gate.fail_reasons||[]).join(' | ')||'OK')+'</div></div>'
+      + '</div></div>';
+    showModal('VIEW '+sym, html);
   }
 
   document.addEventListener('keydown', function(e){

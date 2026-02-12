@@ -1,12 +1,10 @@
 # app.py
 # NEWS BIAS // TERMINAL — RSS + Postgres + Bias/Quality + Trade Gate + Calendar + Alerts + Ticker
-# UPDATED v2026-02-12a (FULL SINGLE FILE — HTML INCLUDED — IMPROVED, NO SECURITY CHANGES):
-# ✅ Faster RSS ingest: parallel feed parsing + quick budget
-# ✅ Faster DB insert: execute_values batch insert
-# ✅ Calendar ingest throttled in QUICK via CAL_INGEST_TTL_SEC (default 300s)
-# ✅ Added conflict_news (conflict computed from NEWS-only contribs, before FRED injection)
-# ✅ Event penalty scaled by event_risk (0..1) instead of fixed
-# ✅ Keeps everything else + UI
+# UPDATED v2026-02-12b (FULL SINGLE FILE — HTML INCLUDED — UI FRIENDLY, NO SECURITY CHANGES):
+# ✅ UI: "engineer friendly" (0..100, no fractions in UI)
+# ✅ Summary: bars-style numbers (Quality/Clarity/Risk as 0..100) + plain-language WHY
+# ✅ View (VU): Donuts for Source Quality / Signal Clarity / Execution Risk + bars breakdown
+# ✅ Keeps everything else (auth, pipeline, DB, compute) unchanged
 
 import os
 import json
@@ -24,7 +22,6 @@ import psycopg2
 import socket
 import threading
 
-# --- NEW: faster batch inserts + lightweight concurrency helpers
 from psycopg2 import extras  # type: ignore
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -147,10 +144,10 @@ FEEDS_HEALTH_TTL_SEC = int(os.environ.get("FEEDS_HEALTH_TTL_SEC", "90"))
 FRED_ON_RUN = os.environ.get("FRED_ON_RUN", "1").strip() == "1"
 FRED_INGEST_EVERY_RUN = os.environ.get("FRED_INGEST_EVERY_RUN", "0").strip() == "1"
 
-# --- NEW: quick calendar ingest throttling
+# quick calendar ingest throttling
 CAL_INGEST_TTL_SEC = int(os.environ.get("CAL_INGEST_TTL_SEC", "300"))  # 5 min default
 
-# --- NEW: parallel RSS parse workers
+# parallel RSS parse workers
 RSS_PARSE_WORKERS = int(os.environ.get("RSS_PARSE_WORKERS", "8"))
 if RSS_PARSE_WORKERS < 2:
     RSS_PARSE_WORKERS = 2
@@ -390,7 +387,6 @@ def db_conn():
                 pass
             return conn
         except Exception:
-            # Any pool error -> fallback
             try:
                 conn = psycopg2.connect(_make_dsn())
                 try:
@@ -480,7 +476,6 @@ def db_init():
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_fred_series_date ON fred_series(obs_date DESC);")
 
-                # Econ calendar store
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS econ_events (
                     id BIGSERIAL PRIMARY KEY,
@@ -500,7 +495,6 @@ def db_init():
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_events_ts ON econ_events(event_ts DESC);")
 
-                # Optional alerts log
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS alerts_log (
                     id BIGSERIAL PRIMARY KEY,
@@ -514,7 +508,6 @@ def db_init():
                 """)
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_alerts_log_created_ts ON alerts_log(created_ts DESC);")
 
-                # NEW: kv store (tiny) for throttling
                 cur.execute("""
                 CREATE TABLE IF NOT EXISTS kv_state (
                     k TEXT PRIMARY KEY,
@@ -707,7 +700,6 @@ def _human_event_reason(reason_list: List[str]) -> str:
     return " | ".join(out)
 
 def _fred_status(meta_fred: dict) -> Tuple[bool, str]:
-    # meta_fred.enabled means "drivers active", not "ingest performed"
     if not FRED_CFG.get("enabled", True):
         return False, "Disabled by env (FRED_ENABLED=0)"
     if requests is None:
@@ -785,17 +777,10 @@ def _parse_one_feed(src: str, url: str, now: int, limit_per_feed: int) -> List[T
     return out
 
 def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) -> int:
-    """
-    Faster version:
-      - parallel feed parsing with ThreadPoolExecutor
-      - DB insert via execute_values batch
-    If max_sec is set, we stop collecting when the budget is exceeded (quick mode).
-    """
     inserted = 0
     now = int(time.time())
     deadline = (time.time() + float(max_sec)) if (max_sec is not None) else None
 
-    # build list of parse tasks (skip calendar feeds)
     tasks: List[Tuple[str, str]] = []
     for src, url in RSS_FEEDS.items():
         if src in CALENDAR_FEEDS:
@@ -806,14 +791,12 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
 
     batch: List[Tuple[str, str, str, int, str]] = []
 
-    # quick budget: stop scheduling more if already out of time
     def _out_of_time() -> bool:
         return (deadline is not None) and (time.time() > deadline)
 
     if not tasks or _out_of_time():
         return 0
 
-    # parse concurrently
     workers = min(RSS_PARSE_WORKERS, max(2, len(tasks)))
     try:
         with ThreadPoolExecutor(max_workers=workers) as ex:
@@ -833,7 +816,6 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
                 except Exception:
                     pass
     except Exception:
-        # fallback: sequential (robust)
         for (src, url) in tasks:
             if _out_of_time():
                 break
@@ -842,18 +824,13 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
     if not batch:
         return 0
 
-    # clamp batch size in quick mode (avoid huge write spike if many feeds return)
     if max_sec is not None and len(batch) > 1200:
         batch = batch[:1200]
 
-    # insert batch fast
     conn = db_conn()
     try:
         with conn:
             with conn.cursor() as cur:
-                # execute_values returns rowcount as rows attempted; we count inserted via ON CONFLICT DO NOTHING and RETURNING trick:
-                # simplest: do not overcomplicate — count approximate inserted via SELECT COUNT where fingerprint in batch is expensive.
-                # Instead: insert with RETURNING 1 per row (still efficient with VALUES + RETURNING).
                 sql = """
                     INSERT INTO news_items(source, title, link, published_ts, fingerprint)
                     VALUES %s
@@ -865,7 +842,6 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
                     rows = cur.fetchall()
                     inserted = int(len(rows or []))
                 except Exception:
-                    # fallback without RETURNING
                     sql2 = """
                         INSERT INTO news_items(source, title, link, published_ts, fingerprint)
                         VALUES %s
@@ -882,7 +858,7 @@ def ingest_news_once(limit_per_feed: int = 40, max_sec: Optional[float] = None) 
     return inserted
 
 # ============================================================
-# INGEST (CALENDAR) — network-first then DB upsert batch
+# INGEST (CALENDAR)
 # ============================================================
 
 _CUR_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b")
@@ -1042,9 +1018,6 @@ def _parse_calendar_fields(src: str, e: dict) -> Dict[str, Optional[str]]:
     }
 
 def ingest_calendar_once(limit_per_feed: int = 250) -> int:
-    """
-    Counts ONLY true inserts (not updates) using RETURNING (xmax=0).
-    """
     inserted = 0
     batch: List[Tuple[str, str, str, Optional[int], Dict[str, Optional[str]], str]] = []
 
@@ -1176,7 +1149,6 @@ def _get_upcoming_events(now_ts: int) -> List[Dict[str, Any]]:
     if out:
         return out[: int(EVENT_CFG["max_upcoming"])]
 
-    # fallback: last events (even if time unknown)
     conn = db_conn()
     try:
         with conn.cursor() as cur:
@@ -1228,14 +1200,6 @@ def _calendar_health(upcoming: List[Dict[str, Any]]) -> Dict[str, Any]:
     }
 
 def _event_risk_score(upcoming: List[Dict[str, Any]], recent_macro: bool) -> float:
-    """
-    0..1 scalar risk:
-      - recent_macro => at least 0.6
-      - upcoming HIGH => 1.0
-      - upcoming MED => 0.7
-      - upcoming LOW => 0.4
-      - timed unknown but upcoming exists => 0.5
-    """
     risk = 0.0
     if recent_macro:
         risk = max(risk, 0.6)
@@ -1247,7 +1211,6 @@ def _event_risk_score(upcoming: List[Dict[str, Any]], recent_macro: bool) -> flo
     if not has_timed:
         return float(max(risk, 0.5))
 
-    # consider nearest timed event
     impacts = []
     for x in upcoming:
         if not x.get("ts"):
@@ -1528,7 +1491,6 @@ def compute_bias(
     finally:
         db_put(conn)
 
-    # FRED: ingest optional; drivers can be computed from existing DB points
     fred_inserted = 0
     fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
@@ -1548,7 +1510,6 @@ def compute_bias(
         except Exception:
             fred_drivers = {"XAU": [], "US500": [], "WTI": []}
 
-    # Event mode
     upcoming_events = _get_upcoming_events(now) if EVENT_CFG["enabled"] else []
     recent_macro = _macro_recent_flag(rows, now)
     has_timed_event = any(x.get("ts") is not None for x in upcoming_events)
@@ -1577,7 +1538,7 @@ def compute_bias(
     for asset in ASSETS:
         score = 0.0
         contribs: List[Dict[str, Any]] = []
-        contribs_news_only: List[Dict[str, Any]] = []  # NEW: before FRED injection
+        contribs_news_only: List[Dict[str, Any]] = []
         freshness = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
 
         for (source, title, link, ts) in rows:
@@ -1611,10 +1572,8 @@ def compute_bias(
                 contribs.append(obj)
                 contribs_news_only.append(obj)
 
-        # NEWS-only conflict (NEW)
         consensus_ratio_news, conflict_news, _abs_sum_news = _consensus_stats(contribs_news_only)
 
-        # Inject FRED drivers (if allowed)
         if fred_drivers_on:
             for d in (fred_drivers.get(asset) or []):
                 c = float(d.get("w", 0.0))
@@ -1659,7 +1618,6 @@ def compute_bias(
         if fresh_total > 0:
             fresh_score = min(1.0, (fresh02 * 1.0 + fresh28 * 0.6) / max(1.0, fresh_total))
 
-        # NEW: penalty scaled by event_risk (0..1)
         event_penalty = 0.15 * float(event_risk) if event_mode else 0.0
 
         raw_v2 = (
@@ -1689,7 +1647,6 @@ def compute_bias(
             "consensus_ratio": float(consensus_ratio),
             "conflict_index": float(conflict_index),
 
-            # NEW:
             "consensus_ratio_news": float(consensus_ratio_news),
             "conflict_news": float(conflict_news),
 
@@ -1717,14 +1674,13 @@ def compute_bias(
                 "requests_present": bool(requests is not None),
             },
             "trump": trump,
-            # IMPORTANT: dynamic token meta
             "run_token_required": bool(get_run_tokens()),
             "run_token_hashes": get_run_token_hashes(),
         },
         "event": {
             "enabled": bool(EVENT_CFG["enabled"]),
             "event_mode": bool(event_mode),
-            "event_risk": float(round(event_risk, 3)),  # NEW
+            "event_risk": float(round(event_risk, 3)),
             "reason": event_reason,
             "recent_macro": bool(recent_macro),
             "upcoming_events": upcoming_events,
@@ -1737,7 +1693,7 @@ def compute_bias(
     return payload
 
 # ============================================================
-# ALERT ENGINE (server-side diff)
+# ALERT ENGINE
 # ============================================================
 
 def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
@@ -1840,15 +1796,10 @@ def compute_alerts(prev: Optional[dict], cur: dict) -> List[Dict[str, Any]]:
     return alerts
 
 # ============================================================
-# PIPELINE RUN (LOCK + TIMING + QUICK/FULL)
+# PIPELINE RUN
 # ============================================================
 
 def pipeline_run(mode: str = "quick"):
-    """
-    mode:
-      - quick: budgeted ingest, cached feeds health, FRED ingest throttled (drivers still computed from DB)
-      - full: heavy run (incl. FRED ingest)
-    """
     mode = (mode or RUN_MODE_DEFAULT).strip().lower()
     if mode not in ("quick", "full"):
         mode = RUN_MODE_DEFAULT
@@ -1873,14 +1824,12 @@ def pipeline_run(mode: str = "quick"):
 
         prev = load_bias()
 
-        # Ingest news (faster)
         t1 = time.time()
         rss_limit = RSS_LIMIT_QUICK if mode == "quick" else RSS_LIMIT_FULL
         max_sec = RUN_MAX_SEC if mode == "quick" else None
         inserted_news = ingest_news_once(limit_per_feed=rss_limit, max_sec=max_sec)
         timing["rss_ingest_ms"] = int((time.time() - t1) * 1000)
 
-        # Ingest calendar (throttled in quick)
         t1 = time.time()
         inserted_cal = 0
         do_cal = True
@@ -1904,10 +1853,7 @@ def pipeline_run(mode: str = "quick"):
         timing["cal_ingest_ms"] = int((time.time() - t1) * 1000)
         timing["cal_ingest_skipped"] = (not do_cal)
 
-        # Bias compute
         t1 = time.time()
-
-        # Drivers can be ON (use DB) even if ingest is OFF.
         fred_ingest_allowed = bool(FRED_ON_RUN)
         if mode == "quick" and (not FRED_INGEST_EVERY_RUN):
             fred_ingest_allowed = False
@@ -1920,7 +1866,6 @@ def pipeline_run(mode: str = "quick"):
         )
         timing["compute_bias_ms"] = int((time.time() - t1) * 1000)
 
-        # Feeds status (cached in quick)
         t1 = time.time()
         feeds_status = feeds_health_live(force=(mode == "full"))
         timing["feeds_health_ms"] = int((time.time() - t1) * 1000)
@@ -2176,10 +2121,6 @@ def _pick_token(query_token: str, header_token: Optional[str]) -> str:
     return (header_token or "").strip()
 
 def _auth_run(token: str) -> bool:
-    """
-    If tokens empty -> open.
-    Else token must match any allowed token, using constant-time compare.
-    """
     toks = get_run_tokens()
     if not toks:
         return True
@@ -2251,7 +2192,6 @@ def latest(limit: int = 40):
         db_put(conn)
     return {"items": [{"source": s, "title": t, "link": l, "published_ts": int(ts)} for (s, t, l, ts) in rows]}
 
-# MyFXBook calendar page (standalone)
 @app.get("/myfx_calendar", response_class=HTMLResponse)
 def myfx_calendar():
     html = f"""<!doctype html>
@@ -2286,13 +2226,6 @@ def _pill_gate(ok: bool) -> str:
     return '<span class="pill ok">TRADE OK</span>' if ok else '<span class="pill no">NO TRADE</span>'
 
 def _pick_next_event_smart(now_ts: int, upcoming: List[Dict[str, Any]], prefer_ccy: str = "USD") -> Tuple[str, str, Dict[str, Any]]:
-    """
-    If USD not detected (currency missing), do NOT lie.
-    Strategy:
-      1) try timed USD
-      2) else timed ANY
-      3) else first ANY
-    """
     meta = _calendar_health(upcoming)
 
     if not upcoming:
@@ -2361,10 +2294,6 @@ def dashboard():
     reason_txt = _human_event_reason([str(x) for x in (event.get("reason", []) or [])])
     next_event_line, next_event_src, cal_meta = _pick_next_event_smart(now_ts, upcoming, prefer_ccy="USD")
 
-    trump = meta.get("trump", {}) or {}
-    trump_flag = bool(trump.get("flag", False))
-    trump_enabled = bool(trump.get("enabled", False))
-
     feeds_ok_ratio = _feeds_ok_ratio(feeds_status) if feeds_status else 1.0
     feeds_ok = feeds_ok_ratio >= float(ALERT_CFG.get("feeds_degraded_ratio", 0.80))
 
@@ -2381,15 +2310,10 @@ def dashboard():
         return f'<button class="chip {cls}" data-chip="{key}" title="{tip}"><span class="k">{label}</span> {value}</button>'
 
     risk_val = "HIGH" if event_mode else "LOW"
-    ev_chip = _chip("RISK", f"{risk_val} ({event_risk:.2f})", "warn" if event_mode else "neu",
+    ev_chip = _chip("RISK", f"{risk_val} ({int(round(event_risk*100))})", "warn" if event_mode else "neu",
                     "Macro-risk window (recent major releases or upcoming events). Click for details.", "risk")
 
-    head_val = ("HOT" if (trump_enabled and trump_flag) else ("ON" if trump_enabled else "OFF"))
-    tr_chip = _chip("HEADLINES", head_val,
-                    "warn" if (trump_enabled and trump_flag) else "neu",
-                    "Trump/White House headline monitor. HOT=hits in last 12h. Click for details.", "headlines")
-
-    fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({feeds_ok_ratio:.2f})",
+    fd_chip = _chip("FEEDS", ("OK" if feeds_ok else "DEGRADED") + f" ({int(round(feeds_ok_ratio*100))}%)",
                     "ok" if feeds_ok else "no",
                     "RSS parsing health. Click to see GOOD/WARN/BAD per feed.", "feeds")
 
@@ -2400,7 +2324,7 @@ def dashboard():
                     "Refresh pipeline access. LOCKED means token required. Click for details.", "run")
 
     lg_chip = _chip("LEGEND", "?", "neu",
-                    "Explain what Quality/Conflict/BiasScore/Threshold/FlipDist mean (simple language). Click for details.", "legend")
+                    "Explain what the 0..100 meters mean (simple language). Click for details.", "legend")
 
     dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
 
@@ -2412,26 +2336,30 @@ def dashboard():
 
         quality = int(gate.get("quality", 0))
         qmin = int(gate.get("quality_min", 0))
-        conflict = float(gate.get("conflict", 1.0))
-        cmax = float(gate.get("conflict_max", 1.0))
-        score = float(gate.get("score", 0.0))
-        th = float(gate.get("th", 0.0))
-        flipd = float(gate.get("flip_dist", 999.0))
-        flipmin = float(gate.get("flip_min", 0.0))
 
-        # NEW: show conflict_news if present
+        conflict = float(gate.get("conflict", 1.0))
         cnews = float(a.get("conflict_news", conflict))
 
+        # UI-friendly: 0..100, no fractions
+        clarity = int(round(max(0.0, min(1.0, 1.0 - conflict)) * 100))
+        clarity_news = int(round(max(0.0, min(1.0, 1.0 - cnews)) * 100))
+        risk = int(round(max(0.0, min(1.0, float(payload.get("event", {}) or {}).get("event_risk", 0.0))) * 100))
+
+        score = float(gate.get("score", 0.0))
+        th = float(gate.get("th", 1.0))
+        strength = int(round(min(100.0, (abs(score) / max(1e-9, th)) * 100.0)))
+
         if ok:
-            return f"BiasScore {score:.2f}/{th:.2f} • Conflict {conflict:.2f} (news {cnews:.2f}) • Quality {quality} • RISK {'ON' if gate.get('event_mode') else 'OFF'}"
+            return f"Quality {quality} • Clarity {clarity} (news {clarity_news}) • Risk {risk} • Strength {strength}"
         else:
-            parts = [f"Quality {quality}/{qmin}", f"Conflict {conflict:.2f}/{cmax:.2f}", f"BiasScore {score:.2f}/{th:.2f}", f"news {cnews:.2f}"]
-            if b in ("BULLISH", "BEARISH") and flipd < flipmin:
-                parts.append(f"FlipDist {flipd:.2f}<{flipmin:.2f}")
-            if gate.get("event_mode"):
-                parts.append("RISK ON")
+            parts = [f"Quality {quality}/{qmin}", f"Clarity {clarity}", f"Risk {risk}", f"Strength {strength}"]
             if b == "NEUTRAL":
                 parts.insert(0, "NEUTRAL")
+            if gate.get("event_mode"):
+                parts.append("RISK ON")
+            fs = (gate.get("fail_short") or [])[:3]
+            if fs:
+                parts.append("Block: " + " | ".join([str(x) for x in fs]))
             return " • ".join(parts)
 
     def row(asset: str) -> str:
@@ -2456,9 +2384,7 @@ def dashboard():
         updated_short = updated_short[:22].strip()
 
     cal_health_badge = f"USD:{cal_meta.get('usd',0)} • timed:{cal_meta.get('timed',0)} • unk:{cal_meta.get('unknown_currency',0)}"
-
     js_payload = json.dumps(payload, ensure_ascii=False).replace("</", "<\\/")
-
     tv_symbols = json.dumps(TV_TICKER_SYMBOLS, ensure_ascii=False)
 
     TEMPLATE = """<!doctype html>
@@ -2592,6 +2518,20 @@ def dashboard():
       .chip{padding:9px 10px;}
       .metaLine{gap:10px;}
     }
+
+    /* ===== NEW: Donuts + Bars (VU) ===== */
+    .meters{display:flex; gap:14px; flex-wrap:wrap; margin-top:12px;}
+    .donut{width:132px; height:132px; border:1px solid var(--line); border-radius:18px; background:rgba(255,255,255,.02); display:flex; align-items:center; justify-content:center; position:relative;}
+    .donut svg{width:112px; height:112px;}
+    .donut .center{position:absolute; inset:0; display:flex; flex-direction:column; align-items:center; justify-content:center; gap:2px; font-family:var(--mono);}
+    .donut .center .v{font-weight:900; font-size:18px; color:var(--text);}
+    .donut .center .k{font-weight:900; font-size:11px; color:var(--muted); letter-spacing:.6px;}
+    .donut .sub{position:absolute; bottom:10px; left:0; right:0; text-align:center; font-family:var(--mono); font-size:11px; color:var(--muted); font-weight:900;}
+    .barRow{display:flex; gap:10px; align-items:center; margin-top:10px; flex-wrap:wrap;}
+    .barRow .lbl{min-width:140px; color:var(--muted); font-family:var(--mono); font-size:12px; font-weight:900;}
+    .bar{flex:1; min-width:220px; height:10px; border-radius:999px; border:1px solid var(--line); background:rgba(255,255,255,.03); overflow:hidden;}
+    .bar > i{display:block; height:100%; width:0%; background:linear-gradient(90deg, rgba(0,229,255,.85), rgba(255,176,0,.85));}
+    .barRow .val{min-width:56px; text-align:right; font-family:var(--mono); font-size:12px; font-weight:900; color:var(--text);}
   </style>
 </head>
 <body>
@@ -2624,7 +2564,7 @@ def dashboard():
     <div class="block">
       <div class="blockTitle">SWITCHBOARD</div>
       <div class="chips">
-        __EV_CHIP__ __TR_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __LEGEND_CHIP__ __DIAG_CHIP__
+        __EV_CHIP__ __FEEDS_CHIP__ __FRED_CHIP__ __RUN_CHIP__ __LEGEND_CHIP__ __DIAG_CHIP__
       </div>
       <div class="kz" style="margin-top:8px;">Tip: chips are clickable — tap to see what they mean + current details.</div>
     </div>
@@ -2680,7 +2620,7 @@ def dashboard():
           <col>
           <col style="width:112px">
         </colgroup>
-        <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>WHY (simple)</th><th></th></tr></thead>
+        <thead><tr><th>SYM</th><th>BIAS</th><th>TRADE</th><th>METERS (0..100) + BLOCK</th><th></th></tr></thead>
         <tbody>__ROW_XAU__ __ROW_US500__ __ROW_WTI__</tbody>
       </table>
     </div>
@@ -2713,6 +2653,8 @@ def dashboard():
   const EXPECTED_HASH = (PAYLOAD && PAYLOAD.meta && PAYLOAD.meta.run_token_hashes) ? PAYLOAD.meta.run_token_hashes : [];
 
   function $(id){ return document.getElementById(id); }
+  function clamp01(x){ x = Number(x||0); if(x<0) return 0; if(x>1) return 1; return x; }
+  function p10001(x){ return Math.round(clamp01(x)*100); }
   function escapeHtml(s){
     s = (s===undefined || s===null) ? '' : String(s);
     return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;')
@@ -2800,19 +2742,30 @@ def dashboard():
 
   function buildMarqueeStatus(){
     var a = (PAYLOAD && PAYLOAD.assets) ? PAYLOAD.assets : {};
+    var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
+    var risk = p10001(ev.event_risk || 0);
+
+    function strength(score, th){
+      score = Number(score||0); th = Number(th||1);
+      return Math.round(Math.min(100, Math.abs(score)/Math.max(1e-9, th)*100));
+    }
+    function clarity(conflict){ return Math.round(Math.max(0, Math.min(100, (1.0 - Number(conflict||0))*100))); }
+
     var parts = [];
     ['XAU','US500','WTI'].forEach(function(sym){
       var x = a[sym] || {};
       var b = x.bias || '—';
       var gate = x.ui_gate || {};
       var trade = gate.ok ? 'TRADE OK' : 'NO TRADE';
-      var why = gate.ok ? ('BiasScore ' + (gate.score||0).toFixed(2) + '/' + (gate.th||0).toFixed(2))
-                        : ((gate.fail_short||[]).join(' | ') || 'Blocked');
-      var cn = (x.conflict_news!==undefined && x.conflict_news!==null) ? (' • newsC ' + Number(x.conflict_news).toFixed(2)) : '';
-      parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b>' + (why ? (' • ' + escapeHtml(why)) : '') + cn + '</span>');
+      var q = Number(x.quality_v2||0);
+      var c = Number(x.conflict_index||0);
+      var cn = (x.conflict_news!==undefined && x.conflict_news!==null) ? Number(x.conflict_news) : c;
+      var line = 'Q' + q + ' C' + clarity(c) + '(n' + clarity(cn) + ') R' + risk + ' S' + strength(gate.score||0, gate.th||1);
+      var why = gate.ok ? line : (line + ' • ' + ((gate.fail_short||[]).join('|') || 'Blocked'));
+      parts.push('<span class="tick"><span class="tag">' + sym + '</span> <b>' + escapeHtml(b) + '</b> • <b>' + escapeHtml(trade) + '</b> • ' + escapeHtml(why) + '</span>');
     });
-    var line = parts.join(' <span class="muted">•</span> ');
-    $('marqueeStatus').innerHTML = line + ' <span class="muted">•</span> ' + line;
+    var l = parts.join(' <span class="muted">•</span> ');
+    $('marqueeStatus').innerHTML = l + ' <span class="muted">•</span> ' + l;
   }
 
   function explainChip(key){
@@ -2820,25 +2773,22 @@ def dashboard():
     const meta = (PAYLOAD && PAYLOAD.meta) ? PAYLOAD.meta : {};
     const feeds = (meta.feeds_status || {});
     const fred = (meta.fred || {});
-    const trump = (meta.trump || {});
     const tokenReq = !!meta.run_token_required;
     const cal = (ev.calendar_health || {});
     const tim = (meta.timing || {});
-    const er = (ev.event_risk!==undefined) ? Number(ev.event_risk) : 0;
+    const er = (ev.event_risk!==undefined) ? Math.round(Number(ev.event_risk)*100) : 0;
 
     let title = 'INFO';
     let body = '';
 
     if(key === 'legend'){
-      title = 'LEGEND (simple meaning)';
+      title = 'LEGEND (0..100 meters)';
       body =
-        '<div class="panel"><div class="h2">Core numbers</div><div class="list">'
-        + '<div class="item"><div class="t">Quality</div><div class="m">0..100. Higher = cleaner signal (more evidence, more diversity, fresher, less contradiction, minus event risk penalty).</div></div>'
-        + '<div class="item"><div class="t">Conflict</div><div class="m">0..1. Lower = sources agree. Higher = noisy.</div></div>'
-        + '<div class="item"><div class="t">Conflict (news)</div><div class="m">0..1 computed BEFORE FRED drivers. If news conflict is high, tape is noisy even if macro pushes bias.</div></div>'
-        + '<div class="item"><div class="t">BiasScore / Threshold</div><div class="m">Weighted sum crosses +Threshold → BULLISH, below -Threshold → BEARISH. Inside → NEUTRAL.</div></div>'
-        + '<div class="item"><div class="t">FlipDist</div><div class="m">Distance to opposite bias flip. If too small, you’re near reversal → blocked in STRICT.</div></div>'
-        + '<div class="item"><div class="t">Event risk</div><div class="m">0..1 scalar. Penalty scales with this value.</div></div>'
+        '<div class="panel"><div class="h2">Meters</div><div class="list">'
+        + '<div class="item"><div class="t">Source Quality (Quality)</div><div class="m">0..100. Higher = cleaner signal (strength + evidence + diversity + freshness + agreement; minus event penalty).</div></div>'
+        + '<div class="item"><div class="t">Signal Clarity (Clarity)</div><div class="m">0..100. Higher = less contradiction. Clarity = 100 × (1 - Conflict).</div></div>'
+        + '<div class="item"><div class="t">Execution Risk (Risk)</div><div class="m">0..100. Higher = macro window risk (events/releases) — scaled by event_risk.</div></div>'
+        + '<div class="item"><div class="t">Strength</div><div class="m">0..100. How close BiasScore is to the threshold (abs(score)/threshold).</div></div>'
         + '</div></div>';
     }
 
@@ -2847,20 +2797,11 @@ def dashboard():
       body =
         '<div class="panel"><div class="h2">Now</div><div class="list">'
         + '<div class="item"><div class="t">event_mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + '</div></div>'
-        + '<div class="item"><div class="t">event_risk</div><div class="m">' + escapeHtml(er.toFixed(2)) + '</div></div>'
+        + '<div class="item"><div class="t">risk</div><div class="m">' + escapeHtml(String(er)) + '/100</div></div>'
         + '<div class="item"><div class="t">reason</div><div class="m">' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
         + '<div class="item"><div class="t">Calendar parse</div><div class="m">'
         + 'USD=' + escapeHtml(String(cal.usd||0)) + ', timed=' + escapeHtml(String(cal.timed||0)) + ', unknown_ccy=' + escapeHtml(String(cal.unknown_currency||0))
         + '</div></div>'
-        + '</div></div>';
-    }
-
-    if(key === 'headlines'){
-      title = 'HEADLINES (Trump filter)';
-      body =
-        '<div class="panel"><div class="h2">Now</div><div class="list">'
-        + '<div class="item"><div class="t">enabled</div><div class="m">' + escapeHtml(trump.enabled ? 'true' : 'false') + '</div></div>'
-        + '<div class="item"><div class="t">flag</div><div class="m">' + escapeHtml(trump.flag ? 'true' : 'false') + '</div></div>'
         + '</div></div>';
     }
 
@@ -2885,7 +2826,6 @@ def dashboard():
         + '<div class="item"><div class="t">Tracked</div><div class="m">' + escapeHtml(String(keys.length)) + '</div></div>'
         + '<div class="item"><div class="t">GOOD / WARN / BAD / SKIP</div><div class="m">'
         + escapeHtml(good + ' / ' + warn + ' / ' + bad + ' / ' + skip) + '</div></div>'
-        + '<div class="item"><div class="t">Rule</div><div class="m">GOOD = ok & bozo=0 & entries>0 • WARN = ok but bozo=1 or entries=0 • BAD = not ok</div></div>'
         + '</div></div>';
 
       const list =
@@ -2899,7 +2839,7 @@ def dashboard():
           }).join('')
         + '</div></div>';
 
-      body = head + list + '<div class="kz"><b>Tip:</b> if BAD spikes, bias/quality becomes noisy.</div>';
+      body = head + list;
     }
 
     if(key === 'macro'){
@@ -2931,23 +2871,66 @@ def dashboard():
     explainChip(key);
   });
 
+  function donutSVG(pct){
+    pct = Math.max(0, Math.min(100, Math.round(Number(pct||0))));
+    const r = 44;
+    const c = 2*Math.PI*r;
+    const dash = (pct/100)*c;
+    const gap = c - dash;
+    return '<svg viewBox="0 0 120 120" aria-hidden="true">'
+         + '<circle cx="60" cy="60" r="'+r+'" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="10"></circle>'
+         + '<circle cx="60" cy="60" r="'+r+'" fill="none" stroke="rgba(0,229,255,.90)" stroke-width="10" stroke-linecap="round"'
+         + ' transform="rotate(-90 60 60)" stroke-dasharray="'+dash+' '+gap+'"></circle>'
+         + '</svg>';
+  }
+
+  function donutCard(key, val, sub){
+    return '<div class="donut">'
+         + donutSVG(val)
+         + '<div class="center"><div class="v">'+escapeHtml(String(val))+'</div><div class="k">'+escapeHtml(key)+'</div></div>'
+         + (sub ? ('<div class="sub">'+escapeHtml(sub)+'</div>') : '')
+         + '</div>';
+  }
+
+  function barRow(lbl, val){
+    val = Math.max(0, Math.min(100, Math.round(Number(val||0))));
+    return '<div class="barRow">'
+         + ' <div class="lbl">'+escapeHtml(lbl)+'</div>'
+         + ' <div class="bar"><i style="width:'+val+'%"></i></div>'
+         + ' <div class="val">'+escapeHtml(String(val))+'</div>'
+         + '</div>';
+  }
+
   function openView(sym){
     var a = (PAYLOAD && PAYLOAD.assets) ? (PAYLOAD.assets[sym] || {}) : {};
     var gate = a.ui_gate || {};
-    var top = (a.top3_drivers || []);
-    var why5 = (a.why_top5 || []);
-    var fr = a.freshness || {};
 
     var ok = !!gate.ok;
     var badge = ok ? '<span class="pill ok">TRADE OK</span>' : '<span class="pill no">NO TRADE</span>';
     var big = ok ? '<span class="ok">TRADE OK</span>' : '<span class="no">NO TRADE</span>';
 
-    var quality = (gate.quality||0), qmin = (gate.quality_min||0);
-    var c = (gate.conflict||0), cmax = (gate.conflict_max||0);
-    var score = (gate.score||0), th = (gate.th||0);
-    var flipd = (gate.flip_dist||0), flipmin = (gate.flip_min||0);
-    var evc = (a.evidence_count||0), div = (a.source_diversity||0);
-    var cnews = (a.conflict_news!==undefined && a.conflict_news!==null) ? Number(a.conflict_news) : null;
+    const ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
+    const risk = p10001(ev.event_risk || 0);
+
+    const q = Number(a.quality_v2||0);
+    const conflict = Number(a.conflict_index||0);
+    const cnews = (a.conflict_news!==undefined && a.conflict_news!==null) ? Number(a.conflict_news) : conflict;
+
+    const clarity = Math.round(Math.max(0, Math.min(100, (1.0 - conflict)*100)));
+    const clarityNews = Math.round(Math.max(0, Math.min(100, (1.0 - cnews)*100)));
+
+    const score = Number(gate.score||0), th = Number(gate.th||1);
+    const strength = Math.round(Math.min(100, Math.abs(score)/Math.max(1e-9, th)*100));
+
+    const evc = Number(a.evidence_count||0);
+    const div = Number(a.source_diversity||0);
+    const fr = a.freshness || {};
+    const freshTotal = Number(fr["0-2h"]||0)+Number(fr["2-8h"]||0)+Number(fr["8-24h"]||0);
+    const freshScore = freshTotal>0 ? Math.min(100, Math.round(((Number(fr["0-2h"]||0)*1.0 + Number(fr["2-8h"]||0)*0.6)/freshTotal)*100)) : 0;
+
+    const evidenceScore = Math.min(100, Math.round((evc/18)*100));
+    const diversityScore = Math.min(100, Math.round((div/7)*100));
+    const agreementScore = Math.min(100, Math.round(Number(a.consensus_ratio||0)*100));
 
     var banner =
       '<div class="banner">'
@@ -2955,15 +2938,17 @@ def dashboard():
       + '  <div class="big">' + escapeHtml(sym) + ' • ' + big + '</div>'
       + '  <div>' + badge + ' ' + '<span class="pill neu">Bias ' + escapeHtml(a.bias||'—') + '</span>' + '</div>'
       + '</div>'
+      + '<div class="meters">'
+      + donutCard('QUALITY', q, 'Source Quality')
+      + donutCard('CLARITY', clarity, 'Signal Clarity')
+      + donutCard('RISK', risk, (ev.event_mode ? 'Macro window' : 'No macro window'))
+      + donutCard('STRENGTH', strength, 'BiasScore vs Th')
+      + '</div>'
       + '<div class="mini">'
-      + '<span class="pill neu">BiasScore ' + score.toFixed(2) + '/' + th.toFixed(2) + '</span>'
-      + '<span class="pill neu">Quality ' + escapeHtml(String(quality)) + '/' + escapeHtml(String(qmin)) + '</span>'
-      + '<span class="pill neu">Conflict ' + c.toFixed(3) + '/' + cmax.toFixed(3) + '</span>'
-      + (cnews!==null ? ('<span class="pill neu">newsC ' + cnews.toFixed(3) + '</span>') : '')
-      + '<span class="pill neu">FlipDist ' + flipd.toFixed(3) + ' (min ' + flipmin.toFixed(3) + ')</span>'
-      + '<span class="pill neu">evidence ' + escapeHtml(String(evc)) + ' • sources ' + escapeHtml(String(div)) + '</span>'
-      + '<span class="pill neu">fresh 0-2h ' + escapeHtml(String(fr["0-2h"]||0)) + ' • 2-8h ' + escapeHtml(String(fr["2-8h"]||0)) + '</span>'
-      + (gate.event_mode ? '<span class="pill warn">RISK ON</span>' : '<span class="pill neu">RISK OFF</span>')
+      + '<span class="pill neu">Clarity(news) ' + escapeHtml(String(clarityNews)) + '</span>'
+      + '<span class="pill neu">event_mode ' + escapeHtml(ev.event_mode ? 'ON' : 'OFF') + '</span>'
+      + '<span class="pill neu">evidence ' + escapeHtml(String(evc)) + '</span>'
+      + '<span class="pill neu">sources ' + escapeHtml(String(div)) + '</span>'
       + '</div>'
       + '</div>';
 
@@ -2979,13 +2964,23 @@ def dashboard():
       + '</div></div>';
 
     var waitfor =
-      '<div class="panel"><div class="h2">TO UNBLOCK (what to wait for)</div><div class="list">'
+      '<div class="panel"><div class="h2">TO UNBLOCK (what to improve)</div><div class="list">'
       + (must.length ? must.map(function(x,i){
           var hot = (i<3) ? 'style="color:var(--ok)"' : '';
           return '<div class="item"><div class="t" ' + hot + '>' + escapeHtml(x) + '</div></div>';
         }).join('') : '<div class="item"><div class="t">—</div></div>')
       + '</div></div>';
 
+    var breakdown =
+      '<div class="panel"><div class="h2">BREAKDOWN (bars)</div>'
+      + barRow('Evidence volume', evidenceScore)
+      + barRow('Source diversity', diversityScore)
+      + barRow('Freshness', freshScore)
+      + barRow('Agreement', agreementScore)
+      + barRow('Clarity (news-only)', clarityNews)
+      + '</div>';
+
+    var top = (a.top3_drivers || []);
     var drivers =
       '<div class="panel"><div class="h2">Top drivers</div><div class="list">'
       + (top.length ? top : [{why:'—'}]).map(function(x,i){
@@ -2999,6 +2994,7 @@ def dashboard():
       return mins + 'm';
     }
 
+    var why5 = (a.why_top5 || []);
     var src =
       '<div class="panel"><div class="h2">Evidence (top 5)</div><div class="list">'
       + (why5.length ? why5 : [{title:'—'}]).slice(0,5).map(function(x,i){
@@ -3021,7 +3017,7 @@ def dashboard():
 
     var html = banner
       + '<div class="grid2" style="margin-top:12px;">' + blockers + waitfor + '</div>'
-      + drivers + src;
+      + breakdown + drivers + src;
 
     showModal('VIEW ' + sym, html);
   }
@@ -3030,7 +3026,7 @@ def dashboard():
     var ev = (PAYLOAD && PAYLOAD.event) ? PAYLOAD.event : {};
     var upcoming = (ev.upcoming_events || []).slice(0, 12);
     var ch = (ev.calendar_health || {});
-    var er = (ev.event_risk!==undefined) ? Number(ev.event_risk) : 0;
+    var er = (ev.event_risk!==undefined) ? Math.round(Number(ev.event_risk)*100) : 0;
 
     function evRow(x){
       const ts = x.ts ? x.ts : null;
@@ -3046,7 +3042,7 @@ def dashboard():
     var html =
       '<div class="panel"><div class="h2">Morning</div><div class="list">'
       + '<div class="item"><div class="t">Updated (UTC)</div><div class="m">' + escapeHtml(PAYLOAD.updated_utc || '') + '</div></div>'
-      + '<div class="item"><div class="t">Risk mode</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • event_risk=' + escapeHtml(er.toFixed(2)) + ' • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
+      + '<div class="item"><div class="t">Risk</div><div class="m">' + escapeHtml(ev.event_mode ? 'HIGH' : 'LOW') + ' • ' + escapeHtml(String(er)) + '/100 • ' + escapeHtml((ev.reason||[]).join(' | ') || '—') + '</div></div>'
       + '<div class="item"><div class="t">Calendar parse health</div><div class="m">USD=' + escapeHtml(String(ch.usd||0)) + ', timed=' + escapeHtml(String(ch.timed||0)) + ', unknown_ccy=' + escapeHtml(String(ch.unknown_currency||0)) + '</div></div>'
       + '</div></div>'
       + '<div class="panel"><div class="h2">Upcoming events</div><div class="list">'
@@ -3128,7 +3124,6 @@ def dashboard():
         .replace("__NEXT_EVENT_SRC__", (f"source={next_event_src}" if next_event_src else ""))
         .replace("__CAL_HEALTH__", str(cal_health_badge))
         .replace("__EV_CHIP__", ev_chip)
-        .replace("__TR_CHIP__", tr_chip)
         .replace("__FEEDS_CHIP__", fd_chip)
         .replace("__FRED_CHIP__", fr_chip)
         .replace("__RUN_CHIP__", rn_chip)

@@ -2327,6 +2327,27 @@ def dashboard():
                     "Explain what the 0..100 meters mean (simple language). Click for details.", "legend")
 
     dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
+    
+    def _to_float(x, default=0.0) -> float:
+    try:
+        if x is None:
+            return float(default)
+        if isinstance(x, (int, float)):
+            return float(x)
+        if isinstance(x, str):
+            s = x.strip()
+            if not s:
+                return float(default)
+            return float(s)
+        # если прилетел dict, иногда там бывает {"value": 0.7} или {"risk": 0.7}
+        if isinstance(x, dict):
+            for k in ("event_risk", "risk", "value", "score"):
+                if k in x:
+                    return _to_float(x.get(k), default)
+            return float(default)
+        return float(default)
+    except Exception:
+        return float(default)
 
     def _short_why(asset: str) -> str:
         a = assets.get(asset, {}) or {}
@@ -2343,7 +2364,11 @@ def dashboard():
         # UI-friendly: 0..100, no fractions
         clarity = int(round(max(0.0, min(1.0, 1.0 - conflict)) * 100))
         clarity_news = int(round(max(0.0, min(1.0, 1.0 - cnews)) * 100))
-        risk = int(round(max(0.0, min(1.0, float(payload.get("event", {}) or {}).get("event_risk", 0.0))) * 100))
+        ev = payload.get("event") or {}
+        ev_risk = _to_float(ev.get("event_risk", 0.0), 0.0)
+        risk = int(round(max(0.0, min(1.0, ev_risk)) * 100))
+
+
 
         score = float(gate.get("score", 0.0))
         th = float(gate.get("th", 1.0))

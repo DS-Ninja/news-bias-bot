@@ -2326,9 +2326,10 @@ def dashboard():
     lg_chip = _chip("LEGEND", "?", "neu",
                     "Explain what the 0..100 meters mean (simple language). Click for details.", "legend")
 
-    dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
     
-        def _to_float(x, default=0.0) -> float:
+    dg_chip = f'<a class="chip neu" href="/diag" target="_blank" rel="noopener" title="Diagnostics">DIAG</a>'
+
+    def _to_float(x, default=0.0) -> float:
         try:
             if x is None:
                 return float(default)

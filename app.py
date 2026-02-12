@@ -3,7 +3,7 @@
 # RESTORED v2026-02-11c (FULL SINGLE FILE — HTML INCLUDED — DB SAFE MODE + SSL FIX)
 #
 # KEY FIXES:
-# ✅ Railway Postgres SSL: auto-enforce sslmode=require if missing in DATABASE_URL (uses PGSSLMODE)
+# ✅ Railway Postgres SSL: auto-enforce sslmode=require if missing in DATABASE_PUBLIC_URL (uses PGSSLMODE)
 # ✅ Connect retries for "server closed the connection unexpectedly"
 # ✅ TRUE safe mode for /dashboard, /run, /diag when DB is down (no crash)
 # ✅ Pooled + fallback direct conn + safe close/return + shutdown hook
@@ -347,7 +347,7 @@ _DB_READY = False
 
 def _ensure_sslmode_in_url(db_url: str) -> str:
     """
-    Railway часто требует SSL. Если в DATABASE_URL нет sslmode=..., добавляем sslmode из PGSSLMODE (default=require).
+    Railway часто требует SSL. Если в DATABASE_PUBLIC_URL нет sslmode=..., добавляем sslmode из PGSSLMODE (default=require).
     Поддерживает URL формата postgresql://... и обычный DSN.
     """
     db_url = (db_url or "").strip()
@@ -379,7 +379,7 @@ def _ensure_sslmode_in_url(db_url: str) -> str:
     return db_url
 
 def _make_dsn() -> str:
-    db_url = os.environ.get("DATABASE_URL", "").strip()
+    db_url = os.environ.get("DATABASE_PUBLIC_URL", "").strip()
     if db_url:
         return _ensure_sslmode_in_url(db_url)
 
@@ -1952,7 +1952,7 @@ background:#0f1724;color:#d7e2ff}}
     <a class="btn" href="/diag.json">/diag.json</a>
     <a class="btn" href="/run">/run</a>
   </div>
-  <div class="small">Fix hints: check DATABASE_URL, ensure sslmode=require, check Railway DB status / connection limits.</div>
+  <div class="small">Fix hints: check DATABASE_PUBLIC_URL, ensure sslmode=require, check Railway DB status / connection limits.</div>
   <pre>{detail_esc}</pre>
 </div>
 </body></html>"""
@@ -1982,8 +1982,8 @@ def health(pretty: int = 0):
 def diag_json():
     toks = get_run_tokens()
     env = {
-        "has_DATABASE_URL": bool(os.environ.get("DATABASE_URL", "").strip()),
-        "DATABASE_URL_ssl_enforced": _ensure_sslmode_in_url(os.environ.get("DATABASE_URL", "").strip()) if os.environ.get("DATABASE_URL") else "",
+        "has_DATABASE_PUBLIC_URL": bool(os.environ.get("DATABASE_PUBLIC_URL", "").strip()),
+        "DATABASE_PUBLIC_URL_ssl_enforced": _ensure_sslmode_in_url(os.environ.get("DATABASE_PUBLIC_URL", "").strip()) if os.environ.get("DATABASE_PUBLIC_URL") else "",
         "PGSSLMODE": os.environ.get("PGSSLMODE", "prefer"),
         "FRED_enabled": bool(FRED_CFG["enabled"]),
         "requests_present": bool(requests is not None),

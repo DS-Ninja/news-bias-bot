@@ -605,8 +605,8 @@ def dashboard():
                 <span class="asset-sym">{sym}</span>
                 <span class="asset-bias" style="color:{bias_color}">{bias} {bias_icon}</span>
             </div>
+            <div class="asset-reason">{reason[:45]}</div>
             <div class="asset-trade" style="background:{trade_color}20;color:{trade_color}">{trade_text}</div>
-            <div class="asset-reason">{reason[:50]}</div>
         </div>'''
     
     # Next event HTML
@@ -653,38 +653,42 @@ body {{
     min-height: 100vh;
 }}
 
+/* Layout */
+.container {{
+    max-width: 900px;
+    margin: 0 auto;
+}}
+
 /* Header */
 .header {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 12px 16px;
+    padding: 8px 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
 }}
 .logo {{
     color: var(--orange);
     font-weight: 700;
-    font-size: 14px;
+    font-size: 12px;
     letter-spacing: 1px;
 }}
 .logo span {{ color: var(--text-muted); }}
 .header-right {{
     display: flex;
     align-items: center;
-    gap: 16px;
+    gap: 12px;
 }}
 .status {{
     display: flex;
     align-items: center;
-    gap: 6px;
-    font-size: 11px;
+    gap: 5px;
+    font-size: 10px;
 }}
 .live-dot {{
-    width: 8px;
-    height: 8px;
+    width: 6px;
+    height: 6px;
     background: var(--green);
     border-radius: 50%;
     animation: pulse 2s infinite;
@@ -693,13 +697,13 @@ body {{
     0%, 100% {{ opacity: 1; }}
     50% {{ opacity: 0.5; }}
 }}
-.time {{ color: var(--text-muted); }}
+.time {{ color: var(--text-muted); font-size: 10px; }}
 .feeds-badge {{
     background: var(--surface);
     border: 1px solid var(--border);
-    padding: 4px 8px;
-    border-radius: 4px;
-    font-size: 11px;
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 10px;
     cursor: pointer;
 }}
 .feeds-badge:hover {{ border-color: var(--orange); }}
@@ -714,16 +718,17 @@ body {{
 .news-ticker {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 10px 0;
+    padding: 6px 0;
     overflow: hidden;
+    font-size: 11px;
 }}
 .ticker-label {{
     color: var(--orange);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
-    padding: 0 16px;
+    padding: 0 12px;
     display: inline-block;
-    min-width: 80px;
+    min-width: 60px;
 }}
 .ticker-scroll {{
     display: inline-block;
@@ -737,46 +742,49 @@ body {{
 }}
 .ticker-item {{
     display: inline;
-    margin-right: 40px;
+    margin-right: 30px;
     color: var(--text-muted);
 }}
 .ticker-item b {{
     color: var(--orange);
-    margin-right: 8px;
+    margin-right: 6px;
 }}
 
 /* Next Event */
 .next-event {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 12px 16px;
+    padding: 8px 16px;
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 10px;
+    font-size: 11px;
+    max-width: 900px;
+    margin: 0 auto;
 }}
 .ev-label {{
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
-    min-width: 80px;
+    min-width: 70px;
 }}
 .ev-ccy {{
     background: #1f6feb33;
     color: #58a6ff;
-    padding: 2px 6px;
-    border-radius: 3px;
-    font-size: 11px;
-    font-weight: 700;
-    margin-right: 8px;
-}}
-.ev-impact {{
+    padding: 2px 5px;
+    border-radius: 2px;
     font-size: 10px;
     font-weight: 700;
-    margin-left: 8px;
+    margin-right: 6px;
+}}
+.ev-impact {{
+    font-size: 9px;
+    font-weight: 700;
+    margin-left: 6px;
 }}
 .ev-time {{
     color: var(--text-muted);
-    margin-left: 8px;
+    margin-left: 6px;
 }}
 .ev-none {{
     color: var(--text-muted);
@@ -785,29 +793,29 @@ body {{
 
 /* Assets */
 .assets {{
-    padding: 16px;
+    padding: 12px 16px;
+    max-width: 900px;
+    margin: 0 auto;
 }}
 .section-header {{
     color: var(--orange);
-    font-size: 10px;
+    font-size: 9px;
     font-weight: 700;
     letter-spacing: 1px;
-    margin-bottom: 12px;
-    padding-left: 4px;
+    margin-bottom: 8px;
 }}
 .asset-row {{
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 6px;
-    padding: 16px;
-    margin-bottom: 8px;
+    border-radius: 4px;
+    padding: 10px 14px;
+    margin-bottom: 4px;
     cursor: pointer;
     transition: border-color 0.15s;
-    display: grid;
-    grid-template-columns: 1fr auto;
-    grid-template-rows: auto auto;
-    gap: 8px 16px;
+    display: flex;
     align-items: center;
+    justify-content: space-between;
+    gap: 12px;
 }}
 .asset-row:hover {{
     border-color: var(--orange);
@@ -815,42 +823,45 @@ body {{
 .asset-main {{
     display: flex;
     align-items: center;
-    gap: 12px;
+    gap: 16px;
+    min-width: 180px;
 }}
 .asset-sym {{
-    font-size: 18px;
+    font-size: 14px;
     font-weight: 700;
     color: var(--text);
-    min-width: 70px;
+    min-width: 55px;
 }}
 .asset-bias {{
-    font-size: 13px;
-    font-weight: 700;
-}}
-.asset-trade {{
-    padding: 6px 14px;
-    border-radius: 4px;
     font-size: 11px;
     font-weight: 700;
-    text-align: center;
-    min-width: 70px;
+    min-width: 80px;
 }}
 .asset-reason {{
-    grid-column: 1 / -1;
+    flex: 1;
     color: var(--text-muted);
-    font-size: 12px;
+    font-size: 11px;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}}
+.asset-trade {{
+    padding: 4px 12px;
+    border-radius: 3px;
+    font-size: 10px;
+    font-weight: 700;
+    text-align: center;
+    min-width: 60px;
 }}
 
 /* Footer */
 .footer {{
     background: var(--surface);
     border-top: 1px solid var(--border);
-    padding: 12px 16px;
+    padding: 8px 16px;
     display: flex;
     justify-content: space-between;
     align-items: center;
-    flex-wrap: wrap;
-    gap: 12px;
     position: fixed;
     bottom: 0;
     left: 0;
@@ -858,15 +869,15 @@ body {{
 }}
 .footer-btns {{
     display: flex;
-    gap: 8px;
+    gap: 6px;
 }}
 .btn {{
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
-    padding: 8px 14px;
-    border-radius: 4px;
-    font-size: 11px;
+    padding: 5px 10px;
+    border-radius: 3px;
+    font-size: 10px;
     font-weight: 600;
     cursor: pointer;
     font-family: inherit;
@@ -877,10 +888,10 @@ body {{
 }}
 .footer-info {{
     color: var(--text-muted);
-    font-size: 10px;
+    font-size: 9px;
 }}
 .footer-info span {{
-    margin-left: 16px;
+    margin-left: 12px;
 }}
 
 /* Modal */
@@ -976,12 +987,19 @@ body {{
 .feed-bad {{ color: var(--red); }}
 
 /* Spacing for fixed footer */
-.spacer {{ height: 70px; }}
+.spacer {{ height: 50px; }}
 
 @media (max-width: 600px) {{
-    .header {{ flex-direction: column; align-items: flex-start; }}
-    .asset-row {{ grid-template-columns: 1fr; }}
-    .asset-trade {{ justify-self: start; }}
+    .container {{ max-width: 100%; }}
+    .asset-row {{ 
+        flex-direction: column;
+        align-items: flex-start;
+        gap: 8px;
+    }}
+    .asset-main {{ width: 100%; justify-content: space-between; }}
+    .asset-reason {{ width: 100%; white-space: normal; }}
+    .asset-trade {{ align-self: flex-start; }}
+    .footer {{ flex-direction: column; gap: 8px; }}
 }}
 </style>
 </head>

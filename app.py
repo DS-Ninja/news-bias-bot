@@ -69,6 +69,7 @@ TV_SYMBOLS = [{"proName": "ICMARKETS:XAUUSD", "title": "XAU"}, {"proName": "ICMA
               {"proName": "ICMARKETS:USDJPY", "title": "JPY"}]
 
 RSS_FEEDS = {
+    # === EXISTING FEEDS ===
     "FED": "https://www.federalreserve.gov/feeds/press_all.xml",
     "BLS": "https://www.bls.gov/feed/news_release.rss",
     "BEA": "https://apps.bea.gov/rss/rss.xml",
@@ -86,13 +87,179 @@ RSS_FEEDS = {
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "NASDAQ_STOCKS": "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
     "WSJ_MARKETS": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
+    
+    # === GOLD / PRECIOUS METALS ===
+    "KITCO_NEWS": "https://www.kitco.com/rss/news.xml",
+    "KITCO_GOLD": "https://www.kitco.com/rss/gold.xml",
+    "MINING_COM": "https://www.mining.com/feed/",
+    "GOLD_PRICE_ORG": "https://goldprice.org/rss",
+    "BULLION_VAULT": "https://www.bullionvault.com/gold-news/rss",
+    "SPROTT_GOLD": "https://www.sprott.com/rss/insights/",
+    "GOLD_SWISS": "https://www.gold.org/rss",
+    
+    # === STOCKS / EQUITIES ===
+    "CNBC_TOP": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
+    "CNBC_STOCKS": "https://www.cnbc.com/id/10001147/device/rss/rss.html",
+    "CNBC_EARNINGS": "https://www.cnbc.com/id/15839135/device/rss/rss.html",
+    "YAHOO_FIN": "https://finance.yahoo.com/news/rssindex",
+    "SEEKINGALPHA": "https://seekingalpha.com/market_currents.xml",
+    "SEEKINGALPHA_TOP": "https://seekingalpha.com/feed.xml",
+    "BENZINGA": "https://www.benzinga.com/feed",
+    "BENZINGA_MARKETS": "https://www.benzinga.com/markets/feed",
+    "ZACKS_COMMENTARY": "https://www.zacks.com/commentary/rss",
+    "MOTLEY_FOOL": "https://www.fool.com/feeds/index.aspx",
+    "THESTREET": "https://www.thestreet.com/rss",
+    "BARRONS": "https://feeds.content.dowjones.io/public/rss/barrons",
+    "IBD": "https://www.investors.com/feed/",
+    "STOCKTWITS": "https://api.stocktwits.com/api/2/streams/trending.json",
+    
+    # === OIL / ENERGY ===
+    "OILPRICE_ENERGY": "https://oilprice.com/rss/energy",
+    "OILPRICE_OIL": "https://oilprice.com/rss/oil",
+    "OILPRICE_GAS": "https://oilprice.com/rss/natural-gas",
+    "RIGZONE": "https://www.rigzone.com/news/rss/rigzone_news.aspx",
+    "EIA_TODAY": "https://www.eia.gov/rss/todayinenergy.xml",
+    "WORLDOIL": "https://www.worldoil.com/rss/news",
+    "OFFSHORE_MAG": "https://www.offshore-mag.com/rss",
+    "ENERGY_VOICE": "https://www.energyvoice.com/feed/",
+    "ARGUS_MEDIA": "https://www.argusmedia.com/en/rss-feeds/news",
+    "PLATTS": "https://www.spglobal.com/commodityinsights/en/rss-feed/oil",
+    "OIL_GAS_JOURNAL": "https://www.ogj.com/rss",
+    
+    # === FOREX / CURRENCIES ===
+    "FOREXLIVE": "https://www.forexlive.com/feed/news",
+    "DAILYFX_NEWS": "https://www.dailyfx.com/feeds/market-news",
+    "DAILYFX_TOP": "https://www.dailyfx.com/feeds/top-stories",
+    "FX_EMPIRE": "https://www.fxempire.com/news/feed",
+    "ACTIONFOREX": "https://www.actionforex.com/feed/",
+    "EARNFOREX": "https://www.earnforex.com/rss/news/",
+    "FXLEADERS": "https://www.fxleaders.com/feed/",
+    "BABYPIPS": "https://www.babypips.com/feed",
+    
+    # === CENTRAL BANKS ===
+    "FED_SPEECHES": "https://www.federalreserve.gov/feeds/speeches.xml",
+    "FED_TESTIMONY": "https://www.federalreserve.gov/feeds/testimony.xml",
+    "ECB_PRESS": "https://www.ecb.europa.eu/rss/press.html",
+    "BOE_NEWS": "https://www.bankofengland.co.uk/rss/news",
+    "BOJ_ANNOUNCE": "https://www.boj.or.jp/en/announcements/release_2024/rel240101a.htm/rss.xml",
+    "SNB_NEWS": "https://www.snb.ch/en/mmr/reference/rss_snb/source/rss_snb.en.xml",
+    "RBA_MEDIA": "https://www.rba.gov.au/rss/rss-cb-media-releases.xml",
+    "BOC_ANNOUNCE": "https://www.bankofcanada.ca/feed/",
+    
+    # === MACRO / ECONOMIC ===
+    "TRADINGECONOMICS": "https://tradingeconomics.com/rss/news.aspx",
+    "ECONODAY": "https://www.econoday.com/rss/",
+    "BRIEFING": "https://www.briefing.com/rss",
+    "CALCWATCH": "https://www.calcalistech.com/ctech/home.rss",
+    "TREASURY_PRESS": "https://home.treasury.gov/news/press-releases/rss.xml",
+    "IMF_NEWS": "https://www.imf.org/en/News/rss",
+    "WORLDBANK": "https://www.worldbank.org/en/news/rss.xml",
+    "BIS_PRESS": "https://www.bis.org/doclist/press.rss",
+    
+    # === GENERAL FINANCIAL NEWS ===
+    "REUTERS_BIZ": "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
+    "REUTERS_MARKETS": "https://www.reutersagency.com/feed/?best-topics=markets&post_type=best",
+    "AP_BUSINESS": "https://rsshub.app/apnews/topics/business",
+    "BBC_BUSINESS": "https://feeds.bbci.co.uk/news/business/rss.xml",
+    "FT_MARKETS": "https://www.ft.com/markets?format=rss",
+    "GUARDIAN_BIZ": "https://www.theguardian.com/uk/business/rss",
+    "ECONOMIST": "https://www.economist.com/finance-and-economics/rss.xml",
+    "FORTUNE": "https://fortune.com/feed/",
+    "FORBES_MARKETS": "https://www.forbes.com/markets/feed/",
+    
+    # === GEOPOLITICS (affects safe-haven) ===
+    "REUTERS_WORLD": "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
+    "AP_WORLD": "https://rsshub.app/apnews/topics/world-news",
+    "BBC_WORLD": "https://feeds.bbci.co.uk/news/world/rss.xml",
+    "ALJAZEERA": "https://www.aljazeera.com/xml/rss/all.xml",
+    "POLITICO_ECON": "https://rss.politico.com/economy.xml",
+    "POLITICO_FIN": "https://rss.politico.com/finance.xml",
+    
+    # === COMMODITIES GENERAL ===
+    "INV_COMMODITIES": "https://www.investing.com/rss/commodities.rss",
+    "COMMODITY_NEWS": "https://www.commodities-now.com/rss",
+    "METAL_BULLETIN": "https://www.metalbulletin.com/rss",
+    "FASTMARKETS": "https://www.fastmarkets.com/rss",
+    "MINING_WEEKLY": "https://www.miningweekly.com/rss",
+    
+    # === CRYPTO (can correlate with gold) ===
+    "COINDESK": "https://www.coindesk.com/arc/outboundfeeds/rss/",
+    "COINTELEGRAPH": "https://cointelegraph.com/rss",
+    
+    # === ADDITIONAL INVESTING.COM ===
+    "INV_STOCK_NEWS": "https://www.investing.com/rss/stock_stock_news.rss",
+    "INV_FOREX": "https://www.investing.com/rss/forex.rss",
+    "INV_CENTRAL_BANKS": "https://www.investing.com/rss/news_287.rss",
+    "INV_ECONOMY": "https://www.investing.com/rss/news_14.rss",
+    "INV_STOCK_MARKETS": "https://www.investing.com/rss/news_25.rss",
 }
 
 CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR", "MYFX_CAL"}
-SOURCE_WEIGHT = {"FED": 3.0, "BLS": 3.0, "BEA": 2.8, "FXSTREET_NEWS": 1.4, "FXSTREET_ANALYSIS": 1.2,
-                 "MARKETWATCH_TOP": 1.2, "MARKETWATCH_REALTIME": 1.3, "OILPRICE": 1.2, "INV_NEWS_11": 1.0, 
-                 "INV_MKT_FUND": 1.0, "INV_COMMOD": 1.0, "TRUMP_HEADLINES": 1.2, "FOREXFACTORY_CALENDAR": 0.0, 
-                 "MYFX_CAL": 0.0, "MYFX_NEWS": 1.15, "NASDAQ_STOCKS": 1.3, "WSJ_MARKETS": 1.6, "FRED": 1.0}
+SOURCE_WEIGHT = {
+    # === HIGH PRIORITY (Official / Institutional) ===
+    "FED": 3.0, "FED_SPEECHES": 2.8, "FED_TESTIMONY": 2.8,
+    "BLS": 3.0, "BEA": 2.8, "TREASURY_PRESS": 2.5,
+    "ECB_PRESS": 2.5, "BOE_NEWS": 2.4, "BOJ_ANNOUNCE": 2.3,
+    "SNB_NEWS": 2.2, "RBA_MEDIA": 2.2, "BOC_ANNOUNCE": 2.2,
+    "IMF_NEWS": 2.0, "WORLDBANK": 1.8, "BIS_PRESS": 2.0,
+    
+    # === GOLD SPECIALIZED ===
+    "KITCO_NEWS": 2.0, "KITCO_GOLD": 2.2,
+    "MINING_COM": 1.6, "GOLD_PRICE_ORG": 1.5,
+    "BULLION_VAULT": 1.5, "SPROTT_GOLD": 1.4, "GOLD_SWISS": 1.6,
+    
+    # === OIL SPECIALIZED ===
+    "OILPRICE": 1.8, "OILPRICE_ENERGY": 1.8, "OILPRICE_OIL": 2.0, "OILPRICE_GAS": 1.5,
+    "RIGZONE": 1.7, "EIA_TODAY": 2.2, "WORLDOIL": 1.5,
+    "OFFSHORE_MAG": 1.3, "ENERGY_VOICE": 1.4,
+    "ARGUS_MEDIA": 1.8, "PLATTS": 2.0, "OIL_GAS_JOURNAL": 1.6,
+    
+    # === MAJOR FINANCIAL MEDIA ===
+    "REUTERS_BIZ": 2.0, "REUTERS_MARKETS": 2.0, "REUTERS_WORLD": 1.5,
+    "WSJ_MARKETS": 2.0, "BARRONS": 1.8, "FT_MARKETS": 1.9,
+    "CNBC_TOP": 1.6, "CNBC_STOCKS": 1.7, "CNBC_EARNINGS": 1.8,
+    "MARKETWATCH_TOP": 1.5, "MARKETWATCH_REALTIME": 1.6,
+    "BBC_BUSINESS": 1.4, "ECONOMIST": 1.6, "FORTUNE": 1.3, "FORBES_MARKETS": 1.3,
+    "AP_BUSINESS": 1.5, "AP_WORLD": 1.3, "BBC_WORLD": 1.3,
+    
+    # === FOREX SPECIALIZED ===
+    "FXSTREET_NEWS": 1.5, "FXSTREET_ANALYSIS": 1.4,
+    "FOREXLIVE": 1.6, "DAILYFX_NEWS": 1.5, "DAILYFX_TOP": 1.5,
+    "FX_EMPIRE": 1.3, "ACTIONFOREX": 1.2, "EARNFOREX": 1.1,
+    "FXLEADERS": 1.2, "BABYPIPS": 1.0,
+    
+    # === STOCK ANALYSIS ===
+    "SEEKINGALPHA": 1.5, "SEEKINGALPHA_TOP": 1.4,
+    "BENZINGA": 1.4, "BENZINGA_MARKETS": 1.5,
+    "ZACKS_COMMENTARY": 1.4, "MOTLEY_FOOL": 1.2,
+    "THESTREET": 1.3, "IBD": 1.5, "YAHOO_FIN": 1.3,
+    "NASDAQ_STOCKS": 1.4,
+    
+    # === INVESTING.COM ===
+    "INV_NEWS_11": 1.2, "INV_MKT_FUND": 1.3, "INV_COMMOD": 1.3,
+    "INV_COMMODITIES": 1.3, "INV_STOCK_NEWS": 1.2, "INV_FOREX": 1.2,
+    "INV_CENTRAL_BANKS": 1.5, "INV_ECONOMY": 1.4, "INV_STOCK_MARKETS": 1.3,
+    
+    # === MACRO / ECONOMIC ===
+    "TRADINGECONOMICS": 1.6, "ECONODAY": 1.4, "BRIEFING": 1.3,
+    
+    # === GEOPOLITICS ===
+    "POLITICO_ECON": 1.4, "POLITICO_FIN": 1.4, "TRUMP_HEADLINES": 1.3,
+    "ALJAZEERA": 1.2, "GUARDIAN_BIZ": 1.2,
+    
+    # === COMMODITIES GENERAL ===
+    "COMMODITY_NEWS": 1.2, "METAL_BULLETIN": 1.4, "FASTMARKETS": 1.3, "MINING_WEEKLY": 1.3,
+    
+    # === CRYPTO (correlation signals) ===
+    "COINDESK": 0.8, "COINTELEGRAPH": 0.7,
+    
+    # === CALENDAR (no bias weight) ===
+    "FOREXFACTORY_CALENDAR": 0.0, "MYFX_CAL": 0.0,
+    "MYFX_NEWS": 1.2,
+    
+    # === FRED ===
+    "FRED": 1.5,
+}
 
 RULES = {
     "XAU": [(r"\b(fed|fomc|powell|hawkish|rate hike|rates higher)\b", -0.7, "Hawkish Fed weighs on gold"),

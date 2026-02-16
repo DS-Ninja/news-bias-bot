@@ -139,22 +139,25 @@ def _get_pool():
     except: pass
     return _DB_POOL
 
+_CONN_FROM_POOL = set()
+
 def db_conn():
     pool = _get_pool()
     if pool:
         try:
             c = pool.getconn()
-            setattr(c, "_from_pool", True)
+            _CONN_FROM_POOL.add(id(c))
             return c
         except: pass
     c = psycopg2.connect(_make_dsn())
-    setattr(c, "_from_pool", False)
     return c
 
 def db_put(conn):
     if not conn: return
     pool = _get_pool()
-    if pool and getattr(conn, "_from_pool", False):
+    conn_id = id(conn)
+    if pool and conn_id in _CONN_FROM_POOL:
+        _CONN_FROM_POOL.discard(conn_id)
         try: pool.putconn(conn); return
         except: pass
     try: conn.close()

@@ -27,7 +27,7 @@ except ImportError:
 from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
-ASSETS = ["XAU", "US500", "WTI"]
+ASSETS = ["XAU", "US500", "WTI", "ETH"]
 GATE_PROFILE = os.environ.get("GATE_PROFILE", "STRICT").strip().upper()
 if GATE_PROFILE not in ("STRICT", "MODERATE"): GATE_PROFILE = "STRICT"
 
@@ -40,7 +40,7 @@ GATE_THRESHOLDS = {
 
 HALF_LIFE_SEC = 8 * 3600
 LAMBDA = 0.69314718056 / HALF_LIFE_SEC
-BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9}
+BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9, "ETH": 1.0}
 
 TRUMP_ENABLED = os.environ.get("TRUMP_ENABLED", "1").strip() == "1"
 TRUMP_PAT = re.compile(r"\b(trump|donald trump|white house)\b", re.I)
@@ -76,7 +76,7 @@ def get_run_tokens():
 MYFXBOOK_IFRAME = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
 TV_SYMBOLS = [{"proName": "ICMARKETS:XAUUSD", "title": "XAU"}, {"proName": "ICMARKETS:EURUSD", "title": "EUR"},
               {"proName": "ICMARKETS:US500", "title": "US500"}, {"proName": "ICMARKETS:XTIUSD", "title": "WTI"},
-              {"proName": "ICMARKETS:USDJPY", "title": "JPY"}]
+              {"proName": "COINBASE:ETHUSD", "title": "ETH"}, {"proName": "ICMARKETS:USDJPY", "title": "JPY"}]
 
 RSS_FEEDS = {
     # === EXISTING FEEDS ===
@@ -195,6 +195,10 @@ RSS_FEEDS = {
     # === CRYPTO (can correlate with gold) ===
     "COINDESK": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "COINTELEGRAPH": "https://cointelegraph.com/rss",
+    "DECRYPT": "https://decrypt.co/feed",
+    "THEBLOCK": "https://www.theblock.co/rss.xml",
+    "CRYPTOSLATE": "https://cryptoslate.com/feed/",
+    "BEINCRYPTO": "https://beincrypto.com/feed/",
 
     # === ADDITIONAL INVESTING.COM ===
     "INV_STOCK_NEWS": "https://www.investing.com/rss/stock_stock_news.rss",
@@ -261,7 +265,8 @@ SOURCE_WEIGHT = {
     "COMMODITY_NEWS": 1.2, "METAL_BULLETIN": 1.4, "FASTMARKETS": 1.3, "MINING_WEEKLY": 1.3,
 
     # === CRYPTO (correlation signals) ===
-    "COINDESK": 0.8, "COINTELEGRAPH": 0.7,
+    "COINDESK": 1.8, "COINTELEGRAPH": 1.6,
+    "DECRYPT": 1.5, "THEBLOCK": 1.7, "CRYPTOSLATE": 1.3, "BEINCRYPTO": 1.2,
 
     # === CALENDAR (no bias weight) ===
     "FOREXFACTORY_CALENDAR": 0.0, "MYFX_CAL": 0.0,
@@ -289,7 +294,19 @@ RULES = {
             (r"\b(inventory build|inventories rise)\b", -0.8, "Inventory build pressures oil"),
             (r"\b(inventory draw|inventories fall)\b", +0.8, "Inventory draw supports oil"),
             (r"\b(disruption|outage|sanctions)\b", +0.7, "Supply disruption risk"),
-            (r"\b(demand weak|recession)\b", -0.6, "Demand concerns weigh on oil")]
+            (r"\b(demand weak|recession)\b", -0.6, "Demand concerns weigh on oil")],
+    "ETH": [(r"\b(ethereum|eth|ether)\b", +0.1, "Ethereum in focus"),
+            (r"\b(defi|dex|decentralized finance|tvl)\b", +0.5, "DeFi activity supports ETH"),
+            (r"\b(sec|regulation|crackdown|ban)\b", -0.7, "Regulatory pressure on crypto"),
+            (r"\b(etf|spot etf|institutional)\b", +0.8, "Institutional demand for ETH"),
+            (r"\b(upgrade|eip|staking|validator)\b", +0.6, "Network upgrade supports ETH"),
+            (r"\b(hack|exploit|bridge attack)\b", -0.9, "Security incident hurts sentiment"),
+            (r"\b(risk-off|selloff|crash|recession)\b", -0.6, "Risk-off mood hits crypto"),
+            (r"\b(risk-on|rally|bull)\b", +0.5, "Risk-on mood lifts crypto"),
+            (r"\b(bitcoin|btc)\b", +0.2, "BTC move correlates with ETH"),
+            (r"\b(layer.?2|l2|rollup|arbitrum|optimism|base)\b", +0.4, "L2 growth benefits ETH"),
+            (r"\b(rate cut|dovish|easing|liquidity)\b", +0.5, "Easier money lifts crypto"),
+            (r"\b(hawkish|rate hike|tightening)\b", -0.4, "Tighter policy weighs on crypto")]
 }
 
 # ============ DB ============
@@ -702,10 +719,6 @@ app = FastAPI(title="News Bias Terminal")
 def startup_event():
     """Start the background scheduler when FastAPI starts."""
     db_init()
-    # Запускаем первый пересчёт сразу при старте в фоне
-    t = threading.Thread(target=_scheduled_pipeline, daemon=True)
-    t.start()
-    print("[scheduler] Initial pipeline run started.")
     if _APSCHEDULER_AVAILABLE:
         scheduler = BackgroundScheduler()
         scheduler.add_job(
@@ -1108,7 +1121,7 @@ body {{
     </div>
     <div class="footer-info">
         <span>Profile: {GATE_PROFILE}</span>
-        <span>Keys: 1-3 view • Esc close</span>
+        <span>Keys: 1-4 view • Esc close</span>
     </div>
 </div>
 
@@ -1124,7 +1137,7 @@ body {{
 
 <script>
 const P = {js_payload};
-const ASSETS = ['XAU', 'US500', 'WTI'];
+const ASSETS = ['XAU', 'US500', 'WTI', 'ETH'];
 const CFG = {json.dumps(GATE_THRESHOLDS[GATE_PROFILE])};
 const AUTO_REFRESH_MS = {AUTO_REFRESH_MINUTES} * 60 * 1000;
 
@@ -1163,8 +1176,7 @@ async function manualRefresh() {{
     const btn = document.getElementById('refreshBtn');
     btn.textContent = '↻ ...';
     try {{
-        // POST запускает пересчёт данных, GET только читает
-        await fetch('/api/refresh', {{ method: 'POST' }});
+        await fetch('/api/data');
         _nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
         window.location.reload();
     }} catch {{
@@ -1279,6 +1291,7 @@ document.addEventListener('keydown', e => {{
     if (e.key === '1') openView('XAU');
     if (e.key === '2') openView('US500');
     if (e.key === '3') openView('WTI');
+    if (e.key === '4') openView('ETH');
 }});
 </script>
 </body>

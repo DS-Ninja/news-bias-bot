@@ -17,6 +17,13 @@ except: ThreadedConnectionPool = None
 try: import requests
 except: requests = None
 
+# === AUTO-SCHEDULER ===
+try:
+    from apscheduler.schedulers.background import BackgroundScheduler
+    _APSCHEDULER_AVAILABLE = True
+except ImportError:
+    _APSCHEDULER_AVAILABLE = False
+
 from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
@@ -51,6 +58,9 @@ RSS_LIMIT, CAL_LIMIT = 18, 120
 FEEDS_HEALTH_TTL_SEC, CAL_INGEST_TTL_SEC = 90, 300
 RSS_PARSE_WORKERS = 8
 FRED_ON_RUN = os.environ.get("FRED_ON_RUN", "1").strip() == "1"
+
+# Auto-refresh interval in minutes (change this to adjust frequency)
+AUTO_REFRESH_MINUTES = int(os.environ.get("AUTO_REFRESH_MINUTES", "15"))
 
 _PIPELINE_LOCK = threading.Lock()
 _FEEDS_HEALTH_CACHE, _FEEDS_HEALTH_TS = None, 0
@@ -87,7 +97,7 @@ RSS_FEEDS = {
     "MYFX_NEWS": "https://www.myfxbook.com/rss/latest-forex-news",
     "NASDAQ_STOCKS": "https://www.nasdaq.com/feed/rssoutbound?category=Stocks",
     "WSJ_MARKETS": "https://feeds.content.dowjones.io/public/rss/RSSMarketsMain",
-    
+
     # === GOLD / PRECIOUS METALS ===
     "KITCO_NEWS": "https://www.kitco.com/rss/news.xml",
     "KITCO_GOLD": "https://www.kitco.com/rss/gold.xml",
@@ -96,7 +106,7 @@ RSS_FEEDS = {
     "BULLION_VAULT": "https://www.bullionvault.com/gold-news/rss",
     "SPROTT_GOLD": "https://www.sprott.com/rss/insights/",
     "GOLD_SWISS": "https://www.gold.org/rss",
-    
+
     # === STOCKS / EQUITIES ===
     "CNBC_TOP": "https://www.cnbc.com/id/100003114/device/rss/rss.html",
     "CNBC_STOCKS": "https://www.cnbc.com/id/10001147/device/rss/rss.html",
@@ -112,7 +122,7 @@ RSS_FEEDS = {
     "BARRONS": "https://feeds.content.dowjones.io/public/rss/barrons",
     "IBD": "https://www.investors.com/feed/",
     "STOCKTWITS": "https://api.stocktwits.com/api/2/streams/trending.json",
-    
+
     # === OIL / ENERGY ===
     "OILPRICE_ENERGY": "https://oilprice.com/rss/energy",
     "OILPRICE_OIL": "https://oilprice.com/rss/oil",
@@ -125,7 +135,7 @@ RSS_FEEDS = {
     "ARGUS_MEDIA": "https://www.argusmedia.com/en/rss-feeds/news",
     "PLATTS": "https://www.spglobal.com/commodityinsights/en/rss-feed/oil",
     "OIL_GAS_JOURNAL": "https://www.ogj.com/rss",
-    
+
     # === FOREX / CURRENCIES ===
     "FOREXLIVE": "https://www.forexlive.com/feed/news",
     "DAILYFX_NEWS": "https://www.dailyfx.com/feeds/market-news",
@@ -135,7 +145,7 @@ RSS_FEEDS = {
     "EARNFOREX": "https://www.earnforex.com/rss/news/",
     "FXLEADERS": "https://www.fxleaders.com/feed/",
     "BABYPIPS": "https://www.babypips.com/feed",
-    
+
     # === CENTRAL BANKS ===
     "FED_SPEECHES": "https://www.federalreserve.gov/feeds/speeches.xml",
     "FED_TESTIMONY": "https://www.federalreserve.gov/feeds/testimony.xml",
@@ -145,7 +155,7 @@ RSS_FEEDS = {
     "SNB_NEWS": "https://www.snb.ch/en/mmr/reference/rss_snb/source/rss_snb.en.xml",
     "RBA_MEDIA": "https://www.rba.gov.au/rss/rss-cb-media-releases.xml",
     "BOC_ANNOUNCE": "https://www.bankofcanada.ca/feed/",
-    
+
     # === MACRO / ECONOMIC ===
     "TRADINGECONOMICS": "https://tradingeconomics.com/rss/news.aspx",
     "ECONODAY": "https://www.econoday.com/rss/",
@@ -155,7 +165,7 @@ RSS_FEEDS = {
     "IMF_NEWS": "https://www.imf.org/en/News/rss",
     "WORLDBANK": "https://www.worldbank.org/en/news/rss.xml",
     "BIS_PRESS": "https://www.bis.org/doclist/press.rss",
-    
+
     # === GENERAL FINANCIAL NEWS ===
     "REUTERS_BIZ": "https://www.reutersagency.com/feed/?best-topics=business-finance&post_type=best",
     "REUTERS_MARKETS": "https://www.reutersagency.com/feed/?best-topics=markets&post_type=best",
@@ -166,7 +176,7 @@ RSS_FEEDS = {
     "ECONOMIST": "https://www.economist.com/finance-and-economics/rss.xml",
     "FORTUNE": "https://fortune.com/feed/",
     "FORBES_MARKETS": "https://www.forbes.com/markets/feed/",
-    
+
     # === GEOPOLITICS (affects safe-haven) ===
     "REUTERS_WORLD": "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
     "AP_WORLD": "https://rsshub.app/apnews/topics/world-news",
@@ -174,18 +184,18 @@ RSS_FEEDS = {
     "ALJAZEERA": "https://www.aljazeera.com/xml/rss/all.xml",
     "POLITICO_ECON": "https://rss.politico.com/economy.xml",
     "POLITICO_FIN": "https://rss.politico.com/finance.xml",
-    
+
     # === COMMODITIES GENERAL ===
     "INV_COMMODITIES": "https://www.investing.com/rss/commodities.rss",
     "COMMODITY_NEWS": "https://www.commodities-now.com/rss",
     "METAL_BULLETIN": "https://www.metalbulletin.com/rss",
     "FASTMARKETS": "https://www.fastmarkets.com/rss",
     "MINING_WEEKLY": "https://www.miningweekly.com/rss",
-    
+
     # === CRYPTO (can correlate with gold) ===
     "COINDESK": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "COINTELEGRAPH": "https://cointelegraph.com/rss",
-    
+
     # === ADDITIONAL INVESTING.COM ===
     "INV_STOCK_NEWS": "https://www.investing.com/rss/stock_stock_news.rss",
     "INV_FOREX": "https://www.investing.com/rss/forex.rss",
@@ -202,18 +212,18 @@ SOURCE_WEIGHT = {
     "ECB_PRESS": 2.5, "BOE_NEWS": 2.4, "BOJ_ANNOUNCE": 2.3,
     "SNB_NEWS": 2.2, "RBA_MEDIA": 2.2, "BOC_ANNOUNCE": 2.2,
     "IMF_NEWS": 2.0, "WORLDBANK": 1.8, "BIS_PRESS": 2.0,
-    
+
     # === GOLD SPECIALIZED ===
     "KITCO_NEWS": 2.0, "KITCO_GOLD": 2.2,
     "MINING_COM": 1.6, "GOLD_PRICE_ORG": 1.5,
     "BULLION_VAULT": 1.5, "SPROTT_GOLD": 1.4, "GOLD_SWISS": 1.6,
-    
+
     # === OIL SPECIALIZED ===
     "OILPRICE": 1.8, "OILPRICE_ENERGY": 1.8, "OILPRICE_OIL": 2.0, "OILPRICE_GAS": 1.5,
     "RIGZONE": 1.7, "EIA_TODAY": 2.2, "WORLDOIL": 1.5,
     "OFFSHORE_MAG": 1.3, "ENERGY_VOICE": 1.4,
     "ARGUS_MEDIA": 1.8, "PLATTS": 2.0, "OIL_GAS_JOURNAL": 1.6,
-    
+
     # === MAJOR FINANCIAL MEDIA ===
     "REUTERS_BIZ": 2.0, "REUTERS_MARKETS": 2.0, "REUTERS_WORLD": 1.5,
     "WSJ_MARKETS": 2.0, "BARRONS": 1.8, "FT_MARKETS": 1.9,
@@ -221,42 +231,42 @@ SOURCE_WEIGHT = {
     "MARKETWATCH_TOP": 1.5, "MARKETWATCH_REALTIME": 1.6,
     "BBC_BUSINESS": 1.4, "ECONOMIST": 1.6, "FORTUNE": 1.3, "FORBES_MARKETS": 1.3,
     "AP_BUSINESS": 1.5, "AP_WORLD": 1.3, "BBC_WORLD": 1.3,
-    
+
     # === FOREX SPECIALIZED ===
     "FXSTREET_NEWS": 1.5, "FXSTREET_ANALYSIS": 1.4,
     "FOREXLIVE": 1.6, "DAILYFX_NEWS": 1.5, "DAILYFX_TOP": 1.5,
     "FX_EMPIRE": 1.3, "ACTIONFOREX": 1.2, "EARNFOREX": 1.1,
     "FXLEADERS": 1.2, "BABYPIPS": 1.0,
-    
+
     # === STOCK ANALYSIS ===
     "SEEKINGALPHA": 1.5, "SEEKINGALPHA_TOP": 1.4,
     "BENZINGA": 1.4, "BENZINGA_MARKETS": 1.5,
     "ZACKS_COMMENTARY": 1.4, "MOTLEY_FOOL": 1.2,
     "THESTREET": 1.3, "IBD": 1.5, "YAHOO_FIN": 1.3,
     "NASDAQ_STOCKS": 1.4,
-    
+
     # === INVESTING.COM ===
     "INV_NEWS_11": 1.2, "INV_MKT_FUND": 1.3, "INV_COMMOD": 1.3,
     "INV_COMMODITIES": 1.3, "INV_STOCK_NEWS": 1.2, "INV_FOREX": 1.2,
     "INV_CENTRAL_BANKS": 1.5, "INV_ECONOMY": 1.4, "INV_STOCK_MARKETS": 1.3,
-    
+
     # === MACRO / ECONOMIC ===
     "TRADINGECONOMICS": 1.6, "ECONODAY": 1.4, "BRIEFING": 1.3,
-    
+
     # === GEOPOLITICS ===
     "POLITICO_ECON": 1.4, "POLITICO_FIN": 1.4, "TRUMP_HEADLINES": 1.3,
     "ALJAZEERA": 1.2, "GUARDIAN_BIZ": 1.2,
-    
+
     # === COMMODITIES GENERAL ===
     "COMMODITY_NEWS": 1.2, "METAL_BULLETIN": 1.4, "FASTMARKETS": 1.3, "MINING_WEEKLY": 1.3,
-    
+
     # === CRYPTO (correlation signals) ===
     "COINDESK": 0.8, "COINTELEGRAPH": 0.7,
-    
+
     # === CALENDAR (no bias weight) ===
     "FOREXFACTORY_CALENDAR": 0.0, "MYFX_CAL": 0.0,
     "MYFX_NEWS": 1.2,
-    
+
     # === FRED ===
     "FRED": 1.5,
 }
@@ -484,7 +494,6 @@ def _get_upcoming(now):
     conn = db_conn()
     try:
         with conn.cursor() as cur:
-            # Only USD HIGH/MED events
             cur.execute("""SELECT title, event_ts, currency, impact FROM econ_events 
                           WHERE event_ts BETWEEN %s AND %s AND currency='USD' AND impact IN ('HIGH','MED')
                           ORDER BY event_ts LIMIT 10;""", (now, horizon))
@@ -604,7 +613,6 @@ def compute_bias():
         raw = 0.45 * min(1, abs(score)/th) + 0.20 * min(1, len(contribs)/18) + 0.10 * min(1, src_div/7) + 0.10 * fresh_score + 0.15 * (1-conflict) - 0.35 * conflict - (0.15 * event_risk if event_mode else 0)
         quality = int(max(0, min(100, round(raw * 100))))
 
-        # Sort drivers by absolute contribution
         top_drivers = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
         why_bias = [d["why"] for d in top_drivers if (d["contrib"] > 0) == (score > 0)][:3]
         why_opposite = [d["why"] for d in top_drivers if (d["contrib"] > 0) != (score > 0)][:2]
@@ -632,21 +640,21 @@ def eval_gate(a, event):
     bias, quality, conflict = a.get("bias", "NEUTRAL"), a.get("quality", 0), a.get("conflict", 1)
     event_mode = event.get("event_mode", False)
     upcoming = event.get("upcoming", [])
-    
+
     blockers, unlock = [], []
-    
+
     if bias == "NEUTRAL":
         blockers.append("No clear market direction")
         unlock.append("Wait for clearer signal")
-    
+
     if quality < cfg["quality_v2_min"]:
         blockers.append("Signal not strong enough")
         unlock.append("Wait for more confirming news")
-    
+
     if conflict > cfg["conflict_max"]:
         blockers.append("Sources disagree on direction")
         unlock.append("Wait for consensus")
-    
+
     if event_mode and cfg["event_mode_block"]:
         next_ev = next((e for e in upcoming if e.get("currency") == "USD" and e.get("impact") in ("HIGH", "MED")), None)
         if next_ev:
@@ -655,7 +663,7 @@ def eval_gate(a, event):
         elif not (quality >= cfg["event_override_quality"] and conflict <= cfg["event_override_conflict"]):
             blockers.append("Macro event window active")
             unlock.append("Wait for window to close")
-    
+
     return {"ok": len(blockers) == 0, "blockers": blockers, "unlock": unlock}
 
 # ============ PIPELINE ============
@@ -678,14 +686,52 @@ def pipeline_run():
         return payload
     finally: _PIPELINE_LOCK.release()
 
+def _scheduled_pipeline():
+    """Called by APScheduler every AUTO_REFRESH_MINUTES minutes."""
+    try:
+        print(f"[scheduler] Running pipeline at {datetime.now(timezone.utc).isoformat()}")
+        pipeline_run()
+        print(f"[scheduler] Done.")
+    except Exception as e:
+        print(f"[scheduler] Error: {e}")
+
 # ============ API ============
 app = FastAPI(title="News Bias Terminal")
+
+@app.on_event("startup")
+def startup_event():
+    """Start the background scheduler when FastAPI starts."""
+    db_init()
+    # Запускаем первый пересчёт сразу при старте в фоне
+    t = threading.Thread(target=_scheduled_pipeline, daemon=True)
+    t.start()
+    print("[scheduler] Initial pipeline run started.")
+    if _APSCHEDULER_AVAILABLE:
+        scheduler = BackgroundScheduler()
+        scheduler.add_job(
+            _scheduled_pipeline,
+            trigger="interval",
+            minutes=AUTO_REFRESH_MINUTES,
+            id="pipeline_refresh",
+            replace_existing=True,
+            max_instances=1,
+        )
+        scheduler.start()
+        print(f"[scheduler] Started — pipeline runs every {AUTO_REFRESH_MINUTES} minutes.")
+    else:
+        print("[scheduler] APScheduler not installed — auto-refresh disabled. Run: pip install apscheduler")
 
 @app.get("/", include_in_schema=False)
 def root(): return RedirectResponse("/dashboard")
 
 @app.get("/health")
-def health(): return {"ok": True, "profile": GATE_PROFILE}
+def health():
+    return {
+        "ok": True,
+        "profile": GATE_PROFILE,
+        "auto_refresh_minutes": AUTO_REFRESH_MINUTES,
+        "scheduler": "apscheduler" if _APSCHEDULER_AVAILABLE else "disabled"
+    }
 
 @app.get("/api/data")
 def api_data():
@@ -729,43 +775,40 @@ def dashboard():
     assets = payload.get("assets", {})
     event = payload.get("event", {})
     meta = payload.get("meta", {})
-    
+
     now_ts = int(time.time())
     event_mode = event.get("event_mode", False)
     upcoming = event.get("upcoming", [])[:5]
-    
-    # Find next USD HIGH/MED event
+
     next_ev = next((e for e in upcoming if e.get("currency") == "USD" and e.get("impact") in ("HIGH", "MED")), None)
     if not next_ev and upcoming:
         next_ev = upcoming[0]
-    
-    # Feeds
+
     feeds_st = meta.get("feeds_status", {})
     feeds_ok = sum(1 for v in feeds_st.values() if v.get("ok"))
     feeds_total = len(feeds_st) or len(RSS_FEEDS)
-    
-    # Build asset data with gates
+
     asset_data = []
     for sym in ASSETS:
         a = assets.get(sym, {})
         gate = eval_gate(a, event)
         a["gate"] = gate
         asset_data.append((sym, a))
-    
+
     def asset_row(sym, a):
         bias = a.get("bias", "NEUTRAL")
         gate = a.get("gate", {})
         ok = gate.get("ok", False)
         blockers = gate.get("blockers", [])
         why_bias = a.get("why_bias", [])
-        
+
         bias_icon = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "●")
         bias_color = "#00d4aa" if bias == "BULLISH" else ("#ff5f56" if bias == "BEARISH" else "#888")
         trade_text = "TRADE" if ok else "WAIT"
         trade_color = "#00d4aa" if ok else "#ffbd2e"
-        
+
         reason = blockers[0] if blockers else (why_bias[0] if why_bias else "Analyzing...")
-        
+
         return f'''
         <div class="asset-row" onclick="openView('{sym}')">
             <div class="asset-main">
@@ -775,8 +818,7 @@ def dashboard():
             <div class="asset-reason">{reason[:45]}</div>
             <div class="asset-trade" style="background:{trade_color}20;color:{trade_color}">{trade_text}</div>
         </div>'''
-    
-    # Next event HTML
+
     if next_ev:
         ev_ccy = next_ev.get("currency") or "—"
         ev_title = (next_ev.get("title") or "Event")[:40]
@@ -786,11 +828,11 @@ def dashboard():
         next_ev_html = f'<span class="ev-ccy">{ev_ccy}</span> {ev_title} <span class="ev-impact" style="color:{impact_color}">{ev_impact}</span> <span class="ev-time">in {ev_time}</span>'
     else:
         next_ev_html = '<span class="ev-none">No major USD events upcoming</span>'
-    
+
     js_payload = json.dumps(payload).replace("</", "<\\/")
     tv_json = json.dumps(TV_SYMBOLS)
     updated = payload.get("updated_utc", "")[:19].replace("T", " ")
-    
+
     return HTMLResponse(f'''<!DOCTYPE html>
 <html lang="en">
 <head>
@@ -820,13 +862,8 @@ body {{
     min-height: 100vh;
 }}
 
-/* Layout */
-.container {{
-    max-width: 900px;
-    margin: 0 auto;
-}}
+.container {{ max-width: 900px; margin: 0 auto; }}
 
-/* Header */
 .header {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -835,35 +872,17 @@ body {{
     justify-content: space-between;
     align-items: center;
 }}
-.logo {{
-    color: var(--orange);
-    font-weight: 700;
-    font-size: 12px;
-    letter-spacing: 1px;
-}}
+.logo {{ color: var(--orange); font-weight: 700; font-size: 12px; letter-spacing: 1px; }}
 .logo span {{ color: var(--text-muted); }}
-.header-right {{
-    display: flex;
-    align-items: center;
-    gap: 12px;
-}}
-.status {{
-    display: flex;
-    align-items: center;
-    gap: 5px;
-    font-size: 10px;
-}}
+.header-right {{ display: flex; align-items: center; gap: 12px; }}
+.status {{ display: flex; align-items: center; gap: 5px; font-size: 10px; }}
 .live-dot {{
-    width: 6px;
-    height: 6px;
+    width: 6px; height: 6px;
     background: var(--green);
     border-radius: 50%;
     animation: pulse 2s infinite;
 }}
-@keyframes pulse {{
-    0%, 100% {{ opacity: 1; }}
-    50% {{ opacity: 0.5; }}
-}}
+@keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
 .time {{ color: var(--text-muted); font-size: 10px; }}
 .feeds-badge {{
     background: var(--surface);
@@ -874,14 +893,19 @@ body {{
     cursor: pointer;
 }}
 .feeds-badge:hover {{ border-color: var(--orange); }}
-
-/* TradingView Ticker */
-.tv-wrap {{
-    border-bottom: 1px solid var(--border);
-    background: #000;
+.refresh-badge {{
+    background: var(--surface);
+    border: 1px solid var(--border);
+    padding: 3px 8px;
+    border-radius: 3px;
+    font-size: 10px;
+    cursor: pointer;
+    color: var(--text-muted);
 }}
+.refresh-badge:hover {{ border-color: var(--green); color: var(--green); }}
 
-/* News Ticker */
+.tv-wrap {{ border-bottom: 1px solid var(--border); background: #000; }}
+
 .news-ticker {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -889,35 +913,13 @@ body {{
     overflow: hidden;
     font-size: 11px;
 }}
-.ticker-label {{
-    color: var(--orange);
-    font-size: 9px;
-    font-weight: 700;
-    padding: 0 12px;
-    display: inline-block;
-    min-width: 60px;
-}}
-.ticker-scroll {{
-    display: inline-block;
-    white-space: nowrap;
-    animation: ticker 180s linear infinite;
-}}
+.ticker-label {{ color: var(--orange); font-size: 9px; font-weight: 700; padding: 0 12px; display: inline-block; min-width: 60px; }}
+.ticker-scroll {{ display: inline-block; white-space: nowrap; animation: ticker 180s linear infinite; }}
 .ticker-scroll:hover {{ animation-play-state: paused; }}
-@keyframes ticker {{
-    0% {{ transform: translateX(0); }}
-    100% {{ transform: translateX(-50%); }}
-}}
-.ticker-item {{
-    display: inline;
-    margin-right: 30px;
-    color: var(--text-muted);
-}}
-.ticker-item b {{
-    color: var(--orange);
-    margin-right: 6px;
-}}
+@keyframes ticker {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }}
+.ticker-item {{ display: inline; margin-right: 30px; color: var(--text-muted); }}
+.ticker-item b {{ color: var(--orange); margin-right: 6px; }}
 
-/* Next Event */
 .next-event {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
@@ -929,48 +931,14 @@ body {{
     max-width: 900px;
     margin: 0 auto;
 }}
-.ev-label {{
-    color: var(--text-muted);
-    font-size: 9px;
-    font-weight: 700;
-    min-width: 70px;
-}}
-.ev-ccy {{
-    background: #1f6feb33;
-    color: #58a6ff;
-    padding: 2px 5px;
-    border-radius: 2px;
-    font-size: 10px;
-    font-weight: 700;
-    margin-right: 6px;
-}}
-.ev-impact {{
-    font-size: 9px;
-    font-weight: 700;
-    margin-left: 6px;
-}}
-.ev-time {{
-    color: var(--text-muted);
-    margin-left: 6px;
-}}
-.ev-none {{
-    color: var(--text-muted);
-    font-style: italic;
-}}
+.ev-label {{ color: var(--text-muted); font-size: 9px; font-weight: 700; min-width: 70px; }}
+.ev-ccy {{ background: #1f6feb33; color: #58a6ff; padding: 2px 5px; border-radius: 2px; font-size: 10px; font-weight: 700; margin-right: 6px; }}
+.ev-impact {{ font-size: 9px; font-weight: 700; margin-left: 6px; }}
+.ev-time {{ color: var(--text-muted); margin-left: 6px; }}
+.ev-none {{ color: var(--text-muted); font-style: italic; }}
 
-/* Assets */
-.assets {{
-    padding: 12px 16px;
-    max-width: 900px;
-    margin: 0 auto;
-}}
-.section-header {{
-    color: var(--orange);
-    font-size: 9px;
-    font-weight: 700;
-    letter-spacing: 1px;
-    margin-bottom: 8px;
-}}
+.assets {{ padding: 12px 16px; max-width: 900px; margin: 0 auto; }}
+.section-header {{ color: var(--orange); font-size: 9px; font-weight: 700; letter-spacing: 1px; margin-bottom: 8px; }}
 .asset-row {{
     background: var(--surface);
     border: 1px solid var(--border);
@@ -984,44 +952,24 @@ body {{
     justify-content: space-between;
     gap: 12px;
 }}
-.asset-row:hover {{
-    border-color: var(--orange);
-}}
-.asset-main {{
-    display: flex;
-    align-items: center;
-    gap: 16px;
-    min-width: 180px;
-}}
-.asset-sym {{
-    font-size: 14px;
-    font-weight: 700;
-    color: var(--text);
-    min-width: 55px;
-}}
-.asset-bias {{
-    font-size: 11px;
-    font-weight: 700;
-    min-width: 80px;
-}}
-.asset-reason {{
-    flex: 1;
-    color: var(--text-muted);
-    font-size: 11px;
-    white-space: nowrap;
-    overflow: hidden;
-    text-overflow: ellipsis;
-}}
-.asset-trade {{
-    padding: 4px 12px;
-    border-radius: 3px;
-    font-size: 10px;
-    font-weight: 700;
-    text-align: center;
-    min-width: 60px;
-}}
+.asset-row:hover {{ border-color: var(--orange); }}
+.asset-main {{ display: flex; align-items: center; gap: 16px; min-width: 180px; }}
+.asset-sym {{ font-size: 14px; font-weight: 700; color: var(--text); min-width: 55px; }}
+.asset-bias {{ font-size: 11px; font-weight: 700; min-width: 80px; }}
+.asset-reason {{ flex: 1; color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+.asset-trade {{ padding: 4px 12px; border-radius: 3px; font-size: 10px; font-weight: 700; text-align: center; min-width: 60px; }}
 
-/* Footer */
+/* Countdown */
+.next-refresh {{
+    background: var(--surface);
+    border-top: 1px solid var(--border);
+    padding: 6px 16px;
+    font-size: 10px;
+    color: var(--text-muted);
+    text-align: center;
+}}
+.next-refresh span {{ color: var(--green); }}
+
 .footer {{
     background: var(--surface);
     border-top: 1px solid var(--border);
@@ -1034,10 +982,7 @@ body {{
     left: 0;
     right: 0;
 }}
-.footer-btns {{
-    display: flex;
-    gap: 6px;
-}}
+.footer-btns {{ display: flex; gap: 6px; }}
 .btn {{
     background: var(--bg);
     border: 1px solid var(--border);
@@ -1049,19 +994,10 @@ body {{
     cursor: pointer;
     font-family: inherit;
 }}
-.btn:hover {{
-    border-color: var(--orange);
-    color: var(--orange);
-}}
-.footer-info {{
-    color: var(--text-muted);
-    font-size: 9px;
-}}
-.footer-info span {{
-    margin-left: 12px;
-}}
+.btn:hover {{ border-color: var(--orange); color: var(--orange); }}
+.footer-info {{ color: var(--text-muted); font-size: 9px; }}
+.footer-info span {{ margin-left: 12px; }}
 
-/* Modal */
 .modal {{
     display: none;
     position: fixed;
@@ -1071,12 +1007,7 @@ body {{
     padding: 20px;
     overflow-y: auto;
 }}
-.modal.open {{
-    display: flex;
-    justify-content: center;
-    align-items: flex-start;
-    padding-top: 10vh;
-}}
+.modal.open {{ display: flex; justify-content: center; align-items: flex-start; padding-top: 10vh; }}
 .modal-box {{
     background: var(--surface);
     border: 1px solid var(--border);
@@ -1096,73 +1027,28 @@ body {{
     top: 0;
     background: var(--surface);
 }}
-.modal-title {{
-    font-size: 14px;
-    font-weight: 700;
-    color: var(--orange);
-}}
-.modal-close {{
-    background: none;
-    border: none;
-    color: var(--text-muted);
-    font-size: 20px;
-    cursor: pointer;
-    padding: 0;
-}}
+.modal-title {{ font-size: 14px; font-weight: 700; color: var(--orange); }}
+.modal-close {{ background: none; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 0; }}
 .modal-close:hover {{ color: var(--text); }}
-.modal-body {{
-    padding: 16px;
-}}
-.view-section {{
-    margin-bottom: 20px;
-}}
-.view-label {{
-    font-size: 10px;
-    font-weight: 700;
-    color: var(--text-muted);
-    letter-spacing: 0.5px;
-    margin-bottom: 10px;
-}}
-.view-item {{
-    padding: 10px 12px;
-    background: var(--bg);
-    border-radius: 4px;
-    margin-bottom: 6px;
-    font-size: 12px;
-    border-left: 3px solid var(--border);
-}}
+.modal-body {{ padding: 16px; }}
+.view-section {{ margin-bottom: 20px; }}
+.view-label {{ font-size: 10px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.5px; margin-bottom: 10px; }}
+.view-item {{ padding: 10px 12px; background: var(--bg); border-radius: 4px; margin-bottom: 6px; font-size: 12px; border-left: 3px solid var(--border); }}
 .view-item.why {{ border-left-color: var(--green); color: var(--green); }}
 .view-item.block {{ border-left-color: var(--red); color: var(--red); }}
 .view-item.unlock {{ border-left-color: var(--yellow); color: var(--yellow); }}
 .view-item.opposite {{ border-left-color: var(--text-muted); color: var(--text-muted); }}
 
-/* Feed grid */
-.feed-grid {{
-    display: grid;
-    grid-template-columns: repeat(auto-fill, minmax(150px, 1fr));
-    gap: 6px;
-}}
-.feed-item {{
-    background: var(--bg);
-    padding: 8px;
-    border-radius: 4px;
-    font-size: 10px;
-    display: flex;
-    justify-content: space-between;
-}}
+.feed-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }}
+.feed-item {{ background: var(--bg); padding: 8px; border-radius: 4px; font-size: 10px; display: flex; justify-content: space-between; }}
 .feed-ok {{ color: var(--green); }}
 .feed-bad {{ color: var(--red); }}
 
-/* Spacing for fixed footer */
 .spacer {{ height: 50px; }}
 
 @media (max-width: 600px) {{
     .container {{ max-width: 100%; }}
-    .asset-row {{ 
-        flex-direction: column;
-        align-items: flex-start;
-        gap: 8px;
-    }}
+    .asset-row {{ flex-direction: column; align-items: flex-start; gap: 8px; }}
     .asset-main {{ width: 100%; justify-content: space-between; }}
     .asset-reason {{ width: 100%; white-space: normal; }}
     .asset-trade {{ align-self: flex-start; }}
@@ -1180,6 +1066,7 @@ body {{
             <span>LIVE</span>
         </div>
         <div class="time" id="clock">{updated} UTC</div>
+        <div class="refresh-badge" onclick="manualRefresh()" id="refreshBtn">↻ REFRESH</div>
         <div class="feeds-badge" onclick="openFeeds()">FEEDS {feeds_ok}/{feeds_total}</div>
     </div>
 </div>
@@ -1206,6 +1093,10 @@ body {{
 <div class="assets">
     <div class="section-header">&lt;&lt; TRADE SIGNALS &gt;&gt;</div>
     {''.join(asset_row(sym, a) for sym, a in asset_data)}
+</div>
+
+<div class="next-refresh">
+    Auto-refresh every {AUTO_REFRESH_MINUTES} min &nbsp;|&nbsp; Next update in: <span id="countdown">—</span>
 </div>
 
 <div class="spacer"></div>
@@ -1235,8 +1126,28 @@ body {{
 const P = {js_payload};
 const ASSETS = ['XAU', 'US500', 'WTI'];
 const CFG = {json.dumps(GATE_THRESHOLDS[GATE_PROFILE])};
+const AUTO_REFRESH_MS = {AUTO_REFRESH_MINUTES} * 60 * 1000;
 
-// Auto-refresh data every 30s
+let _lastUpdate = Date.now();
+let _nextRefreshAt = _lastUpdate + AUTO_REFRESH_MS;
+
+// ---- Countdown timer ----
+function updateCountdown() {{
+    const remaining = Math.max(0, Math.round((_nextRefreshAt - Date.now()) / 1000));
+    const m = Math.floor(remaining / 60);
+    const s = remaining % 60;
+    document.getElementById('countdown').textContent = m + 'm ' + String(s).padStart(2,'0') + 's';
+}}
+setInterval(updateCountdown, 1000);
+updateCountdown();
+
+// ---- Auto-reload the page every AUTO_REFRESH_MINUTES ----
+// This reloads the whole dashboard so UI stays in sync with backend data
+setInterval(() => {{
+    window.location.reload();
+}}, AUTO_REFRESH_MS);
+
+// ---- Also update clock & news every 30s without reloading ----
 setInterval(async () => {{
     try {{
         const r = await fetch('/api/data');
@@ -1247,7 +1158,21 @@ setInterval(async () => {{
     }} catch {{}}
 }}, 30000);
 
-// Load news ticker
+// ---- Manual refresh button ----
+async function manualRefresh() {{
+    const btn = document.getElementById('refreshBtn');
+    btn.textContent = '↻ ...';
+    try {{
+        // POST запускает пересчёт данных, GET только читает
+        await fetch('/api/refresh', {{ method: 'POST' }});
+        _nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
+        window.location.reload();
+    }} catch {{
+        btn.textContent = '↻ REFRESH';
+    }}
+}}
+
+// ---- Load news ticker ----
 async function loadNews() {{
     try {{
         const r = await fetch('/latest?limit=15');
@@ -1271,30 +1196,18 @@ function closeModal() {{ document.getElementById('modal').classList.remove('open
 function openView(sym) {{
     const a = P.assets?.[sym] || {{}};
     const ev = P.event || {{}};
-    
     const bias = a.bias || 'NEUTRAL';
     const whyBias = a.why_bias || [];
     const whyOpp = a.why_opposite || [];
-    
-    // Compute gate
     const blockers = [], unlock = [];
     const quality = a.quality || 0;
     const conflict = a.conflict || 1;
     const eventMode = ev.event_mode;
     const upcoming = ev.upcoming || [];
-    
-    if (bias === 'NEUTRAL') {{
-        blockers.push('No clear market direction');
-        unlock.push('Wait for clearer signal');
-    }}
-    if (quality < CFG.quality_v2_min) {{
-        blockers.push('Signal not strong enough');
-        unlock.push('Wait for more confirming news');
-    }}
-    if (conflict > CFG.conflict_max) {{
-        blockers.push('Sources disagree on direction');
-        unlock.push('Wait for consensus');
-    }}
+
+    if (bias === 'NEUTRAL') {{ blockers.push('No clear market direction'); unlock.push('Wait for clearer signal'); }}
+    if (quality < CFG.quality_v2_min) {{ blockers.push('Signal not strong enough'); unlock.push('Wait for more confirming news'); }}
+    if (conflict > CFG.conflict_max) {{ blockers.push('Sources disagree on direction'); unlock.push('Wait for consensus'); }}
     if (eventMode && CFG.event_mode_block) {{
         const nextUSD = upcoming.find(e => e.currency === 'USD' && ['HIGH','MED'].includes(e.impact));
         if (nextUSD) {{
@@ -1305,43 +1218,38 @@ function openView(sym) {{
             unlock.push('Wait for window to close');
         }}
     }}
-    
+
     const ok = blockers.length === 0;
     const biasColor = bias === 'BULLISH' ? '#00d4aa' : (bias === 'BEARISH' ? '#ff5f56' : '#888');
     const tradeText = ok ? 'TRADE' : 'WAIT';
     const tradeColor = ok ? '#00d4aa' : '#ffbd2e';
-    
+
     let html = `
         <div style="text-align:center;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:16px;">
             <div style="font-size:24px;font-weight:700;color:${{biasColor}};margin-bottom:8px;">${{bias}}</div>
             <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 20px;border-radius:4px;font-weight:700;">${{tradeText}}</div>
         </div>
     `;
-    
     if (whyBias.length) {{
         html += `<div class="view-section"><div class="view-label">WHY ${{bias}}</div>`;
         whyBias.forEach(w => {{ html += `<div class="view-item why">${{esc(w)}}</div>`; }});
         html += `</div>`;
     }}
-    
     if (blockers.length) {{
         html += `<div class="view-section"><div class="view-label">WHY WAIT</div>`;
         blockers.forEach(b => {{ html += `<div class="view-item block">${{esc(b)}}</div>`; }});
         html += `</div>`;
     }}
-    
     if (unlock.length) {{
         html += `<div class="view-section"><div class="view-label">WILL UNLOCK WHEN</div>`;
         unlock.forEach(u => {{ html += `<div class="view-item unlock">${{esc(u)}}</div>`; }});
         html += `</div>`;
     }}
-    
     if (whyOpp.length) {{
         html += `<div class="view-section"><div class="view-label">OPPOSING SIGNALS</div>`;
         whyOpp.forEach(w => {{ html += `<div class="view-item opposite">${{esc(w)}}</div>`; }});
         html += `</div>`;
     }}
-    
     openModal(sym, html);
 }}
 
@@ -1349,14 +1257,12 @@ function openFeeds() {{
     const f = P.meta?.feeds_status || {{}};
     const items = Object.entries(f).sort((a,b) => a[0].localeCompare(b[0]));
     const ok = items.filter(([,v]) => v.ok).length;
-    
     let html = `<div style="margin-bottom:16px;color:var(--text-muted);">Active: ${{ok}}/${{items.length}}</div>`;
     html += `<div class="feed-grid">`;
     items.forEach(([name, info]) => {{
         html += `<div class="feed-item"><span>${{esc(name)}}</span><span class="${{info.ok ? 'feed-ok' : 'feed-bad'}}">${{info.ok ? '●' : '○'}}</span></div>`;
     }});
     html += `</div>`;
-    
     openModal('FEEDS STATUS', html);
 }}
 
@@ -1368,7 +1274,6 @@ function openCalendar() {{
     `);
 }}
 
-// Keyboard shortcuts
 document.addEventListener('keydown', e => {{
     if (e.key === 'Escape') closeModal();
     if (e.key === '1') openView('XAU');

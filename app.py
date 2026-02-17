@@ -605,7 +605,7 @@ def compute_bias():
         net = sum(x["contrib"] for x in contribs)
         abs_sum = sum(abs(x["contrib"]) for x in contribs) or 1
         conflict = 1 - abs(net) / abs_sum
-        src_div = len(set(x.get("source", "") for x in rows if any(match_rules(asset, x[1]) for x in [(x,)])))
+        src_div = len(set(row[0] for row in rows if match_rules(asset, row[1])))
 
         fresh_total = sum(freshness.values()) or 1
         fresh_score = (freshness["0-2h"] + freshness["2-8h"] * 0.6) / fresh_total

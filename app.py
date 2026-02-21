@@ -838,6 +838,219 @@ def _fg_to_weight(v, asset):
         return -centered * 0.5   # fear = gold bullish
     return 0.0
 
+# ============ COT REPORT (CFTC) ============
+# CFTC publishes Commitments of Traders every Friday
+# We parse the legacy CSV — no API key needed
+# Columns we care about: NonComm_Long, NonComm_Short (speculative positioning)
+
+COT_MARKETS = {
+    # CFTC market code → our asset
+    "088691": "XAU",    # Gold futures (COMEX)
+    "067651": "WTI",    # Crude Oil, Light Sweet (NYMEX)
+    "13874A": "EUR",    # Euro FX (CME)
+    "133741": "BTC",    # Bitcoin (CME)
+    "099741": "ETH",    # Ether (CME)
+    "13874+": "US500",  # E-mini S&P 500 (CME) — proxy
+}
+COT_CSV_URL = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
+COT_TTL = 86400 * 2  # refresh every 2 days (published weekly)
+
+def fetch_cot():
+    """Download CFTC COT report, extract net speculative position per asset.
+    Returns {asset: {net_long: float, pct_long: float, signal: str, weight: float}}
+    """
+    cached = _ext_get("cot")
+    if cached:
+        return cached
+    if not requests:
+        return {}
+    result = {}
+    try:
+        r = requests.get(COT_CSV_URL, timeout=20)
+        r.raise_for_status()
+        lines = r.text.splitlines()
+        # Format: fixed-width / CSV depending on file variant; try CSV-style split
+        for line in lines[1:]:  # skip header
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < 10:
+                continue
+            mkt_code = parts[2].strip() if len(parts) > 2 else ""
+            asset = COT_MARKETS.get(mkt_code)
+            if not asset:
+                continue
+            try:
+                # Fields in FinFutWk: ... NonComm_Positions_Long_All, NonComm_Positions_Short_All ...
+                # Column indices (0-based) vary — scan by header name
+                # Fallback: use known legacy indices
+                non_long  = float(parts[8].replace(",",""))   # NonComm Long
+                non_short = float(parts[9].replace(",",""))   # NonComm Short
+                net = non_long - non_short
+                total = non_long + non_short or 1.0
+                pct_long = round(non_long / total * 100, 1)
+                # Interpret signal
+                if pct_long >= 70:
+                    signal, weight = "Speculators heavily long", +0.6
+                elif pct_long >= 60:
+                    signal, weight = "Speculators net long", +0.35
+                elif pct_long <= 30:
+                    signal, weight = "Speculators heavily short", -0.6
+                elif pct_long <= 40:
+                    signal, weight = "Speculators net short", -0.35
+                else:
+                    signal, weight = "Speculators neutral", 0.0
+                result[asset] = {
+                    "net_long": int(net),
+                    "pct_long": pct_long,
+                    "signal": signal,
+                    "weight": weight,
+                }
+            except (ValueError, IndexError):
+                continue
+    except Exception as e:
+        pass  # silently fail — COT is supplementary
+    # Also try alternative JSON source (Quandl/Nasdaq Data Link style fallback)
+    if not result:
+        result = _fetch_cot_fallback()
+    if result:
+        _ext_set("cot", result)
+    return result
+
+def _fetch_cot_fallback():
+    """Fallback: parse CFTC disaggregated futures from their JSON API."""
+    result = {}
+    try:
+        # CFTC open data endpoint
+        url = "https://publicreporting.cftc.gov/api/explore/dataset/fut_disagg_xls_2024_001/records/?limit=50&refine.market_and_exchange_names=GOLD"
+        r = requests.get(url, timeout=10)
+        data = r.json().get("records", [])
+        for rec in data[:1]:
+            f = rec.get("fields", {})
+            nl = float(f.get("noncomm_positions_long_all", 0))
+            ns = float(f.get("noncomm_positions_short_all", 0))
+            if nl + ns > 0:
+                pct = nl / (nl + ns) * 100
+                result["XAU"] = {
+                    "net_long": int(nl - ns),
+                    "pct_long": round(pct, 1),
+                    "signal": "Speculators net long" if pct > 55 else "Speculators net short",
+                    "weight": +0.3 if pct > 55 else -0.3,
+                }
+    except:
+        pass
+    return result
+
+def cot_to_weight(asset, cot_data):
+    """Return (weight, label) from COT data for a given asset."""
+    d = cot_data.get(asset)
+    if not d:
+        return 0.0, None
+    return d.get("weight", 0.0), f"COT: {d['signal']} ({d['pct_long']}% long)"
+
+# ============ OPTIONS MARKET (CBOE Put/Call + Implied Vol) ============
+OPTIONS_TTL = 3600  # refresh hourly
+
+def fetch_options_data():
+    """Fetch CBOE equity put/call ratio and VIX term structure.
+    Returns {
+        'equity_pcr': float,        # <0.7 greedy, >1.0 fearful
+        'index_pcr': float,
+        'total_pcr': float,
+        'vix': float,               # current VIX
+        'vix_signal': str,
+        'pcr_signal': str,
+        'pcr_weight_us500': float,
+        'pcr_weight_xau': float,
+    }
+    """
+    cached = _ext_get("options")
+    if cached:
+        return cached
+    if not requests:
+        return {}
+    result = {}
+    # ── 1. CBOE Put/Call Ratio (free, public endpoint) ──
+    try:
+        r = requests.get(
+            "https://cdn.cboe.com/api/global/us_indices/pcr_totals/total_put_call_ratio.json",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        d = r.json()
+        # Fields: equity, index, total
+        result["equity_pcr"] = float(d.get("equity", 0))
+        result["index_pcr"]  = float(d.get("index",  0))
+        result["total_pcr"]  = float(d.get("total",  0))
+    except:
+        pass
+
+    # ── 2. VIX current level from CBOE ──
+    try:
+        r = requests.get(
+            "https://cdn.cboe.com/api/global/delayed_quotes/charts/historical/_VIX.json",
+            timeout=10, headers={"User-Agent": "Mozilla/5.0"}
+        )
+        quotes = r.json().get("data", [])
+        if quotes:
+            # Last entry: [datetime, open, high, low, close, volume]
+            result["vix"] = float(quotes[-1][4])  # close
+    except:
+        pass
+
+    # ── 3. GVZ (Gold Volatility Index) via FRED if available ──
+    try:
+        gvz_vals = fred_last("VIXCLS", 5)  # fallback to VIX
+        if gvz_vals:
+            result["vix_fred"] = round(gvz_vals[0], 2)
+    except:
+        pass
+
+    # ── Interpret signals ──
+    pcr = result.get("equity_pcr", 0) or result.get("total_pcr", 0)
+    vix = result.get("vix", 0) or result.get("vix_fred", 0)
+
+    if pcr > 0:
+        if pcr >= 1.1:
+            result["pcr_signal"] = f"Extreme fear (P/C={pcr:.2f}) — contrarian bullish"
+            result["pcr_weight_us500"] = +0.45  # contrarian: put heavy = bottom near
+            result["pcr_weight_xau"]   = +0.3
+        elif pcr >= 0.90:
+            result["pcr_signal"] = f"Elevated put buying (P/C={pcr:.2f})"
+            result["pcr_weight_us500"] = +0.2
+            result["pcr_weight_xau"]   = +0.15
+        elif pcr <= 0.55:
+            result["pcr_signal"] = f"Extreme complacency (P/C={pcr:.2f}) — contrarian bearish"
+            result["pcr_weight_us500"] = -0.4
+            result["pcr_weight_xau"]   = -0.2
+        elif pcr <= 0.70:
+            result["pcr_signal"] = f"Low put/call ratio (P/C={pcr:.2f}) — mild caution"
+            result["pcr_weight_us500"] = -0.15
+            result["pcr_weight_xau"]   = -0.1
+        else:
+            result["pcr_signal"] = f"Neutral put/call ratio (P/C={pcr:.2f})"
+            result["pcr_weight_us500"] = 0.0
+            result["pcr_weight_xau"]   = 0.0
+
+    if vix > 0:
+        if vix >= 30:
+            result["vix_signal"] = f"VIX spike {vix:.1f} — extreme fear, XAU bid"
+            result["vix_weight_us500"] = -0.5
+            result["vix_weight_xau"]   = +0.5
+        elif vix >= 20:
+            result["vix_signal"] = f"VIX elevated {vix:.1f} — risk-off"
+            result["vix_weight_us500"] = -0.25
+            result["vix_weight_xau"]   = +0.25
+        elif vix <= 13:
+            result["vix_signal"] = f"VIX low {vix:.1f} — complacency risk"
+            result["vix_weight_us500"] = -0.1
+            result["vix_weight_xau"]   = -0.15
+        else:
+            result["vix_signal"] = f"VIX normal {vix:.1f}"
+            result["vix_weight_us500"] = 0.0
+            result["vix_weight_xau"]   = 0.0
+
+    if result:
+        _ext_set("options", result)
+    return result
+
 # ============ MOMENTUM & VELOCITY ============
 def compute_momentum(rows, asset, now):
     """
@@ -923,7 +1136,9 @@ def compute_bias():
     event_risk = _event_risk(upcoming, recent_macro)
 
     # Fetch external metrics (non-blocking — cached)
-    fg_data = fetch_fear_greed()
+    fg_data  = fetch_fear_greed()
+    cot_data = fetch_cot()
+    opt_data = fetch_options_data()
 
     # ── Pass 1: compute raw scores for cross-asset correlation ──
     raw_scores = {}
@@ -1004,10 +1219,53 @@ def compute_bias():
             mom_label = "Bullish momentum accelerating" if momentum > 0 else "Bearish momentum accelerating"
             contribs.append({"contrib": momentum_contrib, "why": mom_label})
         if vel_why:
-            # velocity adds small boost in direction of current bias
             vel_boost = velocity * 0.1 * (1 if score >= 0 else -1)
             score += vel_boost
             contribs.append({"contrib": vel_boost, "why": vel_why})
+
+        # ── COT Report (speculative positioning) ──
+        cot_weight, cot_label = cot_to_weight(asset, cot_data)
+        cot_snap = cot_data.get(asset, {})
+        if cot_label and abs(cot_weight) > 0.05:
+            score += cot_weight
+            contribs.append({"contrib": cot_weight, "why": cot_label})
+
+        # ── Options Market (Put/Call + VIX) ──
+        opt_labels = []
+        if asset == "US500":
+            pcr_w = opt_data.get("pcr_weight_us500", 0.0)
+            vix_w = opt_data.get("vix_weight_us500", 0.0)
+            if abs(pcr_w) > 0.05:
+                score += pcr_w
+                lbl = opt_data.get("pcr_signal", "Options signal")
+                contribs.append({"contrib": pcr_w, "why": lbl})
+                opt_labels.append(lbl)
+            if abs(vix_w) > 0.05:
+                score += vix_w
+                lbl = opt_data.get("vix_signal", "VIX signal")
+                contribs.append({"contrib": vix_w, "why": lbl})
+                opt_labels.append(lbl)
+        elif asset == "XAU":
+            pcr_w = opt_data.get("pcr_weight_xau", 0.0)
+            vix_w = opt_data.get("vix_weight_xau", 0.0)
+            if abs(pcr_w) > 0.05:
+                score += pcr_w
+                lbl = opt_data.get("pcr_signal", "Options signal")
+                contribs.append({"contrib": pcr_w, "why": lbl})
+                opt_labels.append(lbl)
+            if abs(vix_w) > 0.05:
+                score += vix_w
+                lbl = opt_data.get("vix_signal", "VIX signal")
+                contribs.append({"contrib": vix_w, "why": lbl})
+                opt_labels.append(lbl)
+        elif asset in ("ETH", "BTC"):
+            # Crypto: VIX spike = risk-off hits crypto, low VIX = risk-on lifts crypto
+            vix_w = opt_data.get("vix_weight_us500", 0.0) * 0.7  # dampened
+            if abs(vix_w) > 0.05:
+                score += vix_w
+                lbl = opt_data.get("vix_signal", "VIX signal")
+                contribs.append({"contrib": vix_w, "why": lbl})
+                opt_labels.append(lbl)
 
         th = BIAS_THRESH.get(asset, 1.0)
         bias = "BULLISH" if score >= th else ("BEARISH" if score <= -th else "NEUTRAL")
@@ -1023,23 +1281,30 @@ def compute_bias():
         evidence_v = min(1.0, len(contribs) / 25.0)
         diversity  = min(1.0, src_div / 10.0)
         agreement  = 1.0 - conflict
-        # Velocity bonus: high velocity boosts quality
         vel_bonus  = min(0.1, velocity * 0.02)
+        # Extra quality bonus when multiple independent data sources agree
+        ext_sources_agree = sum([
+            1 if abs(cot_weight) > 0.1 and (cot_weight > 0) == (score > 0) else 0,
+            1 if opt_labels and (opt_data.get("pcr_weight_us500",0) > 0) == (score > 0) else 0,
+            1 if fg_contrib_label else 0,
+        ])
+        ext_bonus = min(0.08, ext_sources_agree * 0.03)
 
         raw = (
-            0.33 * strength
-          + 0.18 * evidence_v
-          + 0.13 * diversity
-          + 0.13 * fresh_score
-          + 0.13 * agreement
+            0.30 * strength
+          + 0.17 * evidence_v
+          + 0.12 * diversity
+          + 0.12 * fresh_score
+          + 0.12 * agreement
           + 0.05 * min(1.0, abs(momentum))
           + vel_bonus
+          + ext_bonus
           - 0.20 * conflict
           - (0.15 * event_risk if event_mode else 0.0)
         )
         quality = int(max(0, min(100, round(raw * 100))))
 
-        top_drivers  = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:6]
+        top_drivers  = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:8]
         why_bias     = [d["why"] for d in top_drivers if (d["contrib"] > 0) == (score > 0)][:3]
         why_opposite = [d["why"] for d in top_drivers if (d["contrib"] > 0) != (score > 0)][:2]
 
@@ -1059,6 +1324,8 @@ def compute_bias():
             "velocity": round(velocity, 2),
             "corr_adj": round(cadj, 3),
             "fear_greed": fg_contrib_label,
+            "cot": {"pct_long": cot_snap.get("pct_long"), "signal": cot_snap.get("signal"), "net_long": cot_snap.get("net_long")} if cot_snap else None,
+            "options": {"pcr": opt_data.get("equity_pcr") or opt_data.get("total_pcr"), "vix": opt_data.get("vix") or opt_data.get("vix_fred"), "pcr_signal": opt_data.get("pcr_signal"), "vix_signal": opt_data.get("vix_signal")} if opt_data else None,
         }
 
     # ── Save history snapshot for sparklines ──
@@ -1837,12 +2104,51 @@ async function openView(sym) {{
         const fv = fgSrc.value;
         const fc = fv >= 60 ? '#00d4aa' : (fv <= 40 ? '#ff5f56' : '#ffbd2e');
         const lbl = ['ETH','BTC'].includes(sym) ? 'Crypto F&G' : 'Mkt F&G';
-        fgHtml = `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border-radius:6px;margin-bottom:14px;font-size:11px">
+        fgHtml = `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border-radius:6px;margin-bottom:6px;font-size:11px">
             <span style="color:var(--text-muted);min-width:60px">${{lbl}}</span>
             <span style="color:${{fc}};font-weight:700;min-width:26px">${{fv}}</span>
             <span style="color:${{fc}};flex:1">${{fgSrc.label}}</span>
             <div style="width:60px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;flex-shrink:0">
                 <div style="width:${{fv}}%;height:100%;background:${{fc}};border-radius:2px"></div>
+            </div>
+        </div>`;
+    }}
+
+    // COT panel
+    const cotD = a.cot;
+    let cotHtml = '';
+    if (cotD && cotD.pct_long != null) {{
+        const cp = cotD.pct_long;
+        const cc = cp >= 60 ? '#00d4aa' : (cp <= 40 ? '#ff5f56' : '#ffbd2e');
+        const netFmt = cotD.net_long > 0 ? '+' + cotD.net_long.toLocaleString() : cotD.net_long.toLocaleString();
+        cotHtml = `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border-radius:6px;margin-bottom:6px;font-size:11px">
+            <span style="color:var(--text-muted);min-width:60px">COT</span>
+            <span style="color:${{cc}};font-weight:700;min-width:40px">${{cp}}% L</span>
+            <span style="color:var(--text-muted);flex:1;font-size:9px">${{cotD.signal}}</span>
+            <span style="color:${{cc}};font-size:9px;font-weight:700">${{netFmt}}</span>
+        </div>`;
+    }}
+
+    // Options panel (PCR + VIX)
+    const optD = a.options;
+    let optHtml = '';
+    if (optD && (optD.pcr || optD.vix)) {{
+        const pcrVal = optD.pcr ? optD.pcr.toFixed(2) : '—';
+        const vixVal = optD.vix ? optD.vix.toFixed(1) : '—';
+        const pcr = optD.pcr || 0;
+        const vix = optD.vix || 0;
+        const pcrC = pcr >= 1.0 ? '#00d4aa' : (pcr <= 0.65 ? '#ff5f56' : '#ffbd2e');
+        const vixC = vix >= 25 ? '#ff5f56' : (vix <= 14 ? '#ffbd2e' : '#00d4aa');
+        optHtml = `<div style="display:flex;gap:6px;margin-bottom:6px">
+            <div style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--bg);border-radius:6px;font-size:11px">
+                <span style="color:var(--text-muted);min-width:32px">P/C</span>
+                <span style="color:${{pcrC}};font-weight:700">${{pcrVal}}</span>
+                <span style="color:var(--text-muted);font-size:9px;flex:1">${{pcr >= 1.0 ? 'puts heavy' : pcr <= 0.65 ? 'calls heavy' : 'neutral'}}</span>
+            </div>
+            <div style="flex:1;display:flex;align-items:center;gap:6px;padding:8px 10px;background:var(--bg);border-radius:6px;font-size:11px">
+                <span style="color:var(--text-muted);min-width:32px">VIX</span>
+                <span style="color:${{vixC}};font-weight:700">${{vixVal}}</span>
+                <span style="color:var(--text-muted);font-size:9px;flex:1">${{vix >= 25 ? 'fear' : vix <= 14 ? 'complacent' : 'normal'}}</span>
             </div>
         </div>`;
     }}
@@ -1860,7 +2166,7 @@ async function openView(sym) {{
             <div class="stat-box"><div class="stat-val">${{evCount}}</div><div class="stat-lbl">SIGNALS</div></div>
             <div class="stat-box"><div class="stat-val">${{velocity >= 0 ? '+' : ''}}${{velocity.toFixed(1)}}</div><div class="stat-lbl">VEL/H</div></div>
         </div>
-        ${{fgHtml}}
+        ${{fgHtml}}${{cotHtml}}${{optHtml}}
         <div class="view-section">
             <div class="view-label">SCORE HISTORY (24H)</div>
             <canvas id="spark_${{sym}}" height="52" style="width:100%;display:block;border-radius:4px;background:var(--bg)"></canvas>

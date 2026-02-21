@@ -992,21 +992,23 @@ def dashboard():
         why_bias  = a.get("why_bias", [])
 
         bias_icon  = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "●")
-        bias_color = "#00d4aa" if bias == "BULLISH" else ("#ff5f56" if bias == "BEARISH" else "#888")
+        bias_color = "#00d4aa" if bias == "BULLISH" else ("#ff5f56" if bias == "BEARISH" else "#666")
         trade_text = "TRADE" if ok else "WAIT"
         trade_color = "#00d4aa" if ok else "#ffbd2e"
+        trade_bg    = "#00d4aa18" if ok else "#ffbd2e18"
         reason = blockers[0] if blockers else (why_bias[0] if why_bias else "Analyzing...")
         icon   = ASSET_ICONS.get(sym, "●")
+        border_accent = bias_color if bias != "NEUTRAL" else "#30363d"
 
         return f'''
-        <div class="asset-row" onclick="openView('{sym}')">
-            <div class="asset-main">
-                <span class="asset-icon">{icon}</span>
-                <span class="asset-sym">{sym}</span>
-                <span class="asset-bias" style="color:{bias_color}">{bias} {bias_icon}</span>
+        <div class="asset-card" onclick="openView('{sym}')" style="border-top:2px solid {border_accent}">
+            <div class="card-top">
+                <span class="card-icon">{icon}</span>
+                <span class="card-sym">{sym}</span>
+                <span class="card-bias" style="color:{bias_color}">{bias} {bias_icon}</span>
             </div>
-            <div class="asset-reason">{reason[:50]}</div>
-            <div class="asset-trade" style="background:{trade_color}20;color:{trade_color}">{trade_text}</div>
+            <div class="card-reason">{reason[:55]}</div>
+            <div class="card-trade" style="background:{trade_bg};color:{trade_color};border:1px solid {trade_color}40">{trade_text}</div>
         </div>'''
 
     if next_ev:
@@ -1034,6 +1036,7 @@ def dashboard():
 :root {{
     --bg: #0d1117;
     --surface: #161b22;
+    --surface2: #1c2128;
     --border: #30363d;
     --text: #c9d1d9;
     --text-muted: #8b949e;
@@ -1042,7 +1045,8 @@ def dashboard():
     --red: #ff5f56;
     --yellow: #ffbd2e;
 }}
-* {{ margin:0; padding:0; box-sizing:border-box; }}
+* {{ margin:0; padding:0; box-sizing:border-box; -webkit-tap-highlight-color: transparent; }}
+html {{ height: 100%; }}
 body {{
     background: var(--bg);
     color: var(--text);
@@ -1050,200 +1054,339 @@ body {{
     font-size: 13px;
     line-height: 1.4;
     min-height: 100vh;
+    /* Prevent iOS bounce */
+    overscroll-behavior: none;
 }}
 
-.container {{ max-width: 900px; margin: 0 auto; }}
-
+/* ── HEADER ── */
 .header {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 8px 16px;
+    padding: 0 12px;
+    height: 44px;
     display: flex;
     justify-content: space-between;
     align-items: center;
+    position: sticky;
+    top: 0;
+    z-index: 50;
 }}
-.logo {{ color: var(--orange); font-weight: 700; font-size: 12px; letter-spacing: 1px; }}
-.logo span {{ color: var(--text-muted); }}
-.header-right {{ display: flex; align-items: center; gap: 12px; }}
-.status {{ display: flex; align-items: center; gap: 5px; font-size: 10px; }}
+.logo {{ color: var(--orange); font-weight: 700; font-size: 11px; letter-spacing: 1px; line-height: 1; }}
+.logo small {{ display: block; color: var(--text-muted); font-size: 8px; font-weight: 400; letter-spacing: 0.5px; margin-top: 2px; }}
+.header-right {{ display: flex; align-items: center; gap: 6px; }}
+.status {{ display: flex; align-items: center; gap: 4px; font-size: 9px; color: var(--text-muted); }}
 .live-dot {{
-    width: 6px; height: 6px;
+    width: 5px; height: 5px;
     background: var(--green);
     border-radius: 50%;
     animation: pulse 2s infinite;
+    flex-shrink: 0;
 }}
-@keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
-.time {{ color: var(--text-muted); font-size: 10px; }}
-.feeds-badge, .refresh-badge {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    padding: 3px 8px;
-    border-radius: 3px;
-    font-size: 10px;
-    cursor: pointer;
-    color: var(--text-muted);
-}}
-.feeds-badge:hover {{ border-color: var(--orange); color: var(--orange); }}
-.refresh-badge:hover {{ border-color: var(--green); color: var(--green); }}
+@keyframes pulse {{ 0%,100% {{ opacity:1; }} 50% {{ opacity:0.4; }} }}
 
+.hdr-btn {{
+    background: var(--bg);
+    border: 1px solid var(--border);
+    color: var(--text-muted);
+    padding: 5px 9px;
+    border-radius: 6px;
+    font-size: 9px;
+    font-weight: 700;
+    cursor: pointer;
+    font-family: inherit;
+    letter-spacing: 0.3px;
+    /* larger tap target on mobile */
+    min-height: 30px;
+    display: flex; align-items: center;
+}}
+.hdr-btn:active {{ background: var(--surface2); color: var(--orange); border-color: var(--orange); }}
+
+/* ── TV WIDGET ── */
 .tv-wrap {{ border-bottom: 1px solid var(--border); background: #000; }}
 
-/* ── NEWS TICKER: slower (300s) and polished ── */
+/* ── NEWS TICKER ── */
 .news-ticker {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
-    padding: 6px 0;
+    padding: 5px 0;
     overflow: hidden;
-    font-size: 11px;
-    position: relative;
-}}
-.ticker-label {{ color: var(--orange); font-size: 9px; font-weight: 700; padding: 0 12px; display: inline-block; min-width: 60px; vertical-align: middle; }}
-.ticker-outer {{ display: inline-block; overflow: hidden; width: calc(100% - 80px); vertical-align: middle; }}
-.ticker-scroll {{ display: inline-block; white-space: nowrap; animation: ticker 300s linear infinite; }}
-.ticker-scroll:hover {{ animation-play-state: paused; cursor: pointer; }}
-@keyframes ticker {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }}
-.ticker-item {{ display: inline; margin-right: 40px; color: var(--text-muted); }}
-.ticker-item b {{ color: var(--orange); margin-right: 6px; }}
-
-.next-event {{
-    background: var(--surface);
-    border-bottom: 1px solid var(--border);
-    padding: 8px 16px;
+    font-size: 10px;
     display: flex;
     align-items: center;
-    gap: 10px;
-    font-size: 11px;
-    max-width: 900px;
-    margin: 0 auto;
 }}
-.ev-label {{ color: var(--text-muted); font-size: 9px; font-weight: 700; min-width: 70px; }}
-.ev-ccy {{ background: #1f6feb33; color: #58a6ff; padding: 2px 5px; border-radius: 2px; font-size: 10px; font-weight: 700; margin-right: 6px; }}
-.ev-impact {{ font-size: 9px; font-weight: 700; margin-left: 6px; }}
-.ev-time {{ color: var(--text-muted); margin-left: 6px; }}
-.ev-none {{ color: var(--text-muted); font-style: italic; }}
+.ticker-label {{
+    color: var(--orange); font-size: 8px; font-weight: 700;
+    padding: 0 10px; flex-shrink: 0;
+    letter-spacing: 0.5px;
+}}
+.ticker-outer {{ overflow: hidden; flex: 1; }}
+.ticker-scroll {{ display: inline-block; white-space: nowrap; animation: ticker 300s linear infinite; }}
+.ticker-scroll:active {{ animation-play-state: paused; }}
+@keyframes ticker {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }}
+.ticker-item {{ display: inline; margin-right: 36px; color: var(--text-muted); }}
+.ticker-item b {{ color: var(--orange); margin-right: 5px; }}
 
-.assets {{ padding: 12px 16px; max-width: 900px; margin: 0 auto; }}
-.section-header {{ color: var(--orange); font-size: 9px; font-weight: 700; letter-spacing: 1px; margin-bottom: 8px; }}
-.asset-row {{
+/* ── NEXT EVENT BAR ── */
+.next-event {{
+    background: var(--surface2);
+    border-bottom: 1px solid var(--border);
+    padding: 7px 12px;
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 10px;
+    min-height: 34px;
+}}
+.ev-label {{
+    color: var(--orange); font-size: 8px; font-weight: 700;
+    letter-spacing: 0.5px; flex-shrink: 0;
+}}
+.ev-body {{ flex: 1; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; color: var(--text); }}
+.ev-ccy {{
+    background: #1f6feb33; color: #58a6ff;
+    padding: 1px 5px; border-radius: 3px;
+    font-size: 9px; font-weight: 700; margin-right: 5px;
+}}
+.ev-impact {{ font-size: 8px; font-weight: 700; margin-left: 4px; }}
+.ev-time {{ color: var(--text-muted); margin-left: 4px; font-size: 9px; }}
+.ev-none {{ color: var(--text-muted); font-style: italic; font-size: 10px; }}
+
+/* ── ASSET GRID (2 columns on mobile) ── */
+.assets {{ padding: 10px 10px 0; }}
+.section-header {{
+    color: var(--text-muted); font-size: 8px; font-weight: 700;
+    letter-spacing: 1px; margin-bottom: 8px; padding: 0 2px;
+}}
+.asset-grid {{
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 8px;
+}}
+
+/* ── ASSET CARD ── */
+.asset-card {{
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 4px;
-    padding: 10px 14px;
-    margin-bottom: 4px;
+    border-radius: 10px;
+    padding: 12px 10px 10px;
     cursor: pointer;
-    transition: border-color 0.15s, background 0.15s;
+    transition: border-color 0.15s, transform 0.1s;
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    -webkit-user-select: none;
+    user-select: none;
+    /* border-top set inline for bias color accent */
+}}
+.asset-card:active {{ transform: scale(0.97); background: var(--surface2); }}
+
+.card-top {{
     display: flex;
     align-items: center;
-    justify-content: space-between;
-    gap: 12px;
+    gap: 6px;
 }}
-.asset-row:hover {{ border-color: var(--orange); background: #1a1f27; }}
-.asset-main {{ display: flex; align-items: center; gap: 12px; min-width: 190px; }}
-.asset-icon {{ font-size: 16px; opacity: 0.7; min-width: 20px; text-align: center; }}
-.asset-sym {{ font-size: 14px; font-weight: 700; color: var(--text); min-width: 50px; }}
-.asset-bias {{ font-size: 11px; font-weight: 700; min-width: 90px; }}
-.asset-reason {{ flex: 1; color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
-.asset-trade {{ padding: 4px 12px; border-radius: 3px; font-size: 10px; font-weight: 700; text-align: center; min-width: 60px; }}
+.card-icon {{
+    font-size: 15px; opacity: 0.65; flex-shrink: 0;
+    width: 20px; text-align: center;
+}}
+.card-sym {{
+    font-size: 13px; font-weight: 700; color: var(--text); flex: 1;
+    letter-spacing: 0.3px;
+}}
+.card-bias {{
+    font-size: 9px; font-weight: 700; text-align: right;
+    white-space: nowrap; letter-spacing: 0.3px;
+}}
+.card-reason {{
+    font-size: 9px; color: var(--text-muted);
+    line-height: 1.4;
+    min-height: 26px;
+    /* allow 2 lines on mobile */
+    display: -webkit-box;
+    -webkit-line-clamp: 2;
+    -webkit-box-orient: vertical;
+    overflow: hidden;
+}}
+.card-trade {{
+    align-self: flex-start;
+    padding: 4px 10px;
+    border-radius: 5px;
+    font-size: 9px; font-weight: 700;
+    letter-spacing: 0.5px;
+    text-align: center;
+    min-width: 52px;
+}}
 
+/* ── COUNTDOWN BAR ── */
 .next-refresh {{
+    margin: 8px 10px 0;
     background: var(--surface);
-    border-top: 1px solid var(--border);
-    padding: 6px 16px;
-    font-size: 10px;
+    border: 1px solid var(--border);
+    border-radius: 6px;
+    padding: 6px 12px;
+    font-size: 9px;
     color: var(--text-muted);
     text-align: center;
 }}
-.next-refresh span {{ color: var(--green); }}
+.next-refresh span {{ color: var(--green); font-weight: 700; }}
 
+/* ── FOOTER ── */
+.spacer {{ height: 64px; }}
 .footer {{
     background: var(--surface);
     border-top: 1px solid var(--border);
-    padding: 8px 16px;
+    padding: 8px 12px;
+    padding-bottom: calc(8px + env(safe-area-inset-bottom));
     display: flex;
     justify-content: space-between;
     align-items: center;
     position: fixed;
     bottom: 0; left: 0; right: 0;
+    z-index: 50;
 }}
 .footer-btns {{ display: flex; gap: 6px; }}
 .btn {{
     background: var(--bg);
     border: 1px solid var(--border);
     color: var(--text);
-    padding: 5px 10px;
-    border-radius: 3px;
+    padding: 8px 14px;
+    border-radius: 8px;
     font-size: 10px;
-    font-weight: 600;
+    font-weight: 700;
     cursor: pointer;
     font-family: inherit;
+    min-height: 36px;
+    display: flex; align-items: center; gap: 4px;
 }}
-.btn:hover {{ border-color: var(--orange); color: var(--orange); }}
-.footer-info {{ color: var(--text-muted); font-size: 9px; }}
-.footer-info span {{ margin-left: 12px; }}
+.btn:active {{ border-color: var(--orange); color: var(--orange); }}
+.footer-info {{ color: var(--text-muted); font-size: 8px; text-align: right; line-height: 1.6; }}
 
+/* ── MODAL ── */
 .modal {{
     display: none;
     position: fixed;
     inset: 0;
-    background: rgba(0,0,0,0.85);
+    background: rgba(0,0,0,0.88);
     z-index: 100;
-    padding: 20px;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
 }}
-.modal.open {{ display: flex; justify-content: center; align-items: flex-start; padding-top: 10vh; }}
+.modal.open {{ display: flex; justify-content: center; align-items: flex-end; }}
+@media (min-height: 700px) {{
+    .modal.open {{ align-items: center; padding: 20px; }}
+}}
 .modal-box {{
     background: var(--surface);
     border: 1px solid var(--border);
-    border-radius: 8px;
+    border-radius: 16px 16px 0 0;
     width: 100%;
-    max-width: 500px;
-    max-height: 80vh;
+    max-width: 540px;
+    max-height: 88vh;
     overflow-y: auto;
+    -webkit-overflow-scrolling: touch;
+    padding-bottom: env(safe-area-inset-bottom);
+}}
+@media (min-height: 700px) {{
+    .modal-box {{ border-radius: 16px; max-height: 82vh; }}
+}}
+/* drag handle */
+.modal-handle {{
+    width: 36px; height: 4px;
+    background: var(--border);
+    border-radius: 2px;
+    margin: 10px auto 0;
 }}
 .modal-header {{
     display: flex; justify-content: space-between; align-items: center;
-    padding: 16px;
+    padding: 12px 16px 12px;
     border-bottom: 1px solid var(--border);
     position: sticky; top: 0;
     background: var(--surface);
+    z-index: 1;
 }}
-.modal-title {{ font-size: 14px; font-weight: 700; color: var(--orange); }}
-.modal-close {{ background: none; border: none; color: var(--text-muted); font-size: 20px; cursor: pointer; padding: 0; }}
-.modal-close:hover {{ color: var(--text); }}
+.modal-title {{ font-size: 15px; font-weight: 700; color: var(--orange); }}
+.modal-close {{
+    background: var(--bg); border: 1px solid var(--border);
+    color: var(--text-muted); font-size: 14px; cursor: pointer;
+    padding: 4px 10px; border-radius: 6px;
+    min-width: 32px; min-height: 32px;
+    display: flex; align-items: center; justify-content: center;
+}}
+.modal-close:active {{ color: var(--text); }}
 .modal-body {{ padding: 16px; }}
-.view-section {{ margin-bottom: 20px; }}
-.view-label {{ font-size: 10px; font-weight: 700; color: var(--text-muted); letter-spacing: 0.5px; margin-bottom: 10px; }}
-.view-item {{ padding: 10px 12px; background: var(--bg); border-radius: 4px; margin-bottom: 6px; font-size: 12px; border-left: 3px solid var(--border); }}
+.view-section {{ margin-bottom: 18px; }}
+.view-label {{
+    font-size: 9px; font-weight: 700; color: var(--text-muted);
+    letter-spacing: 0.8px; margin-bottom: 8px; text-transform: uppercase;
+}}
+.view-item {{
+    padding: 10px 12px; background: var(--bg);
+    border-radius: 6px; margin-bottom: 6px;
+    font-size: 12px; border-left: 3px solid var(--border);
+    line-height: 1.4;
+}}
 .view-item.why {{ border-left-color: var(--green); color: var(--green); }}
 .view-item.block {{ border-left-color: var(--red); color: var(--red); }}
 .view-item.unlock {{ border-left-color: var(--yellow); color: var(--yellow); }}
-.view-item.opposite {{ border-left-color: var(--text-muted); color: var(--text-muted); }}
+.view-item.opposite {{ border-left-color: #555; color: var(--text-muted); }}
 
-.feed-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(150px, 1fr)); gap: 6px; }}
-.feed-item {{ background: var(--bg); padding: 8px; border-radius: 4px; font-size: 10px; display: flex; justify-content: space-between; }}
-.feed-ok {{ color: var(--green); }}
-.feed-bad {{ color: var(--red); }}
+/* stats row in modal */
+.stats-row {{
+    display: grid; grid-template-columns: repeat(4, 1fr); gap: 6px;
+    margin-bottom: 16px;
+}}
+.stat-box {{
+    background: var(--bg); border: 1px solid var(--border);
+    border-radius: 6px; padding: 8px 4px;
+    text-align: center;
+}}
+.stat-val {{ font-size: 14px; font-weight: 700; color: var(--text); }}
+.stat-lbl {{ font-size: 8px; color: var(--text-muted); margin-top: 2px; letter-spacing: 0.3px; }}
 
-.spacer {{ height: 50px; }}
+.feed-grid {{ display: grid; grid-template-columns: repeat(auto-fill, minmax(140px, 1fr)); gap: 5px; }}
+.feed-item {{
+    background: var(--bg); padding: 7px 8px; border-radius: 5px;
+    font-size: 9px; display: flex; justify-content: space-between; align-items: center;
+    gap: 4px;
+}}
+.feed-name {{ overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }}
+.feed-ok {{ color: var(--green); flex-shrink: 0; }}
+.feed-bad {{ color: var(--red); flex-shrink: 0; }}
 
-@media (max-width: 600px) {{
-    .asset-row {{ flex-direction: column; align-items: flex-start; gap: 8px; }}
-    .asset-main {{ width: 100%; justify-content: space-between; }}
-    .asset-reason {{ width: 100%; white-space: normal; }}
-    .asset-trade {{ align-self: flex-start; }}
-    .footer {{ flex-direction: column; gap: 8px; }}
+/* ── DESKTOP overrides ── */
+@media (min-width: 640px) {{
+    .header {{ padding: 0 16px; height: 48px; }}
+    .logo {{ font-size: 12px; }}
+    .logo small {{ display: none; }}
+    .assets {{ padding: 12px 16px 0; }}
+    .asset-grid {{ grid-template-columns: repeat(3, 1fr); gap: 10px; }}
+    .asset-card {{ padding: 14px 12px 12px; gap: 10px; }}
+    .card-sym {{ font-size: 14px; }}
+    .card-reason {{ font-size: 10px; -webkit-line-clamp: 1; }}
+    .section-header {{ font-size: 9px; }}
+    .next-refresh {{ margin: 10px 16px 0; }}
+    .spacer {{ height: 54px; }}
+    .footer {{ padding: 8px 16px; }}
+    .footer-info {{ font-size: 9px; }}
+}}
+
+@media (min-width: 900px) {{
+    .asset-grid {{ grid-template-columns: repeat(3, 1fr); max-width: 900px; margin: 0 auto; }}
+    .assets {{ max-width: 900px; margin: 0 auto; }}
+    .next-refresh {{ max-width: 900px; margin: 10px auto 0; }}
 }}
 </style>
 </head>
 <body>
 
 <div class="header">
-    <div class="logo">NEWS BIAS <span>// TERMINAL</span></div>
+    <div class="logo">NEWS BIAS <span style="color:var(--text-muted)">// TERMINAL</span>
+        <small id="clock">{updated[:10]} {updated[11:16]} UTC</small>
+    </div>
     <div class="header-right">
         <div class="status"><div class="live-dot"></div><span>LIVE</span></div>
-        <div class="time" id="clock">{updated} UTC</div>
-        <div class="refresh-badge" onclick="manualRefresh()" id="refreshBtn">↻ REFRESH</div>
-        <div class="feeds-badge" onclick="openFeeds()">FEEDS {feeds_ok}/{feeds_total}</div>
+        <button class="hdr-btn" onclick="manualRefresh()" id="refreshBtn">↻</button>
+        <button class="hdr-btn" onclick="openFeeds()">{feeds_ok}/{feeds_total}</button>
     </div>
 </div>
 
@@ -1268,8 +1411,10 @@ body {{
 </div>
 
 <div class="assets">
-    <div class="section-header">&lt;&lt; TRADE SIGNALS — {', '.join(ASSETS)} &gt;&gt;</div>
+    <div class="section-header">TRADE SIGNALS</div>
+    <div class="asset-grid">
     {''.join(asset_row(sym, a) for sym, a in asset_data)}
+    </div>
 </div>
 
 <div class="next-refresh">
@@ -1291,6 +1436,7 @@ body {{
 
 <div class="modal" id="modal" onclick="if(event.target===this)closeModal()">
     <div class="modal-box">
+        <div class="modal-handle"></div>
         <div class="modal-header">
             <div class="modal-title" id="modalTitle">View</div>
             <button class="modal-close" onclick="closeModal()">✕</button>
@@ -1393,16 +1539,16 @@ function openView(sym) {{
     const icon = ASSET_ICONS[sym] || '●';
 
     let html = `
-        <div style="text-align:center;padding:16px 0 20px;border-bottom:1px solid var(--border);margin-bottom:16px;">
-            <div style="font-size:28px;opacity:0.5;margin-bottom:4px">${{icon}}</div>
-            <div style="font-size:22px;font-weight:700;color:${{biasColor}};margin-bottom:10px;">${{bias}}</div>
-            <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 24px;border-radius:4px;font-weight:700;">${{ok ? '✓ TRADE' : '⏳ WAIT'}}</div>
+        <div style="text-align:center;padding:16px 0 20px;border-bottom:1px solid var(--border);margin-bottom:14px;">
+            <div style="font-size:26px;opacity:0.45;margin-bottom:4px">${{icon}}</div>
+            <div style="font-size:20px;font-weight:700;color:${{biasColor}};margin-bottom:10px;">${{bias}}</div>
+            <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 28px;border-radius:8px;font-weight:700;font-size:14px;border:1px solid ${{tradeColor}}40">${{ok ? '✓ TRADE' : '⏳ WAIT'}}</div>
         </div>
-        <div style="display:flex;gap:12px;margin-bottom:16px;font-size:10px;color:var(--text-muted);">
-            <span>Quality: <b style="color:var(--text)">${{quality}}</b></span>
-            <span>Conflict: <b style="color:var(--text)">${{Math.round(conflict*100)}}%</b></span>
-            <span>Evidence: <b style="color:var(--text)">${{evCount}}</b></span>
-            <span>Sources: <b style="color:var(--text)">${{srcDiv}}</b></span>
+        <div class="stats-row">
+            <div class="stat-box"><div class="stat-val">${{quality}}</div><div class="stat-lbl">QUALITY</div></div>
+            <div class="stat-box"><div class="stat-val">${{Math.round(conflict*100)}}%</div><div class="stat-lbl">CONFLICT</div></div>
+            <div class="stat-box"><div class="stat-val">${{evCount}}</div><div class="stat-lbl">SIGNALS</div></div>
+            <div class="stat-box"><div class="stat-val">${{srcDiv}}</div><div class="stat-lbl">SOURCES</div></div>
         </div>
     `;
     if (whyBias.length) {{
@@ -1432,13 +1578,13 @@ function openFeeds() {{
     const f = P.meta?.feeds_status || {{}};
     const items = Object.entries(f).sort((a,b) => a[0].localeCompare(b[0]));
     const ok = items.filter(([,v]) => v.ok).length;
-    let html = `<div style="margin-bottom:16px;color:var(--text-muted);">Active: ${{ok}}/${{items.length}} feeds</div>`;
+    let html = `<div style="margin-bottom:12px;color:var(--text-muted);font-size:11px;">Active: ${{ok}}/${{items.length}} feeds</div>`;
     html += `<div class="feed-grid">`;
     items.forEach(([name, info]) => {{
-        html += `<div class="feed-item"><span>${{esc(name)}}</span><span class="${{info.ok ? 'feed-ok' : 'feed-bad'}}">${{info.ok ? '●' : '○'}}</span></div>`;
+        html += `<div class="feed-item"><span class="feed-name">${{esc(name)}}</span><span class="${{info.ok ? 'feed-ok' : 'feed-bad'}}">${{info.ok ? '●' : '○'}}</span></div>`;
     }});
     html += `</div>`;
-    openModal('FEEDS STATUS', html);
+    openModal('📡 FEEDS', html);
 }}
 
 function openCalendar() {{

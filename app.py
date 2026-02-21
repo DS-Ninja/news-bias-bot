@@ -1,5 +1,6 @@
-# app.py - NEWS BIAS TERMINAL v3 - Bloomberg Clean Style
-# Simple output: BIAS + TRADE/WAIT + human-readable reasons
+# app.py - NEWS BIAS TERMINAL v4 - Bloomberg Clean Style
+# Assets: XAU, US500, WTI, ETH, BTC, EUR
+# Improvements: BTC/EUR rules, more RSS feeds, improved scoring, slower ticker
 
 import os, json, time, re, hashlib, math, hmac, calendar as pycalendar, threading
 from datetime import datetime, timezone
@@ -27,7 +28,8 @@ except ImportError:
 from fastapi import FastAPI, Header
 from fastapi.responses import HTMLResponse, RedirectResponse, JSONResponse
 
-ASSETS = ["XAU", "US500", "WTI", "ETH"]
+# ── NEW: BTC and EUR added ──
+ASSETS = ["XAU", "US500", "WTI", "ETH", "BTC", "EUR"]
 GATE_PROFILE = os.environ.get("GATE_PROFILE", "STRICT").strip().upper()
 if GATE_PROFILE not in ("STRICT", "MODERATE"): GATE_PROFILE = "STRICT"
 
@@ -40,7 +42,9 @@ GATE_THRESHOLDS = {
 
 HALF_LIFE_SEC = 8 * 3600
 LAMBDA = 0.69314718056 / HALF_LIFE_SEC
-BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9, "ETH": 1.0}
+
+# ── IMPROVED: separate thresholds, BTC/EUR added ──
+BIAS_THRESH = {"US500": 1.2, "XAU": 0.9, "WTI": 0.9, "ETH": 1.0, "BTC": 1.0, "EUR": 0.7}
 
 TRUMP_ENABLED = os.environ.get("TRUMP_ENABLED", "1").strip() == "1"
 TRUMP_PAT = re.compile(r"\b(trump|donald trump|white house)\b", re.I)
@@ -56,10 +60,9 @@ RUN_MAX_SEC = float(os.environ.get("RUN_MAX_SEC", "10"))
 RUN_LOCK_TIMEOUT_SEC = 25
 RSS_LIMIT, CAL_LIMIT = 18, 120
 FEEDS_HEALTH_TTL_SEC, CAL_INGEST_TTL_SEC = 90, 300
-RSS_PARSE_WORKERS = 8
+RSS_PARSE_WORKERS = 10          # ++ increased workers for more feeds
 FRED_ON_RUN = os.environ.get("FRED_ON_RUN", "1").strip() == "1"
 
-# Auto-refresh interval in minutes (change this to adjust frequency)
 AUTO_REFRESH_MINUTES = int(os.environ.get("AUTO_REFRESH_MINUTES", "15"))
 
 _PIPELINE_LOCK = threading.Lock()
@@ -74,9 +77,17 @@ def get_run_tokens():
     return list(dict.fromkeys(toks))
 
 MYFXBOOK_IFRAME = "https://widget.myfxbook.com/widget/calendar.html?lang=en&impacts=0,1,2,3&symbols=USD"
-TV_SYMBOLS = [{"proName": "ICMARKETS:XAUUSD", "title": "XAU"}, {"proName": "ICMARKETS:EURUSD", "title": "EUR"},
-              {"proName": "ICMARKETS:US500", "title": "US500"}, {"proName": "ICMARKETS:XTIUSD", "title": "WTI"},
-              {"proName": "COINBASE:ETHUSD", "title": "ETH"}, {"proName": "ICMARKETS:USDJPY", "title": "JPY"}]
+
+# ── NEW: BTC and EUR added to ticker tape, slower display ──
+TV_SYMBOLS = [
+    {"proName": "ICMARKETS:XAUUSD",  "title": "XAU"},
+    {"proName": "ICMARKETS:US500",   "title": "US500"},
+    {"proName": "ICMARKETS:XTIUSD",  "title": "WTI"},
+    {"proName": "COINBASE:ETHUSD",   "title": "ETH"},
+    {"proName": "COINBASE:BTCUSD",   "title": "BTC"},
+    {"proName": "ICMARKETS:EURUSD",  "title": "EUR"},
+    {"proName": "ICMARKETS:USDJPY",  "title": "JPY"},
+]
 
 RSS_FEEDS = {
     # === EXISTING FEEDS ===
@@ -160,7 +171,6 @@ RSS_FEEDS = {
     "TRADINGECONOMICS": "https://tradingeconomics.com/rss/news.aspx",
     "ECONODAY": "https://www.econoday.com/rss/",
     "BRIEFING": "https://www.briefing.com/rss",
-    "CALCWATCH": "https://www.calcalistech.com/ctech/home.rss",
     "TREASURY_PRESS": "https://home.treasury.gov/news/press-releases/rss.xml",
     "IMF_NEWS": "https://www.imf.org/en/News/rss",
     "WORLDBANK": "https://www.worldbank.org/en/news/rss.xml",
@@ -177,7 +187,7 @@ RSS_FEEDS = {
     "FORTUNE": "https://fortune.com/feed/",
     "FORBES_MARKETS": "https://www.forbes.com/markets/feed/",
 
-    # === GEOPOLITICS (affects safe-haven) ===
+    # === GEOPOLITICS ===
     "REUTERS_WORLD": "https://www.reutersagency.com/feed/?best-topics=world&post_type=best",
     "AP_WORLD": "https://rsshub.app/apnews/topics/world-news",
     "BBC_WORLD": "https://feeds.bbci.co.uk/news/world/rss.xml",
@@ -192,13 +202,22 @@ RSS_FEEDS = {
     "FASTMARKETS": "https://www.fastmarkets.com/rss",
     "MINING_WEEKLY": "https://www.miningweekly.com/rss",
 
-    # === CRYPTO (can correlate with gold) ===
+    # === CRYPTO (ETH + BTC) ===
     "COINDESK": "https://www.coindesk.com/arc/outboundfeeds/rss/",
     "COINTELEGRAPH": "https://cointelegraph.com/rss",
     "DECRYPT": "https://decrypt.co/feed",
     "THEBLOCK": "https://www.theblock.co/rss.xml",
     "CRYPTOSLATE": "https://cryptoslate.com/feed/",
     "BEINCRYPTO": "https://beincrypto.com/feed/",
+    # ── NEW BTC-specific feeds ──
+    "BITCOIN_MAGAZINE": "https://bitcoinmagazine.com/.rss/full/",
+    "BITCOIN_COM_NEWS": "https://news.bitcoin.com/feed/",
+    "WATCHER_GURU": "https://watcher.guru/news/feed",
+    "CRYPTOBRIEFING": "https://cryptobriefing.com/feed/",
+    "AMBCRYPTO": "https://ambcrypto.com/feed/",
+    "NEWSBTC": "https://www.newsbtc.com/feed/",
+    "BITCOINIST": "https://bitcoinist.com/feed/",
+    "UTODAY_CRYPTO": "https://u.today/rss",
 
     # === ADDITIONAL INVESTING.COM ===
     "INV_STOCK_NEWS": "https://www.investing.com/rss/stock_stock_news.rss",
@@ -206,16 +225,29 @@ RSS_FEEDS = {
     "INV_CENTRAL_BANKS": "https://www.investing.com/rss/news_287.rss",
     "INV_ECONOMY": "https://www.investing.com/rss/news_14.rss",
     "INV_STOCK_MARKETS": "https://www.investing.com/rss/news_25.rss",
+
+    # ── NEW EUR/Forex-specific feeds ──
+    "EUR_USD_FXSTREET": "https://www.fxstreet.com/rss/rates-charts/eurusd",
+    "EURACTIV_ECON": "https://www.euractiv.com/section/economy-jobs/feed/",
+    "ECB_BLOG": "https://www.ecb.europa.eu/pub/blog/rss.html",
+    "ECB_RESEARCH": "https://www.ecb.europa.eu/pub/research/rss.html",
+    "EUROSTAT_NEWS": "https://ec.europa.eu/eurostat/en/news/rss",
+    "BLOOMBERG_EUR": "https://feeds.bloomberg.com/economics/news.rss",
+    "INV_EUR": "https://www.investing.com/rss/news_285.rss",
+    "FOREXLIVE_EUR": "https://www.forexlive.com/feed/eurusd",
 }
 
 CALENDAR_FEEDS = {"FOREXFACTORY_CALENDAR", "MYFX_CAL"}
+
 SOURCE_WEIGHT = {
     # === HIGH PRIORITY (Official / Institutional) ===
     "FED": 3.0, "FED_SPEECHES": 2.8, "FED_TESTIMONY": 2.8,
     "BLS": 3.0, "BEA": 2.8, "TREASURY_PRESS": 2.5,
-    "ECB_PRESS": 2.5, "BOE_NEWS": 2.4, "BOJ_ANNOUNCE": 2.3,
+    "ECB_PRESS": 2.5, "ECB_BLOG": 2.4, "ECB_RESEARCH": 2.2,
+    "BOE_NEWS": 2.4, "BOJ_ANNOUNCE": 2.3,
     "SNB_NEWS": 2.2, "RBA_MEDIA": 2.2, "BOC_ANNOUNCE": 2.2,
     "IMF_NEWS": 2.0, "WORLDBANK": 1.8, "BIS_PRESS": 2.0,
+    "EUROSTAT_NEWS": 2.0,
 
     # === GOLD SPECIALIZED ===
     "KITCO_NEWS": 2.0, "KITCO_GOLD": 2.2,
@@ -234,13 +266,15 @@ SOURCE_WEIGHT = {
     "CNBC_TOP": 1.6, "CNBC_STOCKS": 1.7, "CNBC_EARNINGS": 1.8,
     "MARKETWATCH_TOP": 1.5, "MARKETWATCH_REALTIME": 1.6,
     "BBC_BUSINESS": 1.4, "ECONOMIST": 1.6, "FORTUNE": 1.3, "FORBES_MARKETS": 1.3,
-    "AP_BUSINESS": 1.5, "AP_WORLD": 1.3, "BBC_WORLD": 1.3,
+    "AP_BUSINESS": 1.5, "AP_WORLD": 1.3, "BBC_WORLD": 1.3, "BLOOMBERG_EUR": 1.9,
 
     # === FOREX SPECIALIZED ===
-    "FXSTREET_NEWS": 1.5, "FXSTREET_ANALYSIS": 1.4,
-    "FOREXLIVE": 1.6, "DAILYFX_NEWS": 1.5, "DAILYFX_TOP": 1.5,
+    "FXSTREET_NEWS": 1.5, "FXSTREET_ANALYSIS": 1.4, "EUR_USD_FXSTREET": 1.8,
+    "FOREXLIVE": 1.6, "FOREXLIVE_EUR": 1.8,
+    "DAILYFX_NEWS": 1.5, "DAILYFX_TOP": 1.5,
     "FX_EMPIRE": 1.3, "ACTIONFOREX": 1.2, "EARNFOREX": 1.1,
     "FXLEADERS": 1.2, "BABYPIPS": 1.0,
+    "INV_EUR": 1.4, "EURACTIV_ECON": 1.5,
 
     # === STOCK ANALYSIS ===
     "SEEKINGALPHA": 1.5, "SEEKINGALPHA_TOP": 1.4,
@@ -264,9 +298,18 @@ SOURCE_WEIGHT = {
     # === COMMODITIES GENERAL ===
     "COMMODITY_NEWS": 1.2, "METAL_BULLETIN": 1.4, "FASTMARKETS": 1.3, "MINING_WEEKLY": 1.3,
 
-    # === CRYPTO (correlation signals) ===
+    # === CRYPTO ===
     "COINDESK": 1.8, "COINTELEGRAPH": 1.6,
     "DECRYPT": 1.5, "THEBLOCK": 1.7, "CRYPTOSLATE": 1.3, "BEINCRYPTO": 1.2,
+    # ── NEW BTC sources ──
+    "BITCOIN_MAGAZINE": 2.0,   # premier BTC publication
+    "BITCOIN_COM_NEWS": 1.5,
+    "WATCHER_GURU": 1.2,
+    "CRYPTOBRIEFING": 1.4,
+    "AMBCRYPTO": 1.2,
+    "NEWSBTC": 1.4,
+    "BITCOINIST": 1.3,
+    "UTODAY_CRYPTO": 1.2,
 
     # === CALENDAR (no bias weight) ===
     "FOREXFACTORY_CALENDAR": 0.0, "MYFX_CAL": 0.0,
@@ -276,37 +319,115 @@ SOURCE_WEIGHT = {
     "FRED": 1.5,
 }
 
+# ── IMPROVED & EXTENDED RULES ──
 RULES = {
-    "XAU": [(r"\b(fed|fomc|powell|hawkish|rate hike|rates higher)\b", -0.7, "Hawkish Fed weighs on gold"),
-            (r"\b(rate cut|dovish|easing)\b", +0.6, "Dovish Fed supports gold"),
-            (r"\b(cpi|inflation)\b", +0.2, "Inflation data supports gold"),
-            (r"\b(strong dollar|usd strengthens|yields rise|real yields)\b", -0.8, "Strong USD weighs on gold"),
-            (r"\b(geopolitical|safe[- ]haven|risk aversion)\b", +0.5, "Safe-haven demand rises"),
-            (r"\b(risk-on|stocks rally)\b", -0.2, "Risk-on mood pressures gold")],
-    "US500": [(r"\b(earnings beat|guidance raised)\b", +0.6, "Strong earnings support stocks"),
-              (r"\b(earnings miss|guidance cut)\b", -0.7, "Weak earnings pressure stocks"),
-              (r"\b(yields rise|rates higher|hawkish)\b", -0.6, "Rising yields pressure stocks"),
-              (r"\b(rate cut|dovish|easing)\b", +0.5, "Fed easing supports stocks"),
-              (r"\b(risk-off|selloff|crash)\b", -0.7, "Risk-off mood in markets"),
-              (r"\b(rally|rebound|risk-on)\b", +0.3, "Risk-on momentum building")],
-    "WTI": [(r"\b(crude|oil|wti|brent)\b", +0.1, "Oil market focus"),
-            (r"\b(opec|output cut|production cut)\b", +0.8, "OPEC cuts support prices"),
-            (r"\b(inventory build|inventories rise)\b", -0.8, "Inventory build pressures oil"),
-            (r"\b(inventory draw|inventories fall)\b", +0.8, "Inventory draw supports oil"),
-            (r"\b(disruption|outage|sanctions)\b", +0.7, "Supply disruption risk"),
-            (r"\b(demand weak|recession)\b", -0.6, "Demand concerns weigh on oil")],
-    "ETH": [(r"\b(ethereum|eth|ether)\b", +0.1, "Ethereum in focus"),
-            (r"\b(defi|dex|decentralized finance|tvl)\b", +0.5, "DeFi activity supports ETH"),
-            (r"\b(sec|regulation|crackdown|ban)\b", -0.7, "Regulatory pressure on crypto"),
-            (r"\b(etf|spot etf|institutional)\b", +0.8, "Institutional demand for ETH"),
-            (r"\b(upgrade|eip|staking|validator)\b", +0.6, "Network upgrade supports ETH"),
-            (r"\b(hack|exploit|bridge attack)\b", -0.9, "Security incident hurts sentiment"),
-            (r"\b(risk-off|selloff|crash|recession)\b", -0.6, "Risk-off mood hits crypto"),
-            (r"\b(risk-on|rally|bull)\b", +0.5, "Risk-on mood lifts crypto"),
-            (r"\b(bitcoin|btc)\b", +0.2, "BTC move correlates with ETH"),
-            (r"\b(layer.?2|l2|rollup|arbitrum|optimism|base)\b", +0.4, "L2 growth benefits ETH"),
-            (r"\b(rate cut|dovish|easing|liquidity)\b", +0.5, "Easier money lifts crypto"),
-            (r"\b(hawkish|rate hike|tightening)\b", -0.4, "Tighter policy weighs on crypto")]
+    "XAU": [
+        (r"\b(fed|fomc|powell|hawkish|rate hike|rates higher|tightening)\b", -0.7, "Hawkish Fed weighs on gold"),
+        (r"\b(rate cut|dovish|easing|pause|hold rates)\b", +0.6, "Dovish Fed supports gold"),
+        (r"\b(cpi|inflation|pce|core inflation)\b", +0.25, "Inflation data supports gold"),
+        (r"\b(strong dollar|usd strengthens|yields rise|real yields|dxy)\b", -0.8, "Strong USD weighs on gold"),
+        (r"\b(geopolitical|safe[- ]haven|risk aversion|war|conflict|crisis)\b", +0.6, "Safe-haven demand rises"),
+        (r"\b(risk-on|stocks rally|equity rally)\b", -0.2, "Risk-on mood pressures gold"),
+        (r"\b(recession|slowdown|contraction)\b", +0.4, "Recession fears support gold"),
+        (r"\b(central bank buying|gold reserve|cbr gold|pboc gold)\b", +0.8, "Central bank gold buying"),
+        (r"\b(dollar weakens|usd falls|dxy drop)\b", +0.7, "Weak dollar lifts gold"),
+        (r"\b(deflation|disinflation)\b", -0.3, "Disinflation weighs on gold"),
+        (r"\b(all[- ]time high|record high|ath)\b.*\bgold\b", +0.5, "Gold at record high — momentum bullish"),
+        (r"\b(etf inflow|gold etf|gld)\b", +0.5, "Gold ETF inflows bullish"),
+    ],
+    "US500": [
+        (r"\b(earnings beat|guidance raised|revenue beat|profit up)\b", +0.6, "Strong earnings support stocks"),
+        (r"\b(earnings miss|guidance cut|revenue miss|profit warning)\b", -0.7, "Weak earnings pressure stocks"),
+        (r"\b(yields rise|rates higher|hawkish|tightening)\b", -0.6, "Rising yields pressure stocks"),
+        (r"\b(rate cut|dovish|easing|pause)\b", +0.5, "Fed easing supports stocks"),
+        (r"\b(risk-off|selloff|crash|correction)\b", -0.7, "Risk-off mood in markets"),
+        (r"\b(rally|rebound|risk-on|bull market)\b", +0.3, "Risk-on momentum building"),
+        (r"\b(recession|contraction|gdp miss)\b", -0.6, "Recession fears hit stocks"),
+        (r"\b(strong jobs|nfp beat|jobless claims low)\b", +0.4, "Strong jobs boost stocks"),
+        (r"\b(jobs miss|unemployment rise|layoffs)\b", -0.4, "Weak jobs pressure stocks"),
+        (r"\b(buyback|stock buyback|repurchase)\b", +0.3, "Buybacks support prices"),
+        (r"\b(vix spike|vix surge|volatility)\b", -0.5, "Volatility spike — risk-off"),
+        (r"\b(ipo|m&a|merger|acquisition)\b", +0.2, "M&A activity signals confidence"),
+        (r"\b(ai|artificial intelligence|tech rally|nvidia|semiconductor)\b", +0.3, "AI/tech sector momentum"),
+        (r"\b(tariff|trade war|sanction)\b", -0.5, "Trade tensions weigh on stocks"),
+    ],
+    "WTI": [
+        (r"\b(crude|oil|wti|brent)\b", +0.1, "Oil market focus"),
+        (r"\b(opec|opec\+|output cut|production cut|quota cut)\b", +0.8, "OPEC cuts support prices"),
+        (r"\b(opec increase|output increase|production increase)\b", -0.6, "OPEC output rise pressures oil"),
+        (r"\b(inventory build|inventories rise|api build|eia build|crude build)\b", -0.8, "Inventory build pressures oil"),
+        (r"\b(inventory draw|inventories fall|api draw|eia draw|crude draw)\b", +0.8, "Inventory draw supports oil"),
+        (r"\b(disruption|outage|sanctions|pipeline attack|force majeure)\b", +0.7, "Supply disruption risk"),
+        (r"\b(demand weak|recession|slowdown|china slowdown)\b", -0.6, "Demand concerns weigh on oil"),
+        (r"\b(china demand|china growth|asia demand)\b", +0.5, "Asia demand supports oil"),
+        (r"\b(iran|russia|venezuela|libya)\b.*\b(oil|crude|export|sanction)\b", +0.5, "Geopolitical supply risk"),
+        (r"\b(hurricane|storm|gulf mexico)\b", +0.4, "Weather supply disruption"),
+        (r"\b(shale|permian|us production|us output|rig count)\b", -0.3, "US production growth weighs"),
+        (r"\b(strategic reserve|spr|strategic petroleum)\b", -0.4, "SPR release weighs on oil"),
+        (r"\b(travel demand|fuel demand|gasoline demand|jet fuel)\b", +0.4, "Travel/fuel demand lifts oil"),
+    ],
+    "ETH": [
+        (r"\b(ethereum|eth|ether)\b", +0.1, "Ethereum in focus"),
+        (r"\b(defi|dex|decentralized finance|tvl|uniswap|aave|curve)\b", +0.5, "DeFi activity supports ETH"),
+        (r"\b(sec|regulation|crackdown|ban|lawsuit)\b", -0.7, "Regulatory pressure on crypto"),
+        (r"\b(etf|spot etf|institutional|grayscale|blackrock)\b", +0.8, "Institutional demand for ETH"),
+        (r"\b(upgrade|eip|staking|validator|pectra|dencun)\b", +0.6, "Network upgrade supports ETH"),
+        (r"\b(hack|exploit|bridge attack|rug pull|drain)\b", -0.9, "Security incident hurts sentiment"),
+        (r"\b(risk-off|selloff|crash|recession)\b", -0.6, "Risk-off mood hits crypto"),
+        (r"\b(risk-on|rally|bull|bull market)\b", +0.5, "Risk-on mood lifts crypto"),
+        (r"\b(bitcoin|btc)\b", +0.2, "BTC move correlates with ETH"),
+        (r"\b(layer.?2|l2|rollup|arbitrum|optimism|base|zksync)\b", +0.4, "L2 growth benefits ETH"),
+        (r"\b(rate cut|dovish|easing|liquidity|m2)\b", +0.5, "Easier money lifts crypto"),
+        (r"\b(hawkish|rate hike|tightening|quantitative tightening)\b", -0.4, "Tighter policy weighs on crypto"),
+        (r"\b(gas fee|network fee|burn|eip.?1559)\b", +0.3, "ETH burn/fee mechanism bullish"),
+        (r"\b(nft|web3|metaverse)\b", +0.2, "NFT/Web3 activity benefits ETH"),
+    ],
+    # ── NEW: BTC rules ──
+    "BTC": [
+        (r"\b(bitcoin|btc)\b", +0.1, "Bitcoin in focus"),
+        (r"\b(halving|halvening|block reward)\b", +1.0, "Bitcoin halving — supply shock bullish"),
+        (r"\b(etf|spot etf|bitcoin etf|blackrock|fidelity etf)\b", +0.9, "BTC ETF demand bullish"),
+        (r"\b(etf outflow|etf selling)\b", -0.7, "BTC ETF outflows bearish"),
+        (r"\b(institutional|whale|treasury|microstrategy|saylor)\b", +0.6, "Institutional BTC buying"),
+        (r"\b(sec|regulation|crackdown|ban|lawsuit)\b", -0.7, "Regulatory pressure on BTC"),
+        (r"\b(mining|hashrate|difficulty|miner)\b", +0.3, "Mining health supports BTC"),
+        (r"\b(miner sell|miner capitulation)\b", -0.5, "Miner selling pressure"),
+        (r"\b(hack|exchange hack|theft|stolen|lost keys)\b", -0.8, "Security incident weighs on BTC"),
+        (r"\b(risk-off|selloff|crash|recession)\b", -0.6, "Risk-off mood hits BTC"),
+        (r"\b(risk-on|rally|bull|bull market)\b", +0.5, "Risk-on mood lifts BTC"),
+        (r"\b(rate cut|dovish|easing|liquidity)\b", +0.6, "Easier money lifts BTC"),
+        (r"\b(hawkish|rate hike|tightening)\b", -0.5, "Tighter policy weighs on BTC"),
+        (r"\b(all[- ]time high|ath|record high)\b.*\b(bitcoin|btc|crypto)\b", +0.7, "BTC at ATH — momentum bullish"),
+        (r"\b(lightning network|taproot|ordinals|rune)\b", +0.3, "BTC network development"),
+        (r"\b(cbdc|digital dollar|digital yuan)\b", -0.2, "CBDC competition concerns"),
+        (r"\b(us strategic reserve|btc reserve|government bitcoin)\b", +0.9, "Government BTC reserve demand"),
+        (r"\b(dollar index|dxy|dollar strength)\b", -0.4, "Strong dollar weighs on BTC"),
+        (r"\b(dollar weak|usd falls|inflation hedge)\b", +0.5, "Weak dollar lifts BTC"),
+        (r"\b(network congestion|fees spike)\b", -0.2, "High fees signal but can indicate demand"),
+        (r"\b(m2|money supply|quantitative easing|money print)\b", +0.6, "Monetary expansion bullish for BTC"),
+    ],
+    # ── NEW: EUR rules (EURUSD direction) ──
+    "EUR": [
+        (r"\b(ecb|lagarde|european central bank)\b", +0.1, "ECB in focus"),
+        (r"\b(ecb hike|ecb hawkish|rate hike europe|ecb tightening)\b", +0.7, "Hawkish ECB supports EUR"),
+        (r"\b(ecb cut|ecb dovish|ecb easing|ecb pause|lower rates europe)\b", -0.6, "Dovish ECB weighs on EUR"),
+        (r"\b(eu gdp|eurozone gdp|euro gdp|eu growth)\b", +0.4, "Strong EU growth supports EUR"),
+        (r"\b(eu recession|eurozone recession|eu contraction)\b", -0.7, "EU recession weighs on EUR"),
+        (r"\b(eu inflation|eurozone cpi|hicp|eu cpi)\b", +0.3, "EU inflation supports ECB hawkishness"),
+        (r"\b(eu unemployment|eurozone jobs)\b", -0.2, "EU jobs data"),
+        (r"\b(germany|german|bund|ifo|zew)\b", +0.2, "German data affects EUR"),
+        (r"\b(german recession|german contraction|germany weak)\b", -0.5, "German weakness weighs on EUR"),
+        (r"\b(eu debt crisis|sovereign debt|italy spread|greece)\b", -0.6, "EU debt risk weighs on EUR"),
+        (r"\b(fed hike|fed hawkish|dollar rally|usd strength)\b", -0.7, "Fed hawkishness weighs on EUR"),
+        (r"\b(fed cut|fed dovish|dollar weak|usd falls)\b", +0.7, "Fed dovishness lifts EUR"),
+        (r"\b(eu energy|gas prices europe|energy crisis europe)\b", -0.4, "EU energy crisis weighs on EUR"),
+        (r"\b(eu trade surplus|eu current account)\b", +0.3, "EU trade surplus supports EUR"),
+        (r"\b(parity|eur.?usd parity|below parity)\b", -0.5, "EUR/USD parity threat bearish"),
+        (r"\b(risk-off|geopolitical|war|ukraine|russia)\b", -0.4, "Risk-off / European geopolitics weigh"),
+        (r"\b(risk-on|global growth|emerging market)\b", +0.3, "Risk-on supports EUR"),
+        (r"\b(eu fiscal|eu stimulus|recovery fund|eu bond)\b", +0.4, "EU fiscal support bullish"),
+        (r"\b(eu election|political risk europe|populist)\b", -0.3, "EU political risk weighs"),
+    ],
 }
 
 # ============ DB ============
@@ -401,8 +522,15 @@ def load_bias():
 
 # ============ HELPERS ============
 def fingerprint(t, l): return hashlib.sha1(f"{t}||{l}".encode()).hexdigest()
-def decay_weight(age): return math.exp(-LAMBDA * max(0, age))
-def _fresh_bucket(age): return "0-2h" if age <= 7200 else ("2-8h" if age <= 28800 else "8-24h")
+
+# ── IMPROVED: smoother decay with configurable half-life ──
+def decay_weight(age_sec: float) -> float:
+    """Exponential decay. 0-2h stays near 1.0, 8h ~= 0.5, 24h ~= 0.1"""
+    return math.exp(-LAMBDA * max(0.0, age_sec))
+
+def _fresh_bucket(age):
+    return "0-2h" if age <= 7200 else ("2-8h" if age <= 28800 else "8-24h")
+
 def match_rules(asset, title):
     return [{"w": w, "why": why} for pat, w, why in RULES.get(asset, []) if re.search(pat, title or "", re.I)]
 
@@ -426,7 +554,6 @@ def _fmt_time(ts):
     if d < 86400: return f"{d//3600}h {(d%3600)//60}m"
     return f"{d//86400}d"
 
-# USD Detection
 _USD_KW = re.compile(r"\b(USD|Fed|FOMC|Powell|NFP|Payroll|CPI|PPI|GDP|Retail Sales|Jobless|Unemployment|ISM|PMI|Treasury|Michigan|JOLTS|ADP|Empire State|Durable Goods|Housing|Consumer Confidence|Initial Claims|Core PCE|Factory Orders|Trade Balance)\b", re.I)
 _CCY_PAT = re.compile(r"\b(USD|EUR|GBP|JPY|CHF|AUD|CAD|NZD|CNY)\b", re.I)
 
@@ -559,38 +686,55 @@ def fred_last(sid, n=90):
     finally: db_put(conn)
 
 def compute_fred_drivers():
-    out = {"XAU": [], "US500": [], "WTI": []}
+    out = {"XAU": [], "US500": [], "WTI": [], "ETH": [], "BTC": [], "EUR": []}
     dfii = fred_last("DFII10", 90)
-    dgs = fred_last("DGS10", 90)
-    usd = fred_last("DTWEXBGS", 120)
-    vix = fred_last("VIXCLS", 120)
+    dgs  = fred_last("DGS10", 90)
+    usd  = fred_last("DTWEXBGS", 120)
+    vix  = fred_last("VIXCLS", 120)
+
     if len(dfii) >= 6:
         d = dfii[0] - dfii[5]
-        out["XAU"].append({"w": -1.2 if d > 0 else 1.0, "why": "Real yields rising" if d > 0 else "Real yields falling"})
+        msg = "Real yields rising" if d > 0 else "Real yields falling"
+        out["XAU"].append({"w": -1.2 if d > 0 else 1.0, "why": msg})
+        # BTC also inversely correlated to real yields
+        out["BTC"].append({"w": -0.8 if d > 0 else 0.7, "why": msg})
+
     if len(dgs) >= 6:
         d = dgs[0] - dgs[5]
-        out["US500"].append({"w": -0.9 if d > 0 else 0.5, "why": "Bond yields rising" if d > 0 else "Bond yields falling"})
+        msg = "Bond yields rising" if d > 0 else "Bond yields falling"
+        out["US500"].append({"w": -0.9 if d > 0 else 0.5, "why": msg})
+        # EUR: higher US yields strengthen USD, weigh on EUR
+        out["EUR"].append({"w": -0.6 if d > 0 else 0.5, "why": msg})
+
     if len(usd) >= 6:
         d = (usd[0] - usd[5]) / max(abs(usd[5]), 1)
-        out["XAU"].append({"w": -0.9 if d > 0 else 0.7, "why": "Dollar strengthening" if d > 0 else "Dollar weakening"})
+        msg = "Dollar strengthening" if d > 0 else "Dollar weakening"
+        out["XAU"].append({"w": -0.9 if d > 0 else 0.7, "why": msg})
+        out["EUR"].append({"w": -0.9 if d > 0 else 0.8, "why": msg})
+        out["BTC"].append({"w": -0.5 if d > 0 else 0.4, "why": msg})
+
     if len(vix) >= 6:
         d = (vix[0] - vix[5]) / max(abs(vix[5]), 1)
-        out["US500"].append({"w": -1.0 if d > 0 else 0.4, "why": "Volatility spiking" if d > 0 else "Volatility calming"})
+        msg = "Volatility spiking" if d > 0 else "Volatility calming"
+        out["US500"].append({"w": -1.0 if d > 0 else 0.4, "why": msg})
+        out["ETH"].append({"w": -0.6 if d > 0 else 0.3, "why": msg})
+        out["BTC"].append({"w": -0.6 if d > 0 else 0.3, "why": msg})
+
     return out
 
-# ============ COMPUTE BIAS ============
+# ============ IMPROVED COMPUTE BIAS ============
 def compute_bias():
     now = int(time.time())
     cutoff = now - 86400
     conn = db_conn()
     try:
         with conn.cursor() as cur:
-            cur.execute("SELECT source,title,link,published_ts FROM news_items WHERE published_ts>=%s ORDER BY published_ts DESC LIMIT 1200;", (cutoff,))
+            cur.execute("SELECT source,title,link,published_ts FROM news_items WHERE published_ts>=%s ORDER BY published_ts DESC LIMIT 1500;", (cutoff,))
             rows = cur.fetchall()
     finally: db_put(conn)
 
     fred_ok = FRED_CFG["enabled"] and FRED_CFG["api_key"] and requests
-    fred_drivers = compute_fred_drivers() if fred_ok else {"XAU": [], "US500": [], "WTI": []}
+    fred_drivers = compute_fred_drivers() if fred_ok else {a: [] for a in ASSETS}
 
     upcoming = _get_upcoming(now)
     macro_sources = {"FED", "BLS", "BEA"}
@@ -600,48 +744,84 @@ def compute_bias():
 
     assets_out = {}
     for asset in ASSETS:
-        score, contribs, drivers_why, freshness = 0.0, [], [], {"0-2h": 0, "2-8h": 0, "8-24h": 0}
+        score = 0.0
+        contribs, drivers_why = [], []
+        freshness = {"0-2h": 0, "2-8h": 0, "8-24h": 0}
+        matched_sources = set()
+
         for source, title, link, ts in rows:
-            age = max(0, now - ts)
-            w_src, w_time = SOURCE_WEIGHT.get(source, 1.0), decay_weight(age)
-            for m in match_rules(asset, title):
+            age = max(0.0, float(now - ts))
+            w_src  = SOURCE_WEIGHT.get(source, 1.0)
+            w_time = decay_weight(age)
+            matches = match_rules(asset, title)
+            for m in matches:
                 contrib = m["w"] * w_src * w_time
-                score += contrib
+                score  += contrib
                 freshness[_fresh_bucket(age)] += 1
+                matched_sources.add(source)
                 contribs.append({"contrib": contrib, "why": m["why"]})
-                if m["why"] not in drivers_why: drivers_why.append(m["why"])
+                if m["why"] not in drivers_why:
+                    drivers_why.append(m["why"])
 
         for d in fred_drivers.get(asset, []):
             score += d["w"]
             contribs.append({"contrib": d["w"], "why": d["why"]})
-            if d["why"] not in drivers_why: drivers_why.append(d["why"])
+            if d["why"] not in drivers_why:
+                drivers_why.append(d["why"])
 
         th = BIAS_THRESH.get(asset, 1.0)
         bias = "BULLISH" if score >= th else ("BEARISH" if score <= -th else "NEUTRAL")
 
-        net = sum(x["contrib"] for x in contribs)
-        abs_sum = sum(abs(x["contrib"]) for x in contribs) or 1
-        conflict = 1 - abs(net) / abs_sum
-        src_div = len(set(row[0] for row in rows if match_rules(asset, row[1])))
+        # ── IMPROVED conflict/quality scoring ──
+        net     = sum(x["contrib"] for x in contribs)
+        abs_sum = sum(abs(x["contrib"]) for x in contribs) or 1.0
+        # conflict: 0 = all agree, 1 = perfectly split
+        conflict = 1.0 - abs(net) / abs_sum
+
+        # Source diversity (capped at 12 for full score)
+        src_div = len(matched_sources)
 
         fresh_total = sum(freshness.values()) or 1
-        fresh_score = (freshness["0-2h"] + freshness["2-8h"] * 0.6) / fresh_total
+        # fresh_score weights 0-2h items most, 2-8h moderately
+        fresh_score = (freshness["0-2h"] * 1.0 + freshness["2-8h"] * 0.5 + freshness["8-24h"] * 0.1) / fresh_total
 
-        raw = 0.45 * min(1, abs(score)/th) + 0.20 * min(1, len(contribs)/18) + 0.10 * min(1, src_div/7) + 0.10 * fresh_score + 0.15 * (1-conflict) - 0.35 * conflict - (0.15 * event_risk if event_mode else 0)
+        # ── IMPROVED quality formula ──
+        # Strength component — how far score exceeds threshold
+        strength   = min(1.0, abs(score) / max(th, 1.0))
+        # Evidence volume — how many contributing items
+        evidence_v = min(1.0, len(contribs) / 25.0)
+        # Source diversity
+        diversity  = min(1.0, src_div / 10.0)
+        # Agreement (inverse of conflict)
+        agreement  = 1.0 - conflict
+
+        raw = (
+            0.35 * strength
+          + 0.20 * evidence_v
+          + 0.15 * diversity
+          + 0.15 * fresh_score
+          + 0.15 * agreement
+          - 0.20 * conflict                                     # explicit conflict penalty
+          - (0.15 * event_risk if event_mode else 0.0)          # event risk penalty
+        )
         quality = int(max(0, min(100, round(raw * 100))))
 
-        top_drivers = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:5]
-        why_bias = [d["why"] for d in top_drivers if (d["contrib"] > 0) == (score > 0)][:3]
+        top_drivers  = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:6]
+        why_bias     = [d["why"] for d in top_drivers if (d["contrib"] > 0) == (score > 0)][:3]
         why_opposite = [d["why"] for d in top_drivers if (d["contrib"] > 0) != (score > 0)][:2]
 
         assets_out[asset] = {
-            "bias": bias, "score": round(score, 3), "threshold": th,
-            "quality": quality, "conflict": round(conflict, 2),
+            "bias": bias,
+            "score": round(score, 3),
+            "threshold": th,
+            "quality": quality,
+            "conflict": round(conflict, 2),
             "evidence_count": len(contribs),
+            "source_diversity": src_div,
             "why_bias": why_bias or ["Market signals unclear"],
             "why_opposite": why_opposite,
             "freshness": freshness,
-            "event_mode": event_mode
+            "event_mode": event_mode,
         }
 
     return {
@@ -704,7 +884,6 @@ def pipeline_run():
     finally: _PIPELINE_LOCK.release()
 
 def _scheduled_pipeline():
-    """Called by APScheduler every AUTO_REFRESH_MINUTES minutes."""
     try:
         print(f"[scheduler] Running pipeline at {datetime.now(timezone.utc).isoformat()}")
         pipeline_run()
@@ -717,7 +896,6 @@ app = FastAPI(title="News Bias Terminal")
 
 @app.on_event("startup")
 def startup_event():
-    """Start the background scheduler when FastAPI starts."""
     db_init()
     if _APSCHEDULER_AVAILABLE:
         scheduler = BackgroundScheduler()
@@ -732,19 +910,15 @@ def startup_event():
         scheduler.start()
         print(f"[scheduler] Started — pipeline runs every {AUTO_REFRESH_MINUTES} minutes.")
     else:
-        print("[scheduler] APScheduler not installed — auto-refresh disabled. Run: pip install apscheduler")
+        print("[scheduler] APScheduler not installed — auto-refresh disabled.")
 
 @app.get("/", include_in_schema=False)
 def root(): return RedirectResponse("/dashboard")
 
 @app.get("/health")
 def health():
-    return {
-        "ok": True,
-        "profile": GATE_PROFILE,
-        "auto_refresh_minutes": AUTO_REFRESH_MINUTES,
-        "scheduler": "apscheduler" if _APSCHEDULER_AVAILABLE else "disabled"
-    }
+    return {"ok": True, "profile": GATE_PROFILE, "auto_refresh_minutes": AUTO_REFRESH_MINUTES,
+            "scheduler": "apscheduler" if _APSCHEDULER_AVAILABLE else "disabled", "assets": ASSETS}
 
 @app.get("/api/data")
 def api_data():
@@ -785,20 +959,19 @@ def myfx_cal():
 def dashboard():
     db_init()
     payload = load_bias() or pipeline_run()
-    assets = payload.get("assets", {})
-    event = payload.get("event", {})
-    meta = payload.get("meta", {})
+    assets  = payload.get("assets", {})
+    event   = payload.get("event", {})
+    meta    = payload.get("meta", {})
 
-    now_ts = int(time.time())
+    now_ts     = int(time.time())
     event_mode = event.get("event_mode", False)
-    upcoming = event.get("upcoming", [])[:5]
+    upcoming   = event.get("upcoming", [])[:5]
 
     next_ev = next((e for e in upcoming if e.get("currency") == "USD" and e.get("impact") in ("HIGH", "MED")), None)
-    if not next_ev and upcoming:
-        next_ev = upcoming[0]
+    if not next_ev and upcoming: next_ev = upcoming[0]
 
-    feeds_st = meta.get("feeds_status", {})
-    feeds_ok = sum(1 for v in feeds_st.values() if v.get("ok"))
+    feeds_st    = meta.get("feeds_status", {})
+    feeds_ok    = sum(1 for v in feeds_st.values() if v.get("ok"))
     feeds_total = len(feeds_st) or len(RSS_FEEDS)
 
     asset_data = []
@@ -808,43 +981,47 @@ def dashboard():
         a["gate"] = gate
         asset_data.append((sym, a))
 
-    def asset_row(sym, a):
-        bias = a.get("bias", "NEUTRAL")
-        gate = a.get("gate", {})
-        ok = gate.get("ok", False)
-        blockers = gate.get("blockers", [])
-        why_bias = a.get("why_bias", [])
+    # ── asset icon mapping ──
+    ASSET_ICONS = {"XAU": "◈", "US500": "▦", "WTI": "⬡", "ETH": "⟠", "BTC": "₿", "EUR": "€"}
 
-        bias_icon = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "●")
+    def asset_row(sym, a):
+        bias  = a.get("bias", "NEUTRAL")
+        gate  = a.get("gate", {})
+        ok    = gate.get("ok", False)
+        blockers  = gate.get("blockers", [])
+        why_bias  = a.get("why_bias", [])
+
+        bias_icon  = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "●")
         bias_color = "#00d4aa" if bias == "BULLISH" else ("#ff5f56" if bias == "BEARISH" else "#888")
         trade_text = "TRADE" if ok else "WAIT"
         trade_color = "#00d4aa" if ok else "#ffbd2e"
-
         reason = blockers[0] if blockers else (why_bias[0] if why_bias else "Analyzing...")
+        icon   = ASSET_ICONS.get(sym, "●")
 
         return f'''
         <div class="asset-row" onclick="openView('{sym}')">
             <div class="asset-main">
+                <span class="asset-icon">{icon}</span>
                 <span class="asset-sym">{sym}</span>
                 <span class="asset-bias" style="color:{bias_color}">{bias} {bias_icon}</span>
             </div>
-            <div class="asset-reason">{reason[:45]}</div>
+            <div class="asset-reason">{reason[:50]}</div>
             <div class="asset-trade" style="background:{trade_color}20;color:{trade_color}">{trade_text}</div>
         </div>'''
 
     if next_ev:
-        ev_ccy = next_ev.get("currency") or "—"
-        ev_title = (next_ev.get("title") or "Event")[:40]
+        ev_ccy    = next_ev.get("currency") or "—"
+        ev_title  = (next_ev.get("title") or "Event")[:40]
         ev_impact = next_ev.get("impact") or ""
-        ev_time = _fmt_time(next_ev.get("ts"))
+        ev_time   = _fmt_time(next_ev.get("ts"))
         impact_color = "#ff5f56" if ev_impact == "HIGH" else ("#ffbd2e" if ev_impact == "MED" else "#888")
         next_ev_html = f'<span class="ev-ccy">{ev_ccy}</span> {ev_title} <span class="ev-impact" style="color:{impact_color}">{ev_impact}</span> <span class="ev-time">in {ev_time}</span>'
     else:
         next_ev_html = '<span class="ev-none">No major USD events upcoming</span>'
 
-    js_payload = json.dumps(payload).replace("</", "<\\/")
-    tv_json = json.dumps(TV_SYMBOLS)
-    updated = payload.get("updated_utc", "")[:19].replace("T", " ")
+    js_payload  = json.dumps(payload).replace("</", "<\\/")
+    tv_json     = json.dumps(TV_SYMBOLS)
+    updated     = payload.get("updated_utc", "")[:19].replace("T", " ")
 
     return HTMLResponse(f'''<!DOCTYPE html>
 <html lang="en">
@@ -897,16 +1074,7 @@ body {{
 }}
 @keyframes pulse {{ 0%, 100% {{ opacity: 1; }} 50% {{ opacity: 0.5; }} }}
 .time {{ color: var(--text-muted); font-size: 10px; }}
-.feeds-badge {{
-    background: var(--surface);
-    border: 1px solid var(--border);
-    padding: 3px 8px;
-    border-radius: 3px;
-    font-size: 10px;
-    cursor: pointer;
-}}
-.feeds-badge:hover {{ border-color: var(--orange); }}
-.refresh-badge {{
+.feeds-badge, .refresh-badge {{
     background: var(--surface);
     border: 1px solid var(--border);
     padding: 3px 8px;
@@ -915,22 +1083,26 @@ body {{
     cursor: pointer;
     color: var(--text-muted);
 }}
+.feeds-badge:hover {{ border-color: var(--orange); color: var(--orange); }}
 .refresh-badge:hover {{ border-color: var(--green); color: var(--green); }}
 
 .tv-wrap {{ border-bottom: 1px solid var(--border); background: #000; }}
 
+/* ── NEWS TICKER: slower (300s) and polished ── */
 .news-ticker {{
     background: var(--surface);
     border-bottom: 1px solid var(--border);
     padding: 6px 0;
     overflow: hidden;
     font-size: 11px;
+    position: relative;
 }}
-.ticker-label {{ color: var(--orange); font-size: 9px; font-weight: 700; padding: 0 12px; display: inline-block; min-width: 60px; }}
-.ticker-scroll {{ display: inline-block; white-space: nowrap; animation: ticker 180s linear infinite; }}
-.ticker-scroll:hover {{ animation-play-state: paused; }}
+.ticker-label {{ color: var(--orange); font-size: 9px; font-weight: 700; padding: 0 12px; display: inline-block; min-width: 60px; vertical-align: middle; }}
+.ticker-outer {{ display: inline-block; overflow: hidden; width: calc(100% - 80px); vertical-align: middle; }}
+.ticker-scroll {{ display: inline-block; white-space: nowrap; animation: ticker 300s linear infinite; }}
+.ticker-scroll:hover {{ animation-play-state: paused; cursor: pointer; }}
 @keyframes ticker {{ 0% {{ transform: translateX(0); }} 100% {{ transform: translateX(-50%); }} }}
-.ticker-item {{ display: inline; margin-right: 30px; color: var(--text-muted); }}
+.ticker-item {{ display: inline; margin-right: 40px; color: var(--text-muted); }}
 .ticker-item b {{ color: var(--orange); margin-right: 6px; }}
 
 .next-event {{
@@ -959,20 +1131,20 @@ body {{
     padding: 10px 14px;
     margin-bottom: 4px;
     cursor: pointer;
-    transition: border-color 0.15s;
+    transition: border-color 0.15s, background 0.15s;
     display: flex;
     align-items: center;
     justify-content: space-between;
     gap: 12px;
 }}
-.asset-row:hover {{ border-color: var(--orange); }}
-.asset-main {{ display: flex; align-items: center; gap: 16px; min-width: 180px; }}
-.asset-sym {{ font-size: 14px; font-weight: 700; color: var(--text); min-width: 55px; }}
-.asset-bias {{ font-size: 11px; font-weight: 700; min-width: 80px; }}
+.asset-row:hover {{ border-color: var(--orange); background: #1a1f27; }}
+.asset-main {{ display: flex; align-items: center; gap: 12px; min-width: 190px; }}
+.asset-icon {{ font-size: 16px; opacity: 0.7; min-width: 20px; text-align: center; }}
+.asset-sym {{ font-size: 14px; font-weight: 700; color: var(--text); min-width: 50px; }}
+.asset-bias {{ font-size: 11px; font-weight: 700; min-width: 90px; }}
 .asset-reason {{ flex: 1; color: var(--text-muted); font-size: 11px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
 .asset-trade {{ padding: 4px 12px; border-radius: 3px; font-size: 10px; font-weight: 700; text-align: center; min-width: 60px; }}
 
-/* Countdown */
 .next-refresh {{
     background: var(--surface);
     border-top: 1px solid var(--border);
@@ -991,9 +1163,7 @@ body {{
     justify-content: space-between;
     align-items: center;
     position: fixed;
-    bottom: 0;
-    left: 0;
-    right: 0;
+    bottom: 0; left: 0; right: 0;
 }}
 .footer-btns {{ display: flex; gap: 6px; }}
 .btn {{
@@ -1031,13 +1201,10 @@ body {{
     overflow-y: auto;
 }}
 .modal-header {{
-    display: flex;
-    justify-content: space-between;
-    align-items: center;
+    display: flex; justify-content: space-between; align-items: center;
     padding: 16px;
     border-bottom: 1px solid var(--border);
-    position: sticky;
-    top: 0;
+    position: sticky; top: 0;
     background: var(--surface);
 }}
 .modal-title {{ font-size: 14px; font-weight: 700; color: var(--orange); }}
@@ -1060,7 +1227,6 @@ body {{
 .spacer {{ height: 50px; }}
 
 @media (max-width: 600px) {{
-    .container {{ max-width: 100%; }}
     .asset-row {{ flex-direction: column; align-items: flex-start; gap: 8px; }}
     .asset-main {{ width: 100%; justify-content: space-between; }}
     .asset-reason {{ width: 100%; white-space: normal; }}
@@ -1074,28 +1240,26 @@ body {{
 <div class="header">
     <div class="logo">NEWS BIAS <span>// TERMINAL</span></div>
     <div class="header-right">
-        <div class="status">
-            <div class="live-dot"></div>
-            <span>LIVE</span>
-        </div>
+        <div class="status"><div class="live-dot"></div><span>LIVE</span></div>
         <div class="time" id="clock">{updated} UTC</div>
         <div class="refresh-badge" onclick="manualRefresh()" id="refreshBtn">↻ REFRESH</div>
         <div class="feeds-badge" onclick="openFeeds()">FEEDS {feeds_ok}/{feeds_total}</div>
     </div>
 </div>
 
+<!-- TradingView ticker tape — compact, slower scroll via CSS override -->
 <div class="tv-wrap">
     <div class="tradingview-widget-container">
         <div class="tradingview-widget-container__widget"></div>
         <script src="https://s3.tradingview.com/external-embedding/embed-widget-ticker-tape.js" async>
-        {{"symbols":{tv_json},"showSymbolLogo":true,"isTransparent":true,"displayMode":"compact","colorTheme":"dark"}}
+        {{"symbols":{tv_json},"showSymbolLogo":true,"isTransparent":true,"displayMode":"compact","colorTheme":"dark","speed":20}}
         </script>
     </div>
 </div>
 
 <div class="news-ticker">
     <span class="ticker-label">▶ NEWS</span>
-    <div class="ticker-scroll" id="newsTicker">Loading headlines...</div>
+    <span class="ticker-outer"><div class="ticker-scroll" id="newsTicker">Loading headlines...</div></span>
 </div>
 
 <div class="next-event">
@@ -1104,12 +1268,12 @@ body {{
 </div>
 
 <div class="assets">
-    <div class="section-header">&lt;&lt; TRADE SIGNALS &gt;&gt;</div>
+    <div class="section-header">&lt;&lt; TRADE SIGNALS — {', '.join(ASSETS)} &gt;&gt;</div>
     {''.join(asset_row(sym, a) for sym, a in asset_data)}
 </div>
 
 <div class="next-refresh">
-    Auto-refresh every {AUTO_REFRESH_MINUTES} min &nbsp;|&nbsp; Next update in: <span id="countdown">—</span>
+    Auto-refresh every {AUTO_REFRESH_MINUTES} min &nbsp;|&nbsp; Next in: <span id="countdown">—</span>
 </div>
 
 <div class="spacer"></div>
@@ -1121,7 +1285,7 @@ body {{
     </div>
     <div class="footer-info">
         <span>Profile: {GATE_PROFILE}</span>
-        <span>Keys: 1-4 view • Esc close</span>
+        <span>Keys: 1-6 view • Esc close</span>
     </div>
 </div>
 
@@ -1137,14 +1301,13 @@ body {{
 
 <script>
 const P = {js_payload};
-const ASSETS = ['XAU', 'US500', 'WTI', 'ETH'];
+const ASSETS = {json.dumps(ASSETS)};
+const ASSET_ICONS = {json.dumps({sym: {"XAU":"◈","US500":"▦","WTI":"⬡","ETH":"⟠","BTC":"₿","EUR":"€"}.get(sym,"●") for sym in ASSETS})};
 const CFG = {json.dumps(GATE_THRESHOLDS[GATE_PROFILE])};
 const AUTO_REFRESH_MS = {AUTO_REFRESH_MINUTES} * 60 * 1000;
 
-let _lastUpdate = Date.now();
-let _nextRefreshAt = _lastUpdate + AUTO_REFRESH_MS;
+let _nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
 
-// ---- Countdown timer ----
 function updateCountdown() {{
     const remaining = Math.max(0, Math.round((_nextRefreshAt - Date.now()) / 1000));
     const m = Math.floor(remaining / 60);
@@ -1154,24 +1317,18 @@ function updateCountdown() {{
 setInterval(updateCountdown, 1000);
 updateCountdown();
 
-// ---- Auto-reload the page every AUTO_REFRESH_MINUTES ----
-// This reloads the whole dashboard so UI stays in sync with backend data
-setInterval(() => {{
-    window.location.reload();
-}}, AUTO_REFRESH_MS);
+// Full page reload every AUTO_REFRESH_MINUTES
+setInterval(() => window.location.reload(), AUTO_REFRESH_MS);
 
-// ---- Also update clock & news every 30s without reloading ----
+// Lightweight clock + data sync every 30s
 setInterval(async () => {{
     try {{
         const r = await fetch('/api/data');
         const d = await r.json();
-        if (d.updated_utc) {{
-            document.getElementById('clock').textContent = d.updated_utc.slice(0,19).replace('T',' ') + ' UTC';
-        }}
+        if (d.updated_utc) document.getElementById('clock').textContent = d.updated_utc.slice(0,19).replace('T',' ') + ' UTC';
     }} catch {{}}
 }}, 30000);
 
-// ---- Manual refresh button ----
 async function manualRefresh() {{
     const btn = document.getElementById('refreshBtn');
     btn.textContent = '↻ ...';
@@ -1179,18 +1336,15 @@ async function manualRefresh() {{
         await fetch('/api/data');
         _nextRefreshAt = Date.now() + AUTO_REFRESH_MS;
         window.location.reload();
-    }} catch {{
-        btn.textContent = '↻ REFRESH';
-    }}
+    }} catch {{ btn.textContent = '↻ REFRESH'; }}
 }}
 
-// ---- Load news ticker ----
 async function loadNews() {{
     try {{
-        const r = await fetch('/latest?limit=15');
+        const r = await fetch('/latest?limit=20');
         const d = await r.json();
         const items = (d.items || []).map(i => `<span class="ticker-item"><b>${{esc(i.source)}}</b>${{esc(i.title)}}</span>`).join('');
-        document.getElementById('newsTicker').innerHTML = items + items;
+        document.getElementById('newsTicker').innerHTML = items + items; // doubled for seamless loop
     }} catch {{}}
 }}
 loadNews();
@@ -1214,6 +1368,8 @@ function openView(sym) {{
     const blockers = [], unlock = [];
     const quality = a.quality || 0;
     const conflict = a.conflict || 1;
+    const srcDiv = a.source_diversity || 0;
+    const evCount = a.evidence_count || 0;
     const eventMode = ev.event_mode;
     const upcoming = ev.upcoming || [];
 
@@ -1233,13 +1389,20 @@ function openView(sym) {{
 
     const ok = blockers.length === 0;
     const biasColor = bias === 'BULLISH' ? '#00d4aa' : (bias === 'BEARISH' ? '#ff5f56' : '#888');
-    const tradeText = ok ? 'TRADE' : 'WAIT';
     const tradeColor = ok ? '#00d4aa' : '#ffbd2e';
+    const icon = ASSET_ICONS[sym] || '●';
 
     let html = `
-        <div style="text-align:center;padding:20px 0;border-bottom:1px solid var(--border);margin-bottom:16px;">
-            <div style="font-size:24px;font-weight:700;color:${{biasColor}};margin-bottom:8px;">${{bias}}</div>
-            <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 20px;border-radius:4px;font-weight:700;">${{tradeText}}</div>
+        <div style="text-align:center;padding:16px 0 20px;border-bottom:1px solid var(--border);margin-bottom:16px;">
+            <div style="font-size:28px;opacity:0.5;margin-bottom:4px">${{icon}}</div>
+            <div style="font-size:22px;font-weight:700;color:${{biasColor}};margin-bottom:10px;">${{bias}}</div>
+            <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 24px;border-radius:4px;font-weight:700;">${{ok ? '✓ TRADE' : '⏳ WAIT'}}</div>
+        </div>
+        <div style="display:flex;gap:12px;margin-bottom:16px;font-size:10px;color:var(--text-muted);">
+            <span>Quality: <b style="color:var(--text)">${{quality}}</b></span>
+            <span>Conflict: <b style="color:var(--text)">${{Math.round(conflict*100)}}%</b></span>
+            <span>Evidence: <b style="color:var(--text)">${{evCount}}</b></span>
+            <span>Sources: <b style="color:var(--text)">${{srcDiv}}</b></span>
         </div>
     `;
     if (whyBias.length) {{
@@ -1262,14 +1425,14 @@ function openView(sym) {{
         whyOpp.forEach(w => {{ html += `<div class="view-item opposite">${{esc(w)}}</div>`; }});
         html += `</div>`;
     }}
-    openModal(sym, html);
+    openModal(`${{icon}} ${{sym}}`, html);
 }}
 
 function openFeeds() {{
     const f = P.meta?.feeds_status || {{}};
     const items = Object.entries(f).sort((a,b) => a[0].localeCompare(b[0]));
     const ok = items.filter(([,v]) => v.ok).length;
-    let html = `<div style="margin-bottom:16px;color:var(--text-muted);">Active: ${{ok}}/${{items.length}}</div>`;
+    let html = `<div style="margin-bottom:16px;color:var(--text-muted);">Active: ${{ok}}/${{items.length}} feeds</div>`;
     html += `<div class="feed-grid">`;
     items.forEach(([name, info]) => {{
         html += `<div class="feed-item"><span>${{esc(name)}}</span><span class="${{info.ok ? 'feed-ok' : 'feed-bad'}}">${{info.ok ? '●' : '○'}}</span></div>`;
@@ -1288,10 +1451,7 @@ function openCalendar() {{
 
 document.addEventListener('keydown', e => {{
     if (e.key === 'Escape') closeModal();
-    if (e.key === '1') openView('XAU');
-    if (e.key === '2') openView('US500');
-    if (e.key === '3') openView('WTI');
-    if (e.key === '4') openView('ETH');
+    ASSETS.forEach((sym, i) => {{ if (e.key === String(i+1)) openView(sym); }});
 }});
 </script>
 </body>

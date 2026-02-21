@@ -856,8 +856,8 @@ COT_CSV_URL = "https://www.cftc.gov/dea/newcot/FinFutWk.txt"
 COT_TTL = 86400 * 2  # refresh every 2 days (published weekly)
 
 def fetch_cot():
-    """Download CFTC COT report, extract net speculative position per asset.
-    Returns {asset: {net_long: float, pct_long: float, signal: str, weight: float}}
+    """Download CFTC COT report. Uses header row to find correct columns.
+    Returns {asset: {net_long, pct_long, signal, weight, source}}
     """
     cached = _ext_get("cot")
     if cached:
@@ -866,77 +866,105 @@ def fetch_cot():
         return {}
     result = {}
     try:
-        r = requests.get(COT_CSV_URL, timeout=20)
+        r = requests.get(COT_CSV_URL, timeout=25,
+                         headers={"User-Agent": "Mozilla/5.0"})
         r.raise_for_status()
         lines = r.text.splitlines()
-        # Format: fixed-width / CSV depending on file variant; try CSV-style split
-        for line in lines[1:]:  # skip header
-            parts = [p.strip().strip('"') for p in line.split(",")]
-            if len(parts) < 10:
+        if not lines:
+            raise ValueError("empty")
+
+        # Parse header to find column indices dynamically
+        header = [h.strip().strip('"').lower() for h in lines[0].split(",")]
+        def col(name):
+            for i, h in enumerate(header):
+                if name.lower() in h:
+                    return i
+            return None
+
+        # Try multiple known column name variants
+        long_col  = col("noncomm_positions_long_all") or col("noncomm long") or col("non-commercial long") or 8
+        short_col = col("noncomm_positions_short_all") or col("noncomm short") or col("non-commercial short") or 9
+        code_col  = col("cftc_contract_market_code") or col("market code") or 2
+        name_col  = col("market_and_exchange_names") or col("market name") or 0
+
+        for line in lines[1:]:
+            if not line.strip():
                 continue
-            mkt_code = parts[2].strip() if len(parts) > 2 else ""
+            parts = [p.strip().strip('"') for p in line.split(",")]
+            if len(parts) < max(long_col, short_col, code_col) + 1:
+                continue
+            mkt_code = parts[code_col].strip()
             asset = COT_MARKETS.get(mkt_code)
+            # Also match by name substring if code doesn't match
             if not asset:
+                mkt_name = parts[name_col].upper() if name_col < len(parts) else ""
+                for name_frag, a in [("GOLD", "XAU"), ("CRUDE OIL", "WTI"), ("EURO FX", "EUR"),
+                                      ("BITCOIN", "BTC"), ("ETHER", "ETH"), ("E-MINI S&P", "US500")]:
+                    if name_frag in mkt_name:
+                        asset = a
+                        break
+            if not asset or asset in result:
                 continue
             try:
-                # Fields in FinFutWk: ... NonComm_Positions_Long_All, NonComm_Positions_Short_All ...
-                # Column indices (0-based) vary — scan by header name
-                # Fallback: use known legacy indices
-                non_long  = float(parts[8].replace(",",""))   # NonComm Long
-                non_short = float(parts[9].replace(",",""))   # NonComm Short
-                net = non_long - non_short
-                total = non_long + non_short or 1.0
-                pct_long = round(non_long / total * 100, 1)
-                # Interpret signal
-                if pct_long >= 70:
-                    signal, weight = "Speculators heavily long", +0.6
-                elif pct_long >= 60:
-                    signal, weight = "Speculators net long", +0.35
-                elif pct_long <= 30:
-                    signal, weight = "Speculators heavily short", -0.6
-                elif pct_long <= 40:
-                    signal, weight = "Speculators net short", -0.35
-                else:
-                    signal, weight = "Speculators neutral", 0.0
-                result[asset] = {
-                    "net_long": int(net),
-                    "pct_long": pct_long,
-                    "signal": signal,
-                    "weight": weight,
-                }
+                nl = float(parts[long_col].replace(",", ""))
+                ns = float(parts[short_col].replace(",", ""))
+                net   = nl - ns
+                total = nl + ns or 1.0
+                pct   = round(nl / total * 100, 1)
+                result[asset] = _cot_interpret(int(net), pct, "CFTC")
             except (ValueError, IndexError):
                 continue
-    except Exception as e:
-        pass  # silently fail — COT is supplementary
-    # Also try alternative JSON source (Quandl/Nasdaq Data Link style fallback)
+    except Exception:
+        pass
+
     if not result:
         result = _fetch_cot_fallback()
     if result:
         _ext_set("cot", result)
     return result
 
+def _cot_interpret(net_long, pct_long, source="CFTC"):
+    if pct_long >= 72:
+        signal, weight = "Specs heavily long — crowded", +0.55
+    elif pct_long >= 62:
+        signal, weight = "Specs net long", +0.35
+    elif pct_long <= 28:
+        signal, weight = "Specs heavily short — crowded", -0.55
+    elif pct_long <= 38:
+        signal, weight = "Specs net short", -0.35
+    else:
+        signal, weight = "Specs neutral", 0.0
+    return {"net_long": net_long, "pct_long": pct_long,
+            "signal": signal, "weight": weight, "source": source}
+
 def _fetch_cot_fallback():
-    """Fallback: parse CFTC disaggregated futures from their JSON API."""
+    """Try CFTC Socrata open data API — Gold only, more reliable JSON."""
     result = {}
-    try:
-        # CFTC open data endpoint
-        url = "https://publicreporting.cftc.gov/api/explore/dataset/fut_disagg_xls_2024_001/records/?limit=50&refine.market_and_exchange_names=GOLD"
-        r = requests.get(url, timeout=10)
-        data = r.json().get("records", [])
-        for rec in data[:1]:
-            f = rec.get("fields", {})
-            nl = float(f.get("noncomm_positions_long_all", 0))
-            ns = float(f.get("noncomm_positions_short_all", 0))
-            if nl + ns > 0:
-                pct = nl / (nl + ns) * 100
-                result["XAU"] = {
-                    "net_long": int(nl - ns),
-                    "pct_long": round(pct, 1),
-                    "signal": "Speculators net long" if pct > 55 else "Speculators net short",
-                    "weight": +0.3 if pct > 55 else -0.3,
-                }
-    except:
-        pass
+    if not requests:
+        return result
+    endpoints = [
+        # Gold futures (Socrata dataset)
+        ("https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=1&$order=report_date_as_mm_dd_yyyy+DESC&$where=cftc_contract_market_code=%27088691%27",
+         "XAU"),
+        # Crude Oil
+        ("https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=1&$order=report_date_as_mm_dd_yyyy+DESC&$where=cftc_contract_market_code=%27067651%27",
+         "WTI"),
+        # Euro FX
+        ("https://publicreporting.cftc.gov/resource/jun7-fc8e.json?$limit=1&$order=report_date_as_mm_dd_yyyy+DESC&$where=cftc_contract_market_code=%2713874A%27",
+         "EUR"),
+    ]
+    for url, asset in endpoints:
+        try:
+            r = requests.get(url, timeout=12, headers={"User-Agent": "Mozilla/5.0"})
+            data = r.json()
+            if data:
+                rec = data[0]
+                nl = float(rec.get("noncomm_positions_long_all", 0))
+                ns = float(rec.get("noncomm_positions_short_all", 0))
+                if nl + ns > 0:
+                    result[asset] = _cot_interpret(int(nl - ns), round(nl / (nl + ns) * 100, 1), "CFTC-API")
+        except Exception:
+            continue
     return result
 
 def cot_to_weight(asset, cot_data):
@@ -1305,8 +1333,17 @@ def compute_bias():
         quality = int(max(0, min(100, round(raw * 100))))
 
         top_drivers  = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:8]
-        why_bias     = [d["why"] for d in top_drivers if (d["contrib"] > 0) == (score > 0)][:3]
-        why_opposite = [d["why"] for d in top_drivers if (d["contrib"] > 0) != (score > 0)][:2]
+        # Deduplicate by label text (same rule fires on many articles → same string)
+        seen_why = set()
+        why_bias, why_opposite = [], []
+        for d in top_drivers:
+            txt = d["why"]
+            if txt in seen_why: continue
+            seen_why.add(txt)
+            if (d["contrib"] > 0) == (score > 0):
+                if len(why_bias) < 3: why_bias.append(txt)
+            else:
+                if len(why_opposite) < 2: why_opposite.append(txt)
 
         assets_out[asset] = {
             "bias": bias,
@@ -1462,6 +1499,16 @@ def api_history(asset: str, hours: int = 24):
     if asset not in ASSETS:
         return JSONResponse({"error": "unknown asset"}, 400)
     return {"asset": asset, "history": load_bias_history(asset, hours)}
+
+@app.get("/api/ext-status")
+def api_ext_status():
+    """Return status of external data sources: COT, Options, F&G."""
+    db_init()
+    return {
+        "cot":     _ext_get("cot"),
+        "options": _ext_get("options"),
+        "fear_greed": _ext_get("fear_greed"),
+    }
 
 @app.get("/feeds")
 def feeds():
@@ -2168,9 +2215,18 @@ async function openView(sym) {{
         </div>
         ${{fgHtml}}${{cotHtml}}${{optHtml}}
         <div class="view-section">
-            <div class="view-label">SCORE HISTORY (24H)</div>
-            <canvas id="spark_${{sym}}" height="52" style="width:100%;display:block;border-radius:4px;background:var(--bg)"></canvas>
-            <div id="sigLog_${{sym}}" style="margin-top:8px;max-height:100px;overflow-y:auto"></div>
+            <div class="view-label" style="display:flex;justify-content:space-between;align-items:center">
+                <span>SCORE HISTORY (24H)</span>
+                <span id="sparkStatus_${{sym}}" style="color:var(--text-muted);font-size:8px;font-weight:400">loading...</span>
+            </div>
+            <div id="sparkWrap_${{sym}}" style="position:relative;background:var(--bg);border-radius:4px;min-height:52px;overflow:hidden">
+                <canvas id="spark_${{sym}}" height="52" style="width:100%;display:block"></canvas>
+                <div id="sparkEmpty_${{sym}}" style="display:none;position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--text-muted);font-size:9px;flex-direction:column;gap:4px">
+                    <span>📊</span>
+                    <span>Accumulating data — check back after 1-2 refreshes</span>
+                </div>
+            </div>
+            <div id="sigLog_${{sym}}" style="margin-top:8px;max-height:110px;overflow-y:auto"></div>
         </div>
     `;
     if (whyBias.length) {{
@@ -2193,18 +2249,42 @@ async function openView(sym) {{
         whyOpp.forEach(w => {{ html += `<div class="view-item opposite">${{esc(w)}}</div>`; }});
         html += `</div>`;
     }}
+    // Data sources status strip
+    const hasCOT  = !!a.cot;
+    const hasOpts = !!a.options;
+    const hasFG   = !!a.fear_greed;
+    html += `<div style="display:flex;gap:6px;flex-wrap:wrap;padding-top:12px;border-top:1px solid var(--border);margin-top:4px">
+        <span style="font-size:8px;color:var(--text-muted)">DATA SOURCES:</span>
+        <span style="font-size:8px;color:${{hasFG ? '#00d4aa' : '#555'}}">${{hasFG ? '●' : '○'}} F&G</span>
+        <span style="font-size:8px;color:${{hasCOT ? '#00d4aa' : '#555'}}">${{hasCOT ? '●' : '○'}} COT</span>
+        <span style="font-size:8px;color:${{hasOpts ? '#00d4aa' : '#555'}}">${{hasOpts ? '●' : '○'}} Options/VIX</span>
+        <span style="font-size:8px;color:#00d4aa">● News RSS</span>
+        <span style="font-size:8px;color:#00d4aa">● FRED</span>
+    </div>`;
     openModal(`${{icon}} ${{sym}}`, html);
 
     // Async: load history and render sparkline + signal log
     try {{
         const r = await fetch(`/api/history/${{sym}}?hours=24`);
         const d = await r.json();
-        const hist = (d.history || []).slice().reverse(); // oldest first
-        if (hist.length > 1) renderSparkline(`spark_${{sym}}`, hist);
-        renderSignalLog(`sigLog_${{sym}}`, d.history || []); // newest first for log
+        const hist = (d.history || []).slice().reverse(); // oldest first for sparkline
+        const statusEl = document.getElementById(`sparkStatus_${{sym}}`);
+        const emptyEl  = document.getElementById(`sparkEmpty_${{sym}}`);
+        const canvas   = document.getElementById(`spark_${{sym}}`);
+        if (hist.length >= 2) {{
+            if (canvas) canvas.style.display = 'block';
+            if (emptyEl) emptyEl.style.display = 'none';
+            renderSparkline(`spark_${{sym}}`, hist);
+            if (statusEl) statusEl.textContent = `${{hist.length}} points`;
+        }} else {{
+            if (canvas) canvas.style.display = 'none';
+            if (emptyEl) emptyEl.style.display = 'flex';
+            if (statusEl) statusEl.textContent = 'no data yet';
+        }}
+        renderSignalLog(`sigLog_${{sym}}`, d.history || []);
     }} catch(e) {{
-        const c = document.getElementById(`spark_${{sym}}`);
-        if (c) c.style.display = 'none';
+        const statusEl = document.getElementById(`sparkStatus_${{sym}}`);
+        if (statusEl) statusEl.textContent = 'error';
     }}
 }}
 

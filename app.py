@@ -481,6 +481,23 @@ def db_init():
                 cur.execute("CREATE TABLE IF NOT EXISTS econ_events(id BIGSERIAL PRIMARY KEY,source TEXT,title TEXT,currency TEXT,impact TEXT,event_ts BIGINT,link TEXT,fingerprint TEXT UNIQUE);")
                 cur.execute("CREATE INDEX IF NOT EXISTS idx_econ_ts ON econ_events(event_ts DESC);")
                 cur.execute("CREATE TABLE IF NOT EXISTS kv_state(k TEXT PRIMARY KEY,v TEXT,updated_ts BIGINT);")
+                # NEW: bias history for sparklines and signal log
+                cur.execute("""CREATE TABLE IF NOT EXISTS bias_history(
+                    id BIGSERIAL PRIMARY KEY,
+                    asset TEXT NOT NULL,
+                    bias TEXT,
+                    score DOUBLE PRECISION,
+                    quality INTEGER,
+                    gate_ok BOOLEAN,
+                    recorded_ts BIGINT NOT NULL
+                );""")
+                cur.execute("CREATE INDEX IF NOT EXISTS idx_bh_asset_ts ON bias_history(asset, recorded_ts DESC);")
+                # NEW: external metrics (Fear&Greed, on-chain, COT)
+                cur.execute("""CREATE TABLE IF NOT EXISTS ext_metrics(
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT,
+                    fetched_ts BIGINT
+                );""")
         _DB_READY = True
     finally: db_put(conn)
 
@@ -722,6 +739,169 @@ def compute_fred_drivers():
 
     return out
 
+# ============ BIAS HISTORY ============
+def save_bias_history(assets_out, gate_results):
+    """Record each asset's bias snapshot for sparklines."""
+    now = int(time.time())
+    conn = db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                for asset, a in assets_out.items():
+                    gate_ok = gate_results.get(asset, {}).get("ok", False)
+                    cur.execute(
+                        "INSERT INTO bias_history(asset,bias,score,quality,gate_ok,recorded_ts) VALUES(%s,%s,%s,%s,%s,%s);",
+                        (asset, a["bias"], a["score"], a["quality"], gate_ok, now)
+                    )
+                # Prune older than 7 days
+                cur.execute("DELETE FROM bias_history WHERE recorded_ts < %s;", (now - 7*86400,))
+    except: pass
+    finally: db_put(conn)
+
+def load_bias_history(asset, hours=24):
+    """Returns list of {ts, bias, score, quality, gate_ok} newest-first."""
+    cutoff = int(time.time()) - hours * 3600
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute(
+                "SELECT recorded_ts,bias,score,quality,gate_ok FROM bias_history WHERE asset=%s AND recorded_ts>=%s ORDER BY recorded_ts DESC LIMIT 96;",
+                (asset, cutoff)
+            )
+            return [{"ts": r[0], "bias": r[1], "score": round(r[2],3), "quality": r[3], "gate_ok": r[4]} for r in cur.fetchall()]
+    except: return []
+    finally: db_put(conn)
+
+# ============ EXTERNAL METRICS ============
+EXT_METRICS_TTL = 3600  # refresh every hour
+
+def _ext_get(key):
+    conn = db_conn()
+    try:
+        with conn.cursor() as cur:
+            cur.execute("SELECT value_json, fetched_ts FROM ext_metrics WHERE key=%s;", (key,))
+            r = cur.fetchone()
+            if r and (int(time.time()) - r[1]) < EXT_METRICS_TTL:
+                return json.loads(r[0])
+    except: pass
+    finally: db_put(conn)
+    return None
+
+def _ext_set(key, value):
+    conn = db_conn()
+    try:
+        with conn:
+            with conn.cursor() as cur:
+                cur.execute(
+                    "INSERT INTO ext_metrics(key,value_json,fetched_ts) VALUES(%s,%s,%s) ON CONFLICT(key) DO UPDATE SET value_json=EXCLUDED.value_json,fetched_ts=EXCLUDED.fetched_ts;",
+                    (key, json.dumps(value), int(time.time()))
+                )
+    except: pass
+    finally: db_put(conn)
+
+def fetch_fear_greed():
+    """Fetch CNN Fear & Greed + Crypto Fear & Greed indices. Returns dict."""
+    cached = _ext_get("fear_greed")
+    if cached: return cached
+    result = {}
+    if not requests: return result
+    # Crypto F&G (alternative.me — free, no key)
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=8)
+        d = r.json().get("data", [{}])[0]
+        result["crypto_fg"] = {"value": int(d.get("value", 50)), "label": d.get("value_classification", "Neutral")}
+    except: pass
+    # CNN Fear & Greed via scrape-free endpoint
+    try:
+        r = requests.get("https://production.dataviz.cnn.io/index/fearandgreed/graphdata", timeout=8)
+        score = r.json().get("fear_and_greed", {}).get("score", None)
+        if score is not None:
+            result["stock_fg"] = {"value": round(float(score)), "label": _fg_label(float(score))}
+    except: pass
+    if result: _ext_set("fear_greed", result)
+    return result
+
+def _fg_label(v):
+    if v >= 75: return "Extreme Greed"
+    if v >= 55: return "Greed"
+    if v >= 45: return "Neutral"
+    if v >= 25: return "Fear"
+    return "Extreme Fear"
+
+def _fg_to_weight(v, asset):
+    """Convert F&G 0-100 to a bias contribution for the asset."""
+    # Centre at 50: greed is bullish for risk assets, bearish for gold
+    centered = (v - 50) / 50.0  # -1 .. +1
+    if asset in ("ETH", "BTC", "US500"):
+        return centered * 0.6
+    if asset == "XAU":
+        return -centered * 0.5   # fear = gold bullish
+    return 0.0
+
+# ============ MOMENTUM & VELOCITY ============
+def compute_momentum(rows, asset, now):
+    """
+    Compare weighted score in the last 1h vs 1-4h window.
+    Returns (momentum_score, velocity_score, velocity_why).
+    momentum_score: positive = accelerating bullish, negative = accelerating bearish
+    velocity: items/hour in last 2h vs baseline
+    """
+    # Split rows into time buckets
+    s1h = s4h = 0.0
+    c1h = c4h = 0
+    for source, title, link, ts in rows:
+        age = max(0.0, float(now - ts))
+        if age > 14400: continue  # only 4h window
+        w_src = SOURCE_WEIGHT.get(source, 1.0)
+        w_time = decay_weight(age)
+        for m in match_rules(asset, title):
+            contrib = m["w"] * w_src * w_time
+            if age <= 3600:
+                s1h += contrib; c1h += 1
+            else:
+                s4h += contrib; c4h += 1
+
+    # Momentum: is recent 1h stronger than the 1-4h average?
+    avg_4h = s4h / max(c4h, 1)
+    momentum = s1h - avg_4h  # positive = accelerating
+
+    # Velocity: news items per hour in last 2h vs baseline 2-8h
+    c2h   = sum(1 for s,t,l,ts in rows if (now-ts) <= 7200 and match_rules(asset, t))
+    c8h   = sum(1 for s,t,l,ts in rows if 7200 < (now-ts) <= 28800 and match_rules(asset, t))
+    rate2h = c2h / 2.0
+    rate8h = c8h / 6.0
+    velocity = rate2h - rate8h  # items/h above baseline
+
+    vel_why = None
+    if velocity > 1.5:
+        vel_why = f"News velocity spiking (+{velocity:.1f}/h) — strong signal"
+    elif velocity > 0.5:
+        vel_why = f"Increasing news flow (+{velocity:.1f}/h)"
+
+    return momentum, velocity, vel_why
+
+# ============ CROSS-ASSET CORRELATION ADJUSTMENTS ============
+# Correlation pairs: if asset A has strong signal, nudge correlated asset B
+CORR_PAIRS = [
+    ("BTC", "ETH",  +0.7),   # BTC bull → ETH bull
+    ("ETH", "BTC",  +0.5),
+    ("XAU", "BTC",  +0.25),  # inflation hedge correlation
+    ("WTI", "XAU",  +0.15),  # commodity correlation
+    ("US500", "ETH", +0.3),  # risk-on correlation
+    ("US500", "BTC", +0.3),
+]
+
+def compute_corr_adjustments(scores_map):
+    """Returns {asset: corr_adj} based on other assets' scores."""
+    adj = {a: 0.0 for a in ASSETS}
+    for src, dst, strength in CORR_PAIRS:
+        src_score = scores_map.get(src, 0.0)
+        src_th = BIAS_THRESH.get(src, 1.0)
+        if abs(src_score) >= src_th * 0.6:  # only when src has meaningful signal
+            normalized = src_score / max(abs(src_score), src_th)
+            adj[dst] += normalized * strength
+    return adj
+
 # ============ IMPROVED COMPUTE BIAS ============
 def compute_bias():
     now = int(time.time())
@@ -741,6 +921,25 @@ def compute_bias():
     recent_macro = any(s in macro_sources and (now - ts) <= EVENT_CFG["recent_hours"] * 3600 for s, _, _, ts in rows)
     event_mode = EVENT_CFG["enabled"] and (recent_macro or any(x.get("ts") and x.get("currency") == "USD" and x.get("impact") in ("HIGH", "MED") for x in upcoming))
     event_risk = _event_risk(upcoming, recent_macro)
+
+    # Fetch external metrics (non-blocking — cached)
+    fg_data = fetch_fear_greed()
+
+    # ── Pass 1: compute raw scores for cross-asset correlation ──
+    raw_scores = {}
+    for asset in ASSETS:
+        s = 0.0
+        for source, title, link, ts in rows:
+            age = max(0.0, float(now - ts))
+            w_src = SOURCE_WEIGHT.get(source, 1.0)
+            w_time = decay_weight(age)
+            for m in match_rules(asset, title):
+                s += m["w"] * w_src * w_time
+        for d in fred_drivers.get(asset, []):
+            s += d["w"]
+        raw_scores[asset] = s
+
+    corr_adj = compute_corr_adjustments(raw_scores)
 
     assets_out = {}
     for asset in ASSETS:
@@ -769,40 +968,74 @@ def compute_bias():
             if d["why"] not in drivers_why:
                 drivers_why.append(d["why"])
 
+        # ── Correlation adjustment ──
+        cadj = corr_adj.get(asset, 0.0)
+        if abs(cadj) > 0.05:
+            score += cadj
+            contribs.append({"contrib": cadj, "why": "Cross-asset correlation signal"})
+
+        # ── Fear & Greed contribution ──
+        fg_contrib_label = None
+        if asset in ("ETH", "BTC"):
+            fg = fg_data.get("crypto_fg")
+            if fg:
+                fw = _fg_to_weight(fg["value"], asset)
+                if abs(fw) > 0.05:
+                    score += fw
+                    label = f"Crypto F&G: {fg['value']} ({fg['label']})"
+                    contribs.append({"contrib": fw, "why": label})
+                    fg_contrib_label = label
+        elif asset in ("US500", "XAU"):
+            fg = fg_data.get("stock_fg")
+            if fg:
+                fw = _fg_to_weight(fg["value"], asset)
+                if abs(fw) > 0.05:
+                    score += fw
+                    label = f"Mkt sentiment: {fg['value']} ({fg['label']})"
+                    contribs.append({"contrib": fw, "why": label})
+                    fg_contrib_label = label
+
+        # ── Momentum & Velocity ──
+        momentum, velocity, vel_why = compute_momentum(rows, asset, now)
+        momentum_contrib = 0.0
+        if abs(momentum) > 0.1:
+            momentum_contrib = momentum * 0.4  # dampened
+            score += momentum_contrib
+            mom_label = "Bullish momentum accelerating" if momentum > 0 else "Bearish momentum accelerating"
+            contribs.append({"contrib": momentum_contrib, "why": mom_label})
+        if vel_why:
+            # velocity adds small boost in direction of current bias
+            vel_boost = velocity * 0.1 * (1 if score >= 0 else -1)
+            score += vel_boost
+            contribs.append({"contrib": vel_boost, "why": vel_why})
+
         th = BIAS_THRESH.get(asset, 1.0)
         bias = "BULLISH" if score >= th else ("BEARISH" if score <= -th else "NEUTRAL")
 
-        # ── IMPROVED conflict/quality scoring ──
         net     = sum(x["contrib"] for x in contribs)
         abs_sum = sum(abs(x["contrib"]) for x in contribs) or 1.0
-        # conflict: 0 = all agree, 1 = perfectly split
         conflict = 1.0 - abs(net) / abs_sum
-
-        # Source diversity (capped at 12 for full score)
         src_div = len(matched_sources)
-
         fresh_total = sum(freshness.values()) or 1
-        # fresh_score weights 0-2h items most, 2-8h moderately
         fresh_score = (freshness["0-2h"] * 1.0 + freshness["2-8h"] * 0.5 + freshness["8-24h"] * 0.1) / fresh_total
 
-        # ── IMPROVED quality formula ──
-        # Strength component — how far score exceeds threshold
         strength   = min(1.0, abs(score) / max(th, 1.0))
-        # Evidence volume — how many contributing items
         evidence_v = min(1.0, len(contribs) / 25.0)
-        # Source diversity
         diversity  = min(1.0, src_div / 10.0)
-        # Agreement (inverse of conflict)
         agreement  = 1.0 - conflict
+        # Velocity bonus: high velocity boosts quality
+        vel_bonus  = min(0.1, velocity * 0.02)
 
         raw = (
-            0.35 * strength
-          + 0.20 * evidence_v
-          + 0.15 * diversity
-          + 0.15 * fresh_score
-          + 0.15 * agreement
-          - 0.20 * conflict                                     # explicit conflict penalty
-          - (0.15 * event_risk if event_mode else 0.0)          # event risk penalty
+            0.33 * strength
+          + 0.18 * evidence_v
+          + 0.13 * diversity
+          + 0.13 * fresh_score
+          + 0.13 * agreement
+          + 0.05 * min(1.0, abs(momentum))
+          + vel_bonus
+          - 0.20 * conflict
+          - (0.15 * event_risk if event_mode else 0.0)
         )
         quality = int(max(0, min(100, round(raw * 100))))
 
@@ -822,13 +1055,25 @@ def compute_bias():
             "why_opposite": why_opposite,
             "freshness": freshness,
             "event_mode": event_mode,
+            "momentum": round(momentum, 3),
+            "velocity": round(velocity, 2),
+            "corr_adj": round(cadj, 3),
+            "fear_greed": fg_contrib_label,
         }
+
+    # ── Save history snapshot for sparklines ──
+    gate_results = {asset: eval_gate(assets_out[asset], {
+        "event_mode": event_mode,
+        "upcoming": upcoming
+    }) for asset in ASSETS}
+    save_bias_history(assets_out, gate_results)
 
     return {
         "updated_utc": datetime.now(timezone.utc).isoformat(),
         "assets": assets_out,
         "event": {"event_mode": event_mode, "event_risk": round(event_risk, 2), "upcoming": upcoming[:5]},
-        "meta": {"profile": GATE_PROFILE}
+        "meta": {"profile": GATE_PROFILE},
+        "ext": {"fear_greed": fg_data},
     }
 
 # ============ TRADE GATE ============
@@ -943,6 +1188,14 @@ def latest(limit: int = 20):
             return {"items": [{"source": s, "title": t, "ts": ts} for s, t, ts in cur.fetchall()]}
     finally: db_put(conn)
 
+@app.get("/api/history/{asset}")
+def api_history(asset: str, hours: int = 24):
+    """Return bias history for sparkline rendering."""
+    db_init()
+    if asset not in ASSETS:
+        return JSONResponse({"error": "unknown asset"}, 400)
+    return {"asset": asset, "history": load_bias_history(asset, hours)}
+
 @app.get("/feeds")
 def feeds():
     db_init()
@@ -990,6 +1243,10 @@ def dashboard():
         ok    = gate.get("ok", False)
         blockers  = gate.get("blockers", [])
         why_bias  = a.get("why_bias", [])
+        score     = a.get("score", 0.0)
+        th        = a.get("threshold", 1.0)
+        momentum  = a.get("momentum", 0.0)
+        quality   = a.get("quality", 0)
 
         bias_icon  = "▲" if bias == "BULLISH" else ("▼" if bias == "BEARISH" else "●")
         bias_color = "#00d4aa" if bias == "BULLISH" else ("#ff5f56" if bias == "BEARISH" else "#666")
@@ -1000,14 +1257,28 @@ def dashboard():
         icon   = ASSET_ICONS.get(sym, "●")
         border_accent = bias_color if bias != "NEUTRAL" else "#30363d"
 
+        # Strength bar: 0-100% fill based on score vs threshold
+        strength_pct = min(100, int(abs(score) / max(th, 0.1) * 100))
+        bar_color = bias_color
+
+        # Momentum arrow
+        mom_html = ""
+        if abs(momentum) > 0.08:
+            mom_arrow = "↑" if momentum > 0 else "↓"
+            mom_color = "#00d4aa" if momentum > 0 else "#ff5f56"
+            mom_html = f'<span style="color:{mom_color};font-size:9px;margin-left:4px">{mom_arrow}</span>'
+
         return f'''
         <div class="asset-card" onclick="openView('{sym}')" style="border-top:2px solid {border_accent}">
             <div class="card-top">
                 <span class="card-icon">{icon}</span>
-                <span class="card-sym">{sym}</span>
+                <span class="card-sym">{sym}{mom_html}</span>
                 <span class="card-bias" style="color:{bias_color}">{bias} {bias_icon}</span>
             </div>
             <div class="card-reason">{reason[:55]}</div>
+            <div class="strength-bar">
+                <div class="strength-fill" style="width:{strength_pct}%;background:{bar_color}"></div>
+            </div>
             <div class="card-trade" style="background:{trade_bg};color:{trade_color};border:1px solid {trade_color}40">{trade_text}</div>
         </div>'''
 
@@ -1215,6 +1486,21 @@ body {{
     letter-spacing: 0.5px;
     text-align: center;
     min-width: 52px;
+}}
+
+/* ── STRENGTH BAR ── */
+.strength-bar {{
+    height: 3px;
+    background: var(--border);
+    border-radius: 2px;
+    overflow: hidden;
+    margin: 0 0 2px;
+}}
+.strength-fill {{
+    height: 100%;
+    border-radius: 2px;
+    transition: width 0.5s ease;
+    opacity: 0.8;
 }}
 
 /* ── COUNTDOWN BAR ── */
@@ -1505,17 +1791,19 @@ function openModal(title, html) {{
 }}
 function closeModal() {{ document.getElementById('modal').classList.remove('open'); }}
 
-function openView(sym) {{
+async function openView(sym) {{
     const a = P.assets?.[sym] || {{}};
     const ev = P.event || {{}};
+    const ext = P.ext || {{}};
     const bias = a.bias || 'NEUTRAL';
     const whyBias = a.why_bias || [];
     const whyOpp = a.why_opposite || [];
     const blockers = [], unlock = [];
     const quality = a.quality || 0;
     const conflict = a.conflict || 1;
-    const srcDiv = a.source_diversity || 0;
     const evCount = a.evidence_count || 0;
+    const momentum = a.momentum || 0;
+    const velocity = a.velocity || 0;
     const eventMode = ev.event_mode;
     const upcoming = ev.upcoming || [];
 
@@ -1537,18 +1825,46 @@ function openView(sym) {{
     const biasColor = bias === 'BULLISH' ? '#00d4aa' : (bias === 'BEARISH' ? '#ff5f56' : '#888');
     const tradeColor = ok ? '#00d4aa' : '#ffbd2e';
     const icon = ASSET_ICONS[sym] || '●';
+    const momArrow = momentum > 0.08 ? ' ↑' : (momentum < -0.08 ? ' ↓' : '');
+    const momColor = momentum > 0.08 ? '#00d4aa' : (momentum < -0.08 ? '#ff5f56' : 'transparent');
+
+    // F&G bar
+    let fgHtml = '';
+    const fgCrypto = ext.fear_greed?.crypto_fg;
+    const fgStock  = ext.fear_greed?.stock_fg;
+    const fgSrc = ['ETH','BTC'].includes(sym) ? fgCrypto : (['US500','XAU'].includes(sym) ? fgStock : null);
+    if (fgSrc) {{
+        const fv = fgSrc.value;
+        const fc = fv >= 60 ? '#00d4aa' : (fv <= 40 ? '#ff5f56' : '#ffbd2e');
+        const lbl = ['ETH','BTC'].includes(sym) ? 'Crypto F&G' : 'Mkt F&G';
+        fgHtml = `<div style="display:flex;align-items:center;gap:8px;padding:8px 12px;background:var(--bg);border-radius:6px;margin-bottom:14px;font-size:11px">
+            <span style="color:var(--text-muted);min-width:60px">${{lbl}}</span>
+            <span style="color:${{fc}};font-weight:700;min-width:26px">${{fv}}</span>
+            <span style="color:${{fc}};flex:1">${{fgSrc.label}}</span>
+            <div style="width:60px;height:4px;background:var(--border);border-radius:2px;overflow:hidden;flex-shrink:0">
+                <div style="width:${{fv}}%;height:100%;background:${{fc}};border-radius:2px"></div>
+            </div>
+        </div>`;
+    }}
 
     let html = `
-        <div style="text-align:center;padding:16px 0 20px;border-bottom:1px solid var(--border);margin-bottom:14px;">
-            <div style="font-size:26px;opacity:0.45;margin-bottom:4px">${{icon}}</div>
-            <div style="font-size:20px;font-weight:700;color:${{biasColor}};margin-bottom:10px;">${{bias}}</div>
+        <div style="text-align:center;padding:14px 0 16px;border-bottom:1px solid var(--border);margin-bottom:14px;">
+            <div style="font-size:22px;opacity:0.4;margin-bottom:3px">${{icon}}</div>
+            <div style="font-size:20px;font-weight:700;color:${{biasColor}};margin-bottom:3px">${{bias}}</div>
+            <div style="font-size:10px;color:${{momColor}};margin-bottom:10px;height:14px">${{momArrow ? 'Momentum' + momArrow : ''}}</div>
             <div style="display:inline-block;background:${{tradeColor}}22;color:${{tradeColor}};padding:8px 28px;border-radius:8px;font-weight:700;font-size:14px;border:1px solid ${{tradeColor}}40">${{ok ? '✓ TRADE' : '⏳ WAIT'}}</div>
         </div>
         <div class="stats-row">
             <div class="stat-box"><div class="stat-val">${{quality}}</div><div class="stat-lbl">QUALITY</div></div>
             <div class="stat-box"><div class="stat-val">${{Math.round(conflict*100)}}%</div><div class="stat-lbl">CONFLICT</div></div>
             <div class="stat-box"><div class="stat-val">${{evCount}}</div><div class="stat-lbl">SIGNALS</div></div>
-            <div class="stat-box"><div class="stat-val">${{srcDiv}}</div><div class="stat-lbl">SOURCES</div></div>
+            <div class="stat-box"><div class="stat-val">${{velocity >= 0 ? '+' : ''}}${{velocity.toFixed(1)}}</div><div class="stat-lbl">VEL/H</div></div>
+        </div>
+        ${{fgHtml}}
+        <div class="view-section">
+            <div class="view-label">SCORE HISTORY (24H)</div>
+            <canvas id="spark_${{sym}}" height="52" style="width:100%;display:block;border-radius:4px;background:var(--bg)"></canvas>
+            <div id="sigLog_${{sym}}" style="margin-top:8px;max-height:100px;overflow-y:auto"></div>
         </div>
     `;
     if (whyBias.length) {{
@@ -1572,6 +1888,100 @@ function openView(sym) {{
         html += `</div>`;
     }}
     openModal(`${{icon}} ${{sym}}`, html);
+
+    // Async: load history and render sparkline + signal log
+    try {{
+        const r = await fetch(`/api/history/${{sym}}?hours=24`);
+        const d = await r.json();
+        const hist = (d.history || []).slice().reverse(); // oldest first
+        if (hist.length > 1) renderSparkline(`spark_${{sym}}`, hist);
+        renderSignalLog(`sigLog_${{sym}}`, d.history || []); // newest first for log
+    }} catch(e) {{
+        const c = document.getElementById(`spark_${{sym}}`);
+        if (c) c.style.display = 'none';
+    }}
+}}
+
+function renderSparkline(canvasId, hist) {{
+    const canvas = document.getElementById(canvasId);
+    if (!canvas) return;
+    const dpr = window.devicePixelRatio || 1;
+    const W = canvas.offsetWidth || canvas.parentElement.offsetWidth || 300;
+    const H = 52;
+    canvas.width  = W * dpr;
+    canvas.height = H * dpr;
+    canvas.style.width  = W + 'px';
+    canvas.style.height = H + 'px';
+    const ctx = canvas.getContext('2d');
+    ctx.scale(dpr, dpr);
+    ctx.clearRect(0, 0, W, H);
+
+    const scores = hist.map(h => h.score);
+    const minS = Math.min(...scores, -0.5);
+    const maxS = Math.max(...scores, 0.5);
+    const range = maxS - minS || 1;
+    const toY = s => H - 4 - ((s - minS) / range) * (H - 8);
+    const toX = (i) => 4 + (i / (hist.length - 1)) * (W - 8);
+
+    // Zero line
+    const zeroY = toY(0);
+    ctx.setLineDash([3,3]);
+    ctx.strokeStyle = '#30363d';
+    ctx.lineWidth = 1;
+    ctx.beginPath(); ctx.moveTo(4, zeroY); ctx.lineTo(W-4, zeroY); ctx.stroke();
+    ctx.setLineDash([]);
+
+    // Filled area under line
+    ctx.beginPath();
+    hist.forEach((h, i) => {{ i === 0 ? ctx.moveTo(toX(i), toY(h.score)) : ctx.lineTo(toX(i), toY(h.score)); }});
+    ctx.lineTo(toX(hist.length-1), zeroY);
+    ctx.lineTo(toX(0), zeroY);
+    ctx.closePath();
+    const lastScore = hist[hist.length-1]?.score || 0;
+    const fillColor = lastScore >= 0 ? '#00d4aa' : '#ff5f56';
+    ctx.fillStyle = fillColor + '22';
+    ctx.fill();
+
+    // Line
+    ctx.beginPath();
+    hist.forEach((h, i) => {{
+        const x = toX(i), y = toY(h.score);
+        i === 0 ? ctx.moveTo(x, y) : ctx.lineTo(x, y);
+    }});
+    ctx.strokeStyle = fillColor;
+    ctx.lineWidth = 1.5;
+    ctx.stroke();
+
+    // TRADE dots
+    hist.forEach((h, i) => {{
+        if (h.gate_ok) {{
+            ctx.beginPath();
+            ctx.arc(toX(i), toY(h.score), 2.5, 0, Math.PI*2);
+            ctx.fillStyle = '#00d4aa';
+            ctx.fill();
+        }}
+    }});
+}}
+
+function renderSignalLog(elId, hist) {{
+    // hist: newest first
+    const el = document.getElementById(elId);
+    if (!el || !hist.length) return;
+    const recent = hist.slice(0, 8);
+    let html = '';
+    recent.forEach(h => {{
+        const bc = h.bias === 'BULLISH' ? '#00d4aa' : (h.bias === 'BEARISH' ? '#ff5f56' : '#666');
+        const gate = h.gate_ok ? '<span style="color:#00d4aa;font-size:8px">TRADE</span>' : '<span style="color:#ffbd2e;font-size:8px">WAIT</span>';
+        const t = new Date(h.ts * 1000);
+        const hhmm = t.getHours().toString().padStart(2,'0') + ':' + t.getMinutes().toString().padStart(2,'0');
+        html += `<div style="display:flex;gap:8px;align-items:center;padding:4px 0;border-bottom:1px solid #1c2128;font-size:9px;color:var(--text-muted)">
+            <span style="min-width:32px">${{hhmm}}</span>
+            <span style="color:${{bc}};font-weight:700;min-width:54px">${{h.bias}}</span>
+            <span style="min-width:28px">Q${{h.quality}}</span>
+            ${{gate}}
+        </div>`;
+    }});
+    el.innerHTML = html;
 }}
 
 function openFeeds() {{

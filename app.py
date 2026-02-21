@@ -1298,9 +1298,22 @@ def compute_bias():
         th = BIAS_THRESH.get(asset, 1.0)
         bias = "BULLISH" if score >= th else ("BEARISH" if score <= -th else "NEUTRAL")
 
-        net     = sum(x["contrib"] for x in contribs)
-        abs_sum = sum(abs(x["contrib"]) for x in contribs) or 1.0
-        conflict = 1.0 - abs(net) / abs_sum
+        # ── Aggregate contribs by label first (same rule on 100 articles → 1 entry) ──
+        label_map: dict = {}
+        for c in contribs:
+            txt = c["why"]
+            label_map[txt] = label_map.get(txt, 0.0) + c["contrib"]
+
+        unique_contribs = sorted(
+            [{"why": k, "contrib": v} for k, v in label_map.items()],
+            key=lambda x: abs(x["contrib"]), reverse=True
+        )
+
+        # Conflict on unique signals (not raw RSS hits — much more accurate)
+        u_net     = sum(x["contrib"] for x in unique_contribs)
+        u_abs_sum = sum(abs(x["contrib"]) for x in unique_contribs) or 1.0
+        conflict  = 1.0 - abs(u_net) / u_abs_sum
+
         src_div = len(matched_sources)
         fresh_total = sum(freshness.values()) or 1
         fresh_score = (freshness["0-2h"] * 1.0 + freshness["2-8h"] * 0.5 + freshness["8-24h"] * 0.1) / fresh_total
@@ -1332,18 +1345,26 @@ def compute_bias():
         )
         quality = int(max(0, min(100, round(raw * 100))))
 
-        top_drivers  = sorted(contribs, key=lambda x: abs(x["contrib"]), reverse=True)[:8]
-        # Deduplicate by label text (same rule fires on many articles → same string)
-        seen_why = set()
-        why_bias, why_opposite = [], []
-        for d in top_drivers:
-            txt = d["why"]
-            if txt in seen_why: continue
-            seen_why.add(txt)
-            if (d["contrib"] > 0) == (score > 0):
-                if len(why_bias) < 3: why_bias.append(txt)
+        # ── Aggregate contribs by label (same rule on 100 articles → single entry) ──
+        label_map: dict = {}
+        for c in contribs:
+            txt = c["why"]
+            if txt in label_map:
+                label_map[txt] += c["contrib"]
             else:
-                if len(why_opposite) < 2: why_opposite.append(txt)
+                label_map[txt] = c["contrib"]
+        # Rebuild as unique contrib list sorted by absolute weight
+        unique_contribs = sorted(
+            [{"why": k, "contrib": v} for k, v in label_map.items()],
+            key=lambda x: abs(x["contrib"]), reverse=True
+        )
+        why_bias, why_opposite = [], []
+        for d in unique_contribs:
+            if (d["contrib"] > 0) == (score > 0):
+                if len(why_bias) < 3: why_bias.append(d["why"])
+            else:
+                if len(why_opposite) < 2: why_opposite.append(d["why"])
+            if len(why_bias) >= 3 and len(why_opposite) >= 2: break
 
         assets_out[asset] = {
             "bias": bias,
@@ -1351,7 +1372,8 @@ def compute_bias():
             "threshold": th,
             "quality": quality,
             "conflict": round(conflict, 2),
-            "evidence_count": len(contribs),
+            "evidence_count": len(label_map),   # unique signals, not raw RSS hits
+            "evidence_raw": len(contribs),       # raw count for debug
             "source_diversity": src_div,
             "why_bias": why_bias or ["Market signals unclear"],
             "why_opposite": why_opposite,
